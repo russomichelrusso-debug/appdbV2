@@ -4,9 +4,9 @@ name: Manter backend acordado
 # sem nenhuma requisicao, entao esse intervalo evita que isso aconteca.
 # Tambem pode ser disparado manualmente (aba Actions do GitHub, botao
 # "Run workflow") pra testar sem esperar o horario programado.
+# v2: agendamento desligado - o endereço abaixo é o da PRODUÇÃO. Religar só
+# depois de trocar pelo endereço do serviço da v2 no Render.
 on:
-  schedule:
-    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 jobs:
