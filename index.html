@@ -5441,7 +5441,7 @@
                 (endereço do servidor)</button>
               <div id="apiConfigWrap" class="hidden" style="margin-top:10px;">
                 <label for="apiBaseUrlInput">Endereço do servidor</label>
-                <input type="text" id="apiBaseUrlInput" placeholder="https://appdb-z6uh.onrender.com">
+                <input type="text" id="apiBaseUrlInput" placeholder="https://endereco-da-api-v2.onrender.com">
                 <button class="restoreBtn" id="saveApiConfigBtn">Salvar configuração</button>
               </div>
             </div>
@@ -9642,7 +9642,7 @@
       // Painel Administrativo (ex: se a chave for rotacionada por segurança), sem
       // precisar reenviar o app inteiro.
       const API_CONFIG_LS_KEY = 'cortagApiConfig_v1';
-      const API_BASE_URL_DEFAULT = 'https://appdb-z6uh.onrender.com';
+      const API_BASE_URL_DEFAULT = 'https://api-da-v2-nao-configurada.invalid'; // v2: trocar pelo endereço do serviço da v2 no Render - NUNCA o da produção (appdb-z6uh)
       const AUTH_TOKEN_LS_KEY = 'cortagAuthToken_v1'; // "lembrar-me" marcado - sobrevive fechar o app
       const AUTH_TOKEN_SS_KEY = 'cortagAuthToken_v1'; // "lembrar-me" desmarcado - só dura a sessão do navegador
 

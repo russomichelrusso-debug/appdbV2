@@ -2,6 +2,24 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚠️ Este repositório é a v2 (em construção)
+
+Cópia do `appdb` (produção), com o histórico, para implementar o plano de escala para 200+
+usuários com gerentes regionais — **ler `docs/PLANO-ESCALA-V2.md` antes de qualquer mudança**.
+A produção continua no `appdb`; nada daqui chega aos vendedores até o corte planejado.
+
+Regras (detalhes na seção 3 do plano):
+- **Nunca** usar o `DATABASE_URL` da produção — o `db.js` roda o `schema.sql` a cada subida do
+  servidor. A v2 tem banco (projeto Supabase) e serviço no Render próprios.
+- O frontend aponta para a API da v2 (`API_BASE_URL_DEFAULT` em `index.html`, `curva-abc.html`,
+  `ficha-cnpj.html` — hoje com um endereço `.invalid` até o serviço da v2 existir) e é publicado
+  **fora** do GitHub Pages desta conta (mesma origem = mesmo `localStorage` da produção).
+- O `keep-alive.yml` está sem agendamento (o endereço nele ainda é o da produção).
+- Correções de produção entram pelo `appdb` e chegam aqui por merge
+  (`git remote add producao https://github.com/russomichelrusso-debug/appdb.git`,
+  `git fetch producao && git merge producao/main`). Nada daqui volta para o `appdb`.
+- O resto deste arquivo descreve o app como ele é hoje na produção; atualizar conforme a v2 mudar.
+
 ## O que é este app e por que ele existe
 
 **Cortag Revolution Tools** é o app de vendas em campo dos representantes comerciais da Cortag
@@ -248,7 +266,7 @@ Supabase, sem PR — não é mudança de código.
 
 - **Escala para 200+ usuários com gerentes regionais (v2)** — plano completo em
   `docs/PLANO-ESCALA-V2.md` (limitações, escolha de plataforma, fases). Decisão do usuário: a v2 é
-  construída num **repositório separado** (`appdb-v2`, privado, cópia deste com histórico), para não
+  construída num **repositório separado** (`appdbV2`, privado, cópia deste com histórico), para não
   arriscar a versão em uso. Regras que valem daqui: correção de bug de produção é feita **aqui
   primeiro** e depois levada pra v2 (merge deste `main` lá); nada da v2 volta pra cá antes da troca;
   a v2 **nunca** usa o `DATABASE_URL` da produção (o `db.js` roda o `schema.sql` na subida).
