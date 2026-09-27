@@ -108,8 +108,8 @@ A v2 fica num **repositório separado** (`appdbV2`, privado), criado a partir de
 
 ### Passos manuais (só o dono das contas consegue fazer)
 
-- [ ] Criar o repositório **privado** `appdbV2` vazio no GitHub (sem README) — a integração do
-      Claude não tem permissão de criar repositório; depois disso a cópia é enviada daqui.
+- [x] Criar o repositório **privado** `appdbV2` no GitHub com a cópia do `appdb` (feito em
+      27/09/2026; o isolamento da API e do keep-alive entrou no PR #1 de lá).
 - [ ] Criar o projeto Supabase da v2 e copiar os dados (a string do "Session pooler" vai no Render).
 - [ ] Criar o serviço no Render apontando para `appdbV2`, com as variáveis da regra 2.
 - [ ] Publicar o frontend da v2 em Cloudflare Pages ou Vercel (regra 4 — **não** no GitHub Pages
