@@ -4,6 +4,21 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Contra clickjacking (a página aberta dentro de um iframe de outro site, pra
+       enganar o toque): frame-ancestors só vale em cabeçalho HTTP - no <meta> o
+       navegador ignora - e o GitHub Pages não deixa mandar cabeçalho. Então ela
+       começa escondida e só aparece se não estiver dentro de um frame; dentro de um,
+       tenta sair dele (abrir no lugar da página de fora). O login do Google não é
+       afetado: o botão dele é um iframe do Google DENTRO da nossa página (a nossa
+       continua sendo a janela de cima), e o login do Drive abre em popup. -->
+  <style id="antiFrame">html { display: none !important; }</style>
+  <script>
+    if (window.top === window.self) {
+      document.getElementById('antiFrame').remove();
+    } else {
+      try { window.top.location = window.self.location.href; } catch (e) { }
+    }
+  </script>
   <title>Cortag · Curva ABC de Produtos</title>
   <link rel="manifest" href="manifest.json">
   <meta name="theme-color" content="#CC0935">
@@ -223,25 +238,14 @@
     .segmented button.active { background: var(--white); color: var(--ink); box-shadow: var(--shadow-1); }
 
     /* ---------- KPIs ---------- */
-    .kpiRow {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 10px;
-      margin-bottom: 14px;
-    }
-    @media (max-width: 720px) { .kpiRow { grid-template-columns: repeat(2, 1fr); } }
 
     .kpi { background: var(--white); border-radius: var(--r-md); box-shadow: var(--shadow-1); padding: 13px 15px; }
     .kpi .lbl { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--gray); margin-bottom: 5px; display: block; }
     .kpi .val { font-size: 20px; font-weight: 700; letter-spacing: -.01em; display: block; }
     .kpi .sub { font-size: 11px; color: var(--gray); margin-top: 2px; display: block; }
-    .kpi.kpiExpandable { cursor: pointer; }
-    .kpi.kpiExpandable.active { box-shadow: 0 0 0 2px var(--red) inset, var(--shadow-1); }
     .kpiExpandPanel { background: var(--white); border-radius: var(--r-lg); box-shadow: var(--shadow-1); padding: 15px 17px; margin: -4px 0 14px; }
     .kpiExpandPanel h3 { margin: 0 0 4px; font-size: 14px; }
     .kpiExpandList { display: flex; flex-direction: column; gap: 2px; max-height: 340px; overflow-y: auto; margin-top: 8px; }
-    .kpi.classA .val { color: var(--red); }
-    .kpi.classB .val { color: var(--amber); }
 
     /* ---------- chart card ---------- */
     .chartCard { background: var(--white); border-radius: var(--r-lg); box-shadow: var(--shadow-1); padding: 18px 18px 12px; margin-bottom: 14px; }
@@ -257,8 +261,6 @@
     .ap-msg.error.inline { text-align: center; }
 
     /* ---------- bottom row ---------- */
-    .bottomRow { display: grid; grid-template-columns: 1fr 1.5fr; gap: 14px; align-items: start; }
-    @media (max-width: 860px) { .bottomRow { grid-template-columns: 1fr; } }
     .card { background: var(--white); border-radius: var(--r-lg); box-shadow: var(--shadow-1); padding: 15px 17px; }
     .card h3 { font-size: 13.5px; margin: 0 0 4px; }
     .cardHint { font-size: 11px; color: var(--gray); margin: 0 0 12px; line-height: 1.4; }
@@ -311,8 +313,6 @@
     .kpi .delta { font-size: 11px; font-weight: 700; }
     .kpi .delta.up { color: #1E8E3E; }
     .kpi .delta.down { color: #B3261E; }
-    .dashRow { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; margin-bottom: 14px; }
-    @media (max-width: 720px) { .dashRow { grid-template-columns: 1fr; } }
     .listaAlerta { display: flex; flex-direction: column; gap: 2px; }
     .listaAlertaItem { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--hairline); font-size: 12.5px; }
     .listaAlertaItem:last-child { border-bottom: none; }
@@ -323,6 +323,250 @@
     .rankItem .pos { width: 20px; height: 20px; border-radius: 6px; background: var(--fill); color: var(--gray); font-size: 11px; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
     .rankItem .nome { flex: 1; font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .rankItem .valor { font-size: 12.5px; font-weight: 700; flex-shrink: 0; }
+    /* ---------- Dashboard: grade por aparelho (10/2026) ----------
+       Celular: tudo empilhado. 700 px+ (tablet em pé): colunas. 900 px+ (tablet deitado): hero ao lado
+       dos indicadores e a página larga. 1200 px com mouse (laptop): grade de 12 colunas, opção "A". */
+    body.abaDash .wrap { max-width: 1680px; }
+    @media (min-width: 900px) { body.abaDash .wrap { padding: 0 28px 40px; } }
+    .dashGrid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; margin-bottom: 14px; }
+    .dashGrid > * { margin-bottom: 0; min-width: 0; }
+    .dashHero {
+      background: var(--red); color: #fff; border-radius: var(--r-lg); padding: 20px 22px;
+      display: flex; gap: 20px; align-items: center; cursor: pointer;
+    }
+    .dashHero .chartEmpty { color: rgba(255, 255, 255, .9); }
+    .dashHero.active { box-shadow: inset 0 0 0 3px rgba(255, 255, 255, .85); }
+    .dashHero:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+    .dashHero .heroTexto { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+    .dashHero .heroTopo { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .dashHero .heroLbl { font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+    .dashHero .heroPilula { background: rgba(255, 255, 255, .18); border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 700; }
+    .dashHero .heroValor { font-size: 40px; font-weight: 800; letter-spacing: -.03em; line-height: 1.05; }
+    .dashHero .heroLinha { font-size: 12.5px; color: rgba(255, 255, 255, .92); line-height: 1.45; }
+    .dashHero .heroLinha strong { color: #fff; }
+    .dashHero .heroNums { display: flex; gap: 22px; border-top: 1px solid rgba(255, 255, 255, .25); padding-top: 10px; margin-top: 2px; flex-wrap: wrap; }
+    .dashHero .heroNums b { display: block; font-size: 19px; font-weight: 800; }
+    .dashHero .heroNums span { font-size: 11.5px; color: rgba(255, 255, 255, .9); }
+    .dashHero .heroLapis { border: none; background: rgba(255, 255, 255, .18); color: #fff; border-radius: 8px; font: inherit; font-size: 12px; font-weight: 700; padding: 5px 9px; cursor: pointer; }
+    .anelObjetivo { position: relative; width: 116px; height: 116px; flex-shrink: 0; }
+    .anelObjetivo svg { width: 100%; height: 100%; transform: rotate(-90deg); display: block; }
+    .anelObjetivo .anelCentro { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+    .anelObjetivo .anelCentro b { font-size: 26px; font-weight: 800; line-height: 1; }
+    .anelObjetivo .anelCentro span { font-size: 10.5px; color: rgba(255, 255, 255, .9); margin-top: 3px; }
+    .dashKpis { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .dashKpis .kpi { display: flex; flex-direction: column; }
+    .kpi .spark { width: 100%; height: 26px; margin-top: auto; padding-top: 6px; display: block; }
+    .dashAtencao { min-width: 0; }
+    .dashAtencaoTit { display: none; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--gray); margin-bottom: 4px; }
+    .dashAtencaoLista { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .atItem {
+      display: flex; flex-direction: column; align-items: flex-start; gap: 6px; width: 100%; min-height: 88px; text-align: left; cursor: pointer;
+      border: none; font: inherit; color: inherit; background: var(--white); border-radius: var(--r-md);
+      box-shadow: var(--shadow-1); padding: 12px 14px;
+    }
+    .atItem.active { box-shadow: 0 0 0 2px var(--red) inset, var(--shadow-1); }
+    .atItem .atNum { border-radius: 12px; display: inline-flex; align-items: center; justify-content: center; font-size: 28px; line-height: 1; font-weight: 800; flex-shrink: 0; }
+    .atItem .atTexto { flex: 1; min-width: 0; width: 100%; }
+    .atItem .atTit { display: block; font-size: 13px; font-weight: 700; }
+    .atItem .atNomes { display: block; font-size: 11.5px; color: var(--gray); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .atItem .atSeta { display: none; color: var(--gray); }
+    .atItem[data-cor="danger"] .atNum { color: var(--danger); }
+    .atItem[data-cor="success"] .atNum { color: var(--success); }
+    .atItem[data-cor="warning"] .atNum { color: var(--warning); }
+    .dashMensal .head .segmented { flex-shrink: 0; }
+    .dashMensal .legend { margin: 2px 0 8px; }
+    .legend .tr { width: 14px; border-top: 2px dashed var(--ink); display: inline-block; }
+    .legend .md { width: 14px; border-top: 2px dotted var(--blue); display: inline-block; }
+    .dashDestaque { font-size: 12.5px; color: var(--gray); margin: 2px 0 8px; }
+    .dashDestaque strong { font-size: 18px; color: var(--ink); margin-right: 4px; }
+    .dashDestaque strong.up { color: var(--success); }
+    .dashDestaque strong.down { color: var(--danger); }
+    /* Barras em HTML (não SVG esticado): a altura não cresce com a largura da tela. */
+    .barras { position: relative; display: flex; align-items: flex-end; gap: 6px; height: 170px; border-bottom: 1px solid var(--hairline); }
+    .barras .barCol { flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 4px; }
+    .barras .barVal { font-size: 10.5px; font-weight: 700; white-space: nowrap; }
+    .barras .barCol.atual .barVal { color: var(--red); }
+    .barras .bar { width: 72%; max-width: 46px; min-height: 2px; background: var(--accent-bg); border-radius: 5px 5px 2px 2px; box-shadow: inset 0 0 0 1px rgba(204, 9, 53, .18); }
+    .barras .barCol.atual .bar { background: var(--red); box-shadow: none; }
+    .barras .linhaRef { position: absolute; left: 0; right: 0; height: 0; pointer-events: none; }
+    .barras .linhaRef.meta { border-top: 2px dashed var(--ink); }
+    .barras .linhaRef.media { border-top: 2px dotted var(--blue); }
+    .barras .linhaRef span { position: absolute; right: 0; top: -17px; font-size: 10.5px; font-weight: 700; background: var(--white); padding: 0 4px; }
+    .barras.semValor .barVal { display: none; }
+    .barRotulos { display: flex; gap: 6px; margin-top: 6px; }
+    .barRotulos span { flex: 1; min-width: 0; text-align: center; font-size: 10.5px; color: var(--gray); white-space: nowrap; overflow: hidden; }
+    .barRotulos span.atual { color: var(--ink); font-weight: 800; }
+    .barRotulos i { font-style: normal; }
+    .barRotulos.pontas span { flex: 0 0 auto; }
+    .barRotulos.pontas { justify-content: space-between; }
+    .famLinha { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .famLinha:last-child { margin-bottom: 0; }
+    .famLinha .famNome { width: 160px; font-size: 12.5px; font-weight: 600; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .famLinha .famTrilho { flex: 1; height: 14px; background: var(--fill); border-radius: 4px; overflow: hidden; }
+    .famLinha .famBarra { height: 100%; background: var(--blue); border-radius: 4px; }
+    .famLinha.foco .famBarra { background: var(--red); }
+    .famLinha .famValor { width: 70px; text-align: right; font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+    .focoTag { color: var(--red); font-weight: 700; }
+    .rankItem .rankTrilho { flex-basis: 100%; height: 5px; background: var(--fill); border-radius: 999px; margin: 6px 0 0 30px; }
+    .rankItem .rankBarra { height: 100%; background: var(--red); border-radius: 999px; }
+    .dashTop .rankItem { flex-wrap: wrap; }
+    .dashTop .rankItem:first-child .pos { background: var(--red); color: #fff; }
+    .dashListas { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+    .dashLista { border-top: 4px solid var(--corLista); }
+    .dashLista h3 { color: var(--corLista); }
+    .dashLinkBtn { margin-top: 10px; border: 1px solid var(--hairline); background: var(--white); color: var(--ink); font: inherit; font-size: 12.5px; font-weight: 600; padding: 9px 14px; border-radius: 9px; cursor: pointer; }
+
+    @media (max-width: 699px) {
+      .barras .barCol:not(.atual) .barVal { display: none; }
+      .barRotulos i { display: none; }
+      /* No celular o anel vai pro canto de cima, sem roubar a largura do texto. */
+      .dashHero { position: relative; }
+      .dashHero:has(.anelObjetivo) .heroTopo, .dashHero:has(.anelObjetivo) .heroValor { padding-right: 84px; }
+      .dashHero .heroValor { font-size: 34px; }
+      .anelObjetivo { position: absolute; top: 16px; right: 16px; width: 76px; height: 76px; }
+      .anelObjetivo .anelCentro b { font-size: 17px; }
+      .anelObjetivo .anelCentro span { font-size: 8.5px; }
+    }
+    @media (min-width: 700px) {
+      .dashGrid { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+      .dashGrid > * { grid-column: span 12; }
+      .dashHero .heroValor { font-size: 50px; }
+      .anelObjetivo { width: 140px; height: 140px; }
+      .anelObjetivo .anelCentro b { font-size: 30px; }
+      .dashKpis { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .barras { height: 220px; }
+      .barras .barVal { font-size: 11px; }
+      .barRotulos span { font-size: 11.5px; }
+      .dashGrid > .dashSemanal, .dashGrid > .dashTrimestral { grid-column: span 6; }
+      .dashListas { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (min-width: 900px) {
+      .dashGrid > .dashHero { grid-column: span 7; }
+      .dashGrid > .dashKpis { grid-column: span 5; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .dashAtencaoLista { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .atItem { min-height: 96px; padding: 14px 16px; }
+      .atItem .atNum { font-size: 32px; }
+      .dashGrid > .dashTop, .dashGrid > .dashFamilias { grid-column: span 6; }
+    }
+    /* Laptop (opção "A"): hero 5 · indicadores 4 · "Pede atenção" 3; mensal 8 · top 4; famílias 5 · semana 4 · trimestre 3. */
+    @media (min-width: 1200px) and (hover: hover) and (pointer: fine) {
+      .dashGrid { gap: 16px; margin-bottom: 16px; }
+      .dashGrid > .dashHero { grid-column: span 5; }
+      .dashGrid > .dashKpis { grid-column: span 4; }
+      .dashGrid > .dashAtencao { grid-column: span 3; background: var(--white); border-radius: var(--r-lg); box-shadow: var(--shadow-1); padding: 16px 16px 8px; }
+      .dashAtencaoTit { display: block; }
+      .dashAtencaoLista { grid-template-columns: minmax(0, 1fr); gap: 0; }
+      .atItem { flex-direction: row; align-items: center; min-height: 60px; padding: 8px 0; gap: 12px; box-shadow: none; border-radius: 0; border-bottom: 1px solid var(--hairline); background: transparent; }
+      .atItem:last-child { border-bottom: none; }
+      .atItem:hover .atTit { color: var(--red); }
+      .atItem.active { box-shadow: none; }
+      .atItem.active .atTit { color: var(--red); }
+      .atItem .atNum { width: 44px; height: 44px; font-size: 20px; }
+      .atItem .atTexto { width: auto; }
+      .atItem[data-cor="danger"] .atNum { background: var(--danger-bg); }
+      .atItem[data-cor="success"] .atNum { background: var(--success-bg); }
+      .atItem[data-cor="warning"] .atNum { background: var(--warning-bg); }
+      .atItem .atSeta { display: inline; }
+      .dashGrid > .dashMensal { grid-column: span 8; }
+      .dashGrid > .dashTop { grid-column: span 4; }
+      .dashGrid > .dashFamilias { grid-column: span 5; }
+      .dashGrid > .dashSemanal { grid-column: span 4; }
+      .dashGrid > .dashTrimestral { grid-column: span 3; }
+      .dashListas { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+      .dashHero:hover { background: var(--red-deep); }
+    }
+    /* ---------- Curva ABC: grade por aparelho (10/2026, opção "A") ----------
+       Celular empilhado. 900 px+: página larga. 1200 px com mouse (laptop): gráfico e categorias
+       à esquerda, lista de produtos presa à direita com rolagem própria. */
+    body.abaAbc .wrap { max-width: 1680px; }
+    @media (min-width: 900px) { body.abaAbc .wrap { padding: 0 28px 40px; } }
+    .abcToolbar { align-items: center; }
+    .abcResumo { margin-left: auto; font-size: 12.5px; color: var(--gray); }
+    .abcResumo strong { color: var(--ink); font-size: 15px; }
+    .abcTopo { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; margin-bottom: 14px; }
+    .abcDivisao { background: #1D1D1F; color: #fff; border-radius: var(--r-lg); padding: 18px 20px; display: flex; flex-direction: column; gap: 12px; }
+    .abcDivisao:empty { display: none; }
+    html[data-theme="dark"] .abcDivisao { background: #000; box-shadow: inset 0 0 0 1px var(--hairline); }
+    .abcDivisao .divLbl { font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #C7C7CC; }
+    .abcDivisao .divTitulo { font-size: 22px; font-weight: 800; letter-spacing: -.02em; line-height: 1.2; }
+    .abcDivisao .divTitulo b { color: #FF5C7A; }
+    .abcDivisao .divLinha { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 10px; align-items: center; font-size: 12px; color: #C7C7CC; }
+    .abcDivisao .divBarra { display: flex; height: 20px; border-radius: 6px; overflow: hidden; gap: 2px; }
+    .abcDivisao .divBarra span { display: flex; align-items: center; padding-left: 7px; font-size: 11.5px; font-weight: 800; white-space: nowrap; overflow: hidden; min-width: 0; }
+    .abcDivisao .divRodape { font-size: 12.5px; color: #C7C7CC; }
+    .divA { background: #CC0935; color: #fff; }
+    .divB { background: #F0A54A; color: #1D1D1F; }
+    .divC { background: #48484A; color: #fff; }
+    .abcClasses { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .abcClasse {
+      border: none; font: inherit; color: inherit; text-align: left; cursor: pointer; background: var(--white);
+      border-radius: var(--r-md); box-shadow: var(--shadow-1); padding: 14px; display: flex; flex-direction: column; gap: 3px; min-width: 0;
+    }
+    .abcClasse.active { box-shadow: 0 0 0 2px var(--red) inset, var(--shadow-1); }
+    .abcClasse .clLetra { width: 32px; height: 32px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; font-weight: 800; margin-bottom: 4px; }
+    .abcClasse[data-classe="A"] .clLetra { background: #CC0935; color: #fff; }
+    .abcClasse[data-classe="B"] .clLetra { background: #F0A54A; color: #1D1D1F; }
+    .abcClasse[data-classe="C"] .clLetra { background: var(--hairline); color: var(--ink); }
+    .abcClasse .clQtd { font-size: 22px; font-weight: 800; letter-spacing: -.02em; }
+    .abcClasse .clSub { font-size: 11.5px; color: var(--gray); }
+    .abcClasse .clValor { font-size: 14px; font-weight: 800; margin-top: 4px; }
+    .abcClasse .clAcao { font-size: 11.5px; font-weight: 700; color: var(--blue); margin-top: auto; padding-top: 6px; }
+    .abcClasse.active .clAcao { color: var(--red); }
+    .abcCorpo { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; align-items: start; }
+    .abcEsq { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+    .abcEsq .chartCard { margin-bottom: 0; }
+    /* Pareto em HTML (o SVG esticava com a largura): barras por produto, ou por grupo de produtos
+       vizinhos quando são muitos; linha do % acumulado por cima. */
+    .pareto { position: relative; height: 200px; border-bottom: 1px solid var(--hairline); margin-top: 6px; }
+    .pareto .parBarras { position: absolute; inset: 0; display: flex; align-items: flex-end; gap: 1px; }
+    .pareto .parBarra { flex: 1; min-width: 0; border-radius: 2px 2px 0 0; min-height: 1px; }
+    .pareto .parBarra.A { background: #CC0935; }
+    .pareto .parBarra.B { background: #F0A54A; }
+    .pareto .parBarra.C { background: var(--hairline); }
+    .pareto svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .pareto .parCorte { position: absolute; left: 0; right: 0; border-top: 1px dashed; pointer-events: none; }
+    .pareto .parCorte span { position: absolute; top: -17px; font-size: 10.5px; font-weight: 700; background: var(--white); padding: 0 4px; white-space: nowrap; }
+    .pareto .parCorte.a { border-color: var(--red); color: var(--red); }
+    .pareto .parCorte.a span { left: 0; }
+    .pareto .parCorte.b { border-color: var(--amber); color: var(--amber); }
+    .pareto .parCorte.b span { right: 0; }
+    .parEixo { display: flex; justify-content: space-between; font-size: 11px; color: var(--gray); margin-top: 6px; }
+    #catHost { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: 24px; align-items: start; }
+    .catBar .track { display: flex; }
+    .catBar .fillbar.fA { background: #CC0935; border-radius: 0; }
+    .catBar .fillbar.fB { background: #F0A54A; border-radius: 0; }
+    .catBar .fillbar.fC { background: var(--hairline); border-radius: 0; }
+    .catBar .track .fillbar:first-child { border-radius: 4px 0 0 4px; }
+    .prodValPct { display: block; font-size: 10.5px; color: var(--gray); font-weight: 400; }
+    .acumBarra { display: block; height: 4px; background: var(--fill); border-radius: 999px; margin-top: 4px; min-width: 40px; }
+    .acumBarra i { display: block; height: 4px; border-radius: 999px; }
+    .acumBarra i.a { background: #CC0935; } .acumBarra i.b { background: #F0A54A; } .acumBarra i.c { background: var(--gray); }
+    @media (min-width: 700px) {
+      #catHost { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #catHost .catBar { margin-left: 0; margin-bottom: 8px; }
+      #catHost .catBar .name { width: 150px; }
+      .pareto { height: 220px; }
+    }
+    @media (min-width: 900px) {
+      .abcTopo { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); }
+      .abcDivisao .divTitulo { font-size: 26px; }
+      .abcClasse .clQtd { font-size: 26px; }
+    }
+    @media (hover: none), (pointer: coarse) {
+      .abcLista .addCartBtn { width: 44px; height: 44px; border-radius: 10px; }
+      .abcLista td { padding-top: 10px; padding-bottom: 10px; }
+    }
+    @media (min-width: 1200px) and (hover: hover) and (pointer: fine) {
+      .abcTopo { grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; }
+      .abcTopo .abcDivisao { grid-column: span 7; padding: 22px 24px; }
+      .abcTopo .abcClasses { grid-column: span 5; gap: 12px; }
+      .abcCorpo { grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; }
+      .abcCorpo .abcEsq { grid-column: span 7; gap: 16px; }
+      .abcCorpo .abcLista { grid-column: span 5; position: sticky; top: 12px; }
+      .abcLista .prodTableScroll { max-height: calc(100vh - 230px); }
+      .abcClasse:hover .clAcao { text-decoration: underline; }
+      .pareto { height: 240px; }
+    }
     .hidden { display: none !important; }
 
     .addCartBtn {
@@ -378,118 +622,87 @@
     </div>
 
     <section id="tabDashboardPrincipal">
-      <div class="kpiRow" id="kpiRowPrincipal"></div>
+      <!-- Grade do Dashboard (10/2026, opção "A" escolhida pelo usuário a partir de mockups,
+           com o anel do objetivo da opção "B"): no celular tudo empilha; a partir de 700 px
+           ganha colunas; no laptop (1200 px com mouse) vira a grade de 12 colunas. -->
+      <div class="dashGrid">
+        <div class="dashHero" id="dashHero"><div class="chartEmpty">Carregando…</div></div>
+        <div class="dashKpis" id="kpiRowPrincipal"></div>
+        <div class="dashAtencao">
+          <span class="dashAtencaoTit">Pede atenção</span>
+          <div class="dashAtencaoLista" id="dashAtencao"></div>
+        </div>
+      </div>
       <div class="kpiExpandPanel hidden" id="kpiExpandPanel"></div>
 
-      <div class="chartCard">
-        <div class="head">
-          <div>
-            <h2>Valor Entrada de Pedidos (Mensal)</h2>
-            <p>Últimos 12 meses · pedidos pela data de implantação (carteira + faturado)</p>
+      <div class="dashGrid">
+        <div class="chartCard dashMensal">
+          <div class="head">
+            <div>
+              <h2 id="mensalTitulo">Entrada de pedidos por mês</h2>
+              <p>Últimos 12 meses · pela data de implantação (carteira + faturado)</p>
+            </div>
+            <div class="segmented" id="mensalSeg">
+              <button type="button" data-serie="valor" class="active">Valor</button>
+              <button type="button" data-serie="pedidos">Pedidos</button>
+              <button type="button" data-serie="clientes">Clientes</button>
+            </div>
           </div>
+          <div class="legend" id="mensalLegenda"></div>
+          <div id="chartMensalHost"></div>
         </div>
-        <div class="chartScroll" id="chartMensalHost"></div>
-      </div>
+        <div class="card dashTop">
+          <h3>Top 5 clientes</h3>
+          <p class="cardHint">Faturado nos últimos 12 meses · relatório oficial de Faturamento.</p>
+          <div id="rankTopClientes"></div>
+        </div>
 
-      <div class="dashRow">
-        <div class="chartCard" style="margin-bottom:0;">
-          <div class="head">
-            <div>
-              <h2>Qtde. Pedidos Mês</h2>
-              <p>Últimos 12 meses · nº de pedidos que entraram no mês</p>
-            </div>
-          </div>
-          <div class="chartScroll" id="chartPedidosMesHost"></div>
+        <div class="card dashFamilias">
+          <h3>Famílias no mês</h3>
+          <p class="cardHint">Faturado no mês atual, todas as famílias · <span class="focoTag">★ foco</span> = marcada como foco no admin.</p>
+          <div id="chartFamiliaHost"></div>
         </div>
-        <div class="chartCard" style="margin-bottom:0;">
-          <div class="head">
-            <div>
-              <h2>Qtde. Clientes Mês</h2>
-              <p>Últimos 12 meses · nº de clientes com pedido no mês</p>
-            </div>
-          </div>
-          <div class="chartScroll" id="chartClientesMesHost"></div>
+        <div class="chartCard dashSemanal">
+          <div class="head"><div><h2>Vendas por semana</h2><p>Últimas 10 semanas · faturado</p></div></div>
+          <div class="dashDestaque" id="semanalDestaque"></div>
+          <div id="chartSemanalHost"></div>
         </div>
-      </div>
-
-      <div class="dashRow">
-        <div class="chartCard" style="margin-bottom:0;">
-          <div class="head">
-            <div>
-              <h2>Vendas semanal</h2>
-              <p>Últimas 10 semanas</p>
-            </div>
-          </div>
-          <div class="chartScroll" id="chartSemanalHost"></div>
-        </div>
-        <div class="chartCard" style="margin-bottom:0;">
-          <div class="head">
-            <div>
-              <h2>Vendas trimestral</h2>
-              <p>Últimos 8 trimestres</p>
-            </div>
-          </div>
-          <div class="chartScroll" id="chartTrimestralHost"></div>
+        <div class="chartCard dashTrimestral">
+          <div class="head"><div><h2>Por trimestre</h2><p>Últimos 8 trimestres · faturado</p></div></div>
+          <div class="dashDestaque" id="trimestralDestaque"></div>
+          <div id="chartTrimestralHost"></div>
         </div>
       </div>
 
-      <div class="dashRow">
-        <div class="card">
-          <h3 style="color:#B3261E;">⚠️ Em risco de cair de faixa</h3>
-          <p class="cardHint">Clientes classificados abaixo do mínimo da própria faixa — risco de perder o desconto negociado.</p>
+      <div class="dashListas">
+        <div class="card dashLista" style="--corLista: var(--danger);">
+          <h3>Em risco de cair de faixa</h3>
+          <p class="cardHint">Abaixo do mínimo da própria faixa — risco de perder o desconto negociado.</p>
           <div class="listaAlerta" id="listaRiscoQueda"></div>
         </div>
-        <div class="card">
-          <h3 style="color:#1E8E3E;">📈 Perto de subir de faixa</h3>
+        <div class="card dashLista" style="--corLista: var(--success);">
+          <h3>Perto de subir de faixa</h3>
           <p class="cardHint">Falta pouco pra promover — boa hora pra empurrar mais um pedido.</p>
           <div class="listaAlerta" id="listaPertoSubir"></div>
         </div>
-      </div>
-
-      <div class="dashRow">
-        <div class="card">
-          <h3 style="color:#B36B00;">🕒 Sem comprar há mais de 60 dias</h3>
-          <p class="cardHint">Clientes classificados que sumiram — vale uma ligação antes que percam a faixa.</p>
+        <div class="card dashLista" style="--corLista: var(--warning);">
+          <h3>Sem comprar há mais de 60 dias</h3>
+          <p class="cardHint">Pelo último pedido — vale uma ligação antes que percam a faixa.</p>
           <div class="listaAlerta" id="listaSemComprar"></div>
         </div>
-        <div class="card">
-          <h3>Top 5 clientes por faturamento</h3>
-          <p class="cardHint">Últimos 12 meses · relatório oficial de Faturamento.</p>
-          <div id="rankTopClientes"></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>Produtos mais vendidos</h3>
-        <p class="cardHint">Top 3 por faturamento no período — veja a curva completa na aba Curva ABC.</p>
-        <div id="rankTopProdutos"></div>
-        <button type="button" id="verCurvaAbcBtn" class="fileBtnLike" style="margin-top:10px;border:1px solid var(--hairline);background:var(--white);color:var(--ink);font:inherit;font-size:12.5px;font-weight:600;padding:8px 14px;border-radius:9px;cursor:pointer;">Ver Curva ABC completa →</button>
-      </div>
-
-      <div class="dashRow">
-        <div class="chartCard" style="margin-bottom:0;">
-          <div class="head">
-            <div>
-              <h2>Valor Família de Produtos x Mês</h2>
-              <p>Mês atual · todas as famílias, por faturamento</p>
-            </div>
-          </div>
-          <div class="chartScroll" id="chartFamiliaHost"></div>
-        </div>
-        <div class="chartCard" style="margin-bottom:0;">
-          <div class="head">
-            <div>
-              <h2>Valor Produtos Foco (Dash)</h2>
-              <p>Mês atual · famílias marcadas como foco no admin</p>
-            </div>
-          </div>
-          <div class="chartScroll" id="chartFocoHost"></div>
+        <div class="card dashLista" style="--corLista: var(--blue);">
+          <h3>Produtos mais vendidos</h3>
+          <p class="cardHint">Top 3 por faturamento no período.</p>
+          <div id="rankTopProdutos"></div>
+          <button type="button" id="verCurvaAbcBtn" class="dashLinkBtn">Ver Curva ABC completa →</button>
         </div>
       </div>
     </section>
-
     <section id="tabCurvaAbc" class="hidden">
-    <div class="controlsRow">
+    <!-- Curva ABC por aparelho (10/2026, opção "A" escolhida pelo usuário a partir de mockups):
+         celular empilhado; laptop (1200 px com mouse) = gráfico e categorias à esquerda e a
+         lista de produtos presa à direita. -->
+    <div class="controlsRow abcToolbar">
       <div class="segmented" id="verSeg">
         <button data-modo="produtos" class="active">Todos os produtos</button>
         <button data-modo="porCliente">Por cliente</button>
@@ -504,12 +717,13 @@
         <button data-campo="faturamento_total">Faturamento</button>
         <button data-campo="quantidade_total">Quantidade</button>
       </div>
+      <span class="abcResumo" id="abcResumo"></span>
     </div>
 
     <div class="card hidden" id="clientPickerCard" style="margin-bottom:14px;">
       <div id="clientPickerSearch">
         <p class="cardHint" style="margin-top:0;">Escolha o cliente pra ver o que ele mais e menos compra (mesma classificação A/B/C, só que sobre o histórico faturado desse cliente).</p>
-        <input type="text" id="clientPickerInput" placeholder="Buscar cliente por nome ou CNPJ…" style="font:inherit;font-size:13px;border:1px solid var(--hairline);border-radius:9px;padding:9px 12px;width:100%;background:var(--white);color:var(--ink);">
+        <input type="text" id="clientPickerInput" placeholder="Cliente: nome, fantasia, CNPJ, código, cidade…" style="font:inherit;font-size:13px;border:1px solid var(--hairline);border-radius:9px;padding:9px 12px;width:100%;background:var(--white);color:var(--ink);">
         <div id="clientPickerResults" style="margin-top:8px;"></div>
       </div>
       <div id="clientPickerSelected" class="hidden" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
@@ -521,27 +735,31 @@
       </div>
     </div>
 
-    <div class="kpiRow" id="kpiRow"></div>
-
-    <div class="chartCard">
-      <div class="head">
-        <div>
-          <h2 id="chartTitle">Curva de Pareto — participação por produto</h2>
-          <p>Ranking decrescente · linha = % acumulado</p>
-        </div>
-        <div class="legend" id="chartLegend"></div>
-      </div>
-      <div class="chartScroll" id="chartHost"></div>
+    <div class="abcTopo">
+      <div class="abcDivisao" id="abcDivisao"></div>
+      <div class="abcClasses" id="kpiRow"></div>
     </div>
 
-    <div class="bottomRow">
-      <div class="card">
-        <h3 id="catCardTitle">Por categoria</h3>
-        <p class="cardHint" id="catCardHint">Toque numa categoria pra filtrar a lista de produtos ao lado.</p>
-        <div id="catHost"></div>
-        <p class="footNote">Fonte: relatório oficial de Faturamento (Painel Administrativo → Relatórios e clientes).</p>
+    <div class="abcCorpo">
+      <div class="abcEsq">
+        <div class="chartCard">
+          <div class="head">
+            <div>
+              <h2 id="chartTitle">Curva de Pareto — participação por produto</h2>
+              <p>Do que mais vende ao que menos vende · linha = % acumulado · passe o mouse pra ver o produto</p>
+            </div>
+            <div class="legend" id="chartLegend"></div>
+          </div>
+          <div id="chartHost"></div>
+        </div>
+        <div class="card">
+          <h3 id="catCardTitle">Por categoria</h3>
+          <p class="cardHint" id="catCardHint">Toque numa categoria pra filtrar a lista de produtos.</p>
+          <div id="catHost"></div>
+          <p class="footNote">Fonte: relatório oficial de Faturamento (Painel Administrativo → Relatórios e clientes).</p>
+        </div>
       </div>
-      <div class="card">
+      <div class="card abcLista">
         <h3 id="itemCardTitle">Produtos</h3>
         <p class="cardHint" id="itemCardHint">Todas as classes ficam disponíveis aqui — use os filtros pra achar o que precisa pra planejar venda ou recomendar ao cliente.</p>
         <div class="prodFilters">
@@ -552,7 +770,7 @@
             <button data-classe="C">C</button>
           </div>
           <select id="categoriaFiltro"><option value="">Todas as categorias</option></select>
-          <input type="text" id="produtoBusca" placeholder="Buscar por nome ou código…">
+          <input type="text" id="produtoBusca" placeholder="Nome, código ou medida (ex.: serra copo 50)…">
         </div>
         <div class="prodCount" id="prodFiltroCount"></div>
         <div class="prodTableScroll" id="topTableHost"></div>
@@ -714,12 +932,12 @@
     let kpiExpandAberto = null;
     function toggleKpiExpand(tipo) {
       const panel = document.getElementById('kpiExpandPanel');
-      document.querySelectorAll('.kpi.kpiExpandable').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('#tabDashboardPrincipal [data-kpi-tipo]').forEach(el => el.classList.remove('active'));
       if (kpiExpandAberto === tipo) { panel.classList.add('hidden'); kpiExpandAberto = null; return; }
       kpiExpandAberto = tipo;
       const cfg = kpiExpandData[tipo];
       if (!cfg) return;
-      document.querySelector(`[data-kpi-tipo="${tipo}"]`)?.classList.add('active');
+      document.querySelector(`#tabDashboardPrincipal [data-kpi-tipo="${tipo}"]`)?.classList.add('active');
       panel.classList.remove('hidden');
       panel.innerHTML = `
         <h3>${escapeHtml(cfg.titulo)}</h3>
@@ -853,7 +1071,9 @@
       host.innerHTML = lista.map(c => `
         <button type="button" class="clientResultItem" data-id="${c.id}" data-nome="${escapeHtml(c.nome)}">
           <span class="crName">${escapeHtml(c.nome)}</span>
-          <span class="crDoc">${escapeHtml(c.documento || 'Sem CNPJ cadastrado')}</span>
+          <span class="crDoc">${[escapeHtml(c.documento || 'Sem CNPJ cadastrado'),
+            c.municipio ? escapeHtml(c.municipio + (c.uf ? '/' + c.uf : '')) : '',
+            c.nome_fantasia && textoBusca(c.nome_fantasia) !== textoBusca(c.nome) ? escapeHtml(c.nome_fantasia) : ''].filter(Boolean).join(' · ')}</span>
         </button>`).join('');
       host.querySelectorAll('.clientResultItem').forEach(btn => {
         btn.addEventListener('click', () => selecionarCliente(Number(btn.dataset.id), btn.dataset.nome));
@@ -911,10 +1131,14 @@
         const host = document.getElementById('clientPickerResults');
         if (termo.length < 2) { host.innerHTML = ''; return; }
         clientBuscaDebounce = setTimeout(async () => {
+          // resposta de um termo que já não está no campo (chegou atrasada) não troca a lista
+          const campo = document.getElementById('clientPickerInput');
           try {
             const resultados = await apiFetch('/api/clientes?busca=' + encodeURIComponent(termo));
+            if (campo.value.trim() !== termo) return;
             renderClientResults(resultados);
           } catch (e) {
+            if (campo.value.trim() !== termo) return;
             host.innerHTML = `<div class="ap-msg error inline">${escapeHtml(e.message)}</div>`;
           }
         }, 250);
@@ -945,8 +1169,14 @@
           document.querySelectorAll('#classeSeg button').forEach(b => b.classList.remove('active'));
           btn.classList.add('active');
           state.filtroClasse = btn.dataset.classe;
+          if (state.classificados.length) renderKPIs(state.classificados); // realça o bloco A/B/C
           renderProdutos();
         });
+      });
+      // Blocos A/B/C do topo (recriados a cada render): um listener no container.
+      document.getElementById('kpiRow').addEventListener('click', (e) => {
+        const bloco = e.target.closest('.abcClasse');
+        if (bloco) filtrarClasse(bloco.dataset.classe);
       });
       document.getElementById('categoriaFiltro').addEventListener('change', (e) => {
         state.filtroCategoria = e.target.value;
@@ -956,7 +1186,7 @@
       document.getElementById('produtoBusca').addEventListener('input', (e) => {
         clearTimeout(buscaDebounce);
         const valor = e.target.value;
-        buscaDebounce = setTimeout(() => { state.busca = valor.trim().toLowerCase(); renderProdutos(); }, 150);
+        buscaDebounce = setTimeout(() => { state.busca = valor.trim(); renderProdutos(); }, 150);
       });
       document.querySelector('#periodoSeg button[data-dias=""]').classList.add('active');
       document.querySelector('#campoSeg button[data-campo="faturamento_total"]').classList.add('active');
@@ -966,6 +1196,9 @@
         btn.addEventListener('click', () => ativarTabPrincipal(btn.dataset.tab));
       });
       document.getElementById('verCurvaAbcBtn').addEventListener('click', () => ativarTabPrincipal('curvaAbc'));
+      document.querySelectorAll('#mensalSeg button').forEach(btn => {
+        btn.addEventListener('click', () => { dashMensal.serie = btn.dataset.serie; renderMensal(); });
+      });
     }
 
     // Alterna entre a aba "Dashboard" (visão geral) e "Curva ABC" (o que já
@@ -977,6 +1210,8 @@
       document.querySelectorAll('#tabSegPrincipal button').forEach(b => b.classList.toggle('active', b.dataset.tab === nome));
       document.getElementById('tabDashboardPrincipal').classList.toggle('hidden', nome !== 'dashboard');
       document.getElementById('tabCurvaAbc').classList.toggle('hidden', nome !== 'curvaAbc');
+      document.body.classList.toggle('abaDash', nome === 'dashboard'); // página larga nas duas abas
+      document.body.classList.toggle('abaAbc', nome === 'curvaAbc');
       if (nome === 'dashboard') {
         document.getElementById('pageTitle').textContent = 'Dashboard';
         document.getElementById('topSub').textContent = 'Faturamento, metas de classificatório e vendas — visão geral pra ajudar na visita/negociação.';
@@ -1017,43 +1252,43 @@
       return `T${Math.floor((mes - 1) / 3) + 1}/${ano}`;
     }
 
-    // Gráfico de barras genérico pra série temporal (mensal/semanal/
-    // trimestral) - mesma linguagem visual do renderChart() da Curva ABC
-    // (SVG inline, barra por período), só que sem a linha de acumulado/
-    // classes A/B/C, que não fazem sentido aqui.
-    function renderBarrasSerieTemporal(hostId, pontos, opts) {
+    // Gráfico de barras do Dashboard (mensal/semanal/trimestral). Em HTML, não
+    // num SVG esticado: o SVG crescia com a largura e no laptop o gráfico
+    // mensal ficava com ~400 px de altura e letras grandes (10/2026). A altura
+    // vem do CSS (.barras); a barra do período atual sai em vermelho cheio e as
+    // fechadas em vermelho claro. opts: rotulo, valorKey, formatarValor (texto
+    // em cima da barra), atual(p) (período em andamento), meta (linha
+    // tracejada), media (linha pontilhada da média dos períodos fechados),
+    // pontas (rótulo só do 1º e do último), semValor, msgVazio.
+    function renderBarras(hostId, pontos, opts) {
       const host = document.getElementById(hostId);
-      const dados = (pontos || []).map(p => ({ data: p.periodo, valor: Number(p[opts.valorKey]) || 0 }));
-      const formatarValor = opts.formatarValor || brl;
+      const dados = (pontos || []).map(p => ({ periodo: p.periodo, valor: Number(p[opts.valorKey]) || 0, atual: opts.atual ? opts.atual(p) : false }));
       if (!dados.length || !dados.some(d => d.valor > 0)) {
         host.innerHTML = `<div class="chartEmpty">${opts.msgVazio || 'Sem faturamento suficiente nesse período ainda.'}</div>`;
         return;
       }
-      const n = dados.length;
-      const slot = opts.slot || 46;
-      const plotLeft = 40, plotRight = plotLeft + n * slot, plotTop = 14, plotBottom = 150;
-      const W = plotRight + 12, H = 176;
-      const alturaUtil = plotBottom - plotTop;
-      const barW = Math.min(28, slot * 0.6);
-      const maxValor = Math.max(...dados.map(d => d.valor), 1) * 1.15;
-      const yFor = (v) => plotBottom - (v / maxValor) * alturaUtil;
-      const barras = dados.map((d, i) => {
-        const x = plotLeft + i * slot + (slot - barW) / 2;
-        const y = yFor(d.valor);
-        const h = plotBottom - y;
-        const titulo = `${opts.rotulo(d.data)} — ${formatarValor(d.valor)}`;
-        return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(h, 1).toFixed(1)}" rx="3" fill="var(--red)"><title>${escapeHtml(titulo)}</title></rect>`;
-      }).join('');
-      const rotulos = dados.map((d, i) => {
-        const x = plotLeft + i * slot + slot / 2;
-        return `<text x="${x.toFixed(1)}" y="${(plotBottom + 14).toFixed(1)}" text-anchor="middle" font-size="9" fill="var(--gray)">${escapeHtml(opts.rotulo(d.data))}</text>`;
-      }).join('');
-      host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="min-width:${Math.min(W, 520)}px;height:auto;display:block;" role="img" aria-label="Gráfico de vendas">
-        <line x1="${plotLeft}" y1="${plotBottom}" x2="${plotRight}" y2="${plotBottom}" stroke="var(--hairline)" stroke-width="1"/>
-        ${barras}${rotulos}
-      </svg>`;
+      const formatarValor = opts.formatarValor || (v => formatCompact(v));
+      const formatarTitulo = opts.formatarTitulo || brl;
+      // mediaSemPrimeiro: a 1ª semana da série costuma vir cortada (o filtro do servidor é "hoje - 10 semanas").
+      const fechados = dados.filter((d, i) => !d.atual && !(opts.mediaSemPrimeiro && i === 0 && dados.length > 2));
+      const media = opts.media && fechados.length ? fechados.reduce((s, d) => s + d.valor, 0) / fechados.length : null;
+      const max = Math.max(...dados.map(d => d.valor), opts.meta || 0, 1) * 1.15;
+      const pct = v => Math.min(100, (v / max) * 100).toFixed(1) + '%';
+      const linhaMeta = opts.meta ? `<div class="linhaRef meta" style="bottom:${pct(opts.meta)};"><span>objetivo ${escapeHtml(formatCompact(opts.meta, true))}</span></div>` : '';
+      const linhaMedia = media ? `<div class="linhaRef media" style="bottom:${pct(media)};"></div>` : '';
+      const colunas = dados.map(d => `
+        <div class="barCol${d.atual ? ' atual' : ''}" title="${escapeHtml(`${opts.rotulo(d.periodo)} — ${formatarTitulo(d.valor)}`)}">
+          <span class="barVal">${d.valor ? escapeHtml(formatarValor(d.valor)) : ''}</span>
+          <div class="bar" style="height:${pct(d.valor)};"></div>
+        </div>`).join('');
+      const rotulos = opts.pontas
+        ? `<span>${escapeHtml(opts.rotulo(dados[0].periodo))}</span><span>${escapeHtml(opts.rotulo(dados[dados.length - 1].periodo))}</span>`
+        // "nov/25": o ano vai num <i> que some no celular (12 rótulos não cabem inteiros).
+        : dados.map(d => `<span${d.atual ? ' class="atual"' : ''}>${escapeHtml(opts.rotulo(d.periodo)).replace('/', '<i>/') + (opts.rotulo(d.periodo).includes('/') ? '</i>' : '')}</span>`).join('');
+      host.innerHTML = `
+        <div class="barras${opts.semValor ? ' semValor' : ''}" role="img" aria-label="${escapeHtml(opts.ariaLabel || 'Gráfico de vendas')}">${linhaMeta}${linhaMedia}${colunas}</div>
+        <div class="barRotulos${opts.pontas ? ' pontas' : ''}">${rotulos}</div>`;
     }
-
     function renderListaAlerta(hostId, lista, detalheFn) {
       const host = document.getElementById(hostId);
       if (!lista || lista.length === 0) { host.innerHTML = '<div class="lev-empty">Nenhum cliente nessa situação agora.</div>'; return; }
@@ -1067,11 +1302,13 @@
     function renderRankTopClientes(lista) {
       const host = document.getElementById('rankTopClientes');
       if (!lista || lista.length === 0) { host.innerHTML = '<div class="lev-empty">Sem dados suficientes.</div>'; return; }
+      const maior = Math.max(...lista.map(c => Number(c.faturamento) || 0), 1);
       host.innerHTML = lista.map((c, i) => `
         <div class="rankItem">
           <span class="pos">${i + 1}</span>
           <span class="nome">${escapeHtml(c.nome)}</span>
           <span class="valor">${brl(c.faturamento)}</span>
+          <span class="rankTrilho"><span class="rankBarra" style="display:block;width:${((Number(c.faturamento) || 0) / maior * 100).toFixed(1)}%;"></span></span>
         </div>`).join('');
     }
 
@@ -1092,18 +1329,80 @@
       }
     }
 
+    // Dias úteis do mês (segunda a sexta, sem feriados) e quantos já passaram
+    // até ontem - a entrada de pedidos vem do relatório da madrugada, que vai
+    // até o dia anterior. Base do "no ritmo atual fecha em" do cartão do mês.
+    function diasUteisDoMes(hoje) {
+      const ano = hoje.getFullYear(), mes = hoje.getMonth();
+      const ultimo = new Date(ano, mes + 1, 0).getDate();
+      let total = 0, passados = 0;
+      for (let d = 1; d <= ultimo; d++) {
+        const dia = new Date(ano, mes, d).getDay();
+        if (dia === 0 || dia === 6) continue;
+        total++;
+        if (d < hoje.getDate()) passados++;
+      }
+      return { total, passados, restantes: total - passados };
+    }
+
+    // Linha de tendência dos últimos 12 meses no rodapé do cartão.
+    function sparkline(valores) {
+      const v = valores.filter(x => Number.isFinite(x));
+      if (v.length < 2) return '';
+      const max = Math.max(...v), min = Math.min(...v);
+      const pontos = v.map((x, i) => `${(i / (v.length - 1) * 100).toFixed(1)},${(24 - ((x - min) / ((max - min) || 1)) * 22).toFixed(1)}`).join(' ');
+      return `<svg class="spark" viewBox="0 0 100 26" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pontos}" fill="none" stroke="var(--red)" stroke-width="2" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg>`;
+    }
+
+    // Anel do objetivo (opção "B" dos mockups, pedido do usuário junto da "A"):
+    // branco = entrada até agora, branco mais claro = o que o ritmo atual ainda
+    // deve trazer até o fim do mês.
+    function anelObjetivo(pct, pctRitmo) {
+      const C = 2 * Math.PI * 66;
+      const feito = Math.min(100, Math.max(0, pct)) / 100 * C;
+      const ritmo = pctRitmo == null ? 0 : Math.max(0, Math.min(100, pctRitmo) / 100 * C - feito);
+      return `<div class="anelObjetivo">
+        <svg viewBox="0 0 160 160" role="img" aria-label="${pct}% do objetivo do mês">
+          <circle cx="80" cy="80" r="66" fill="none" stroke="rgba(255,255,255,.22)" stroke-width="16"/>
+          ${ritmo > 0 ? `<circle cx="80" cy="80" r="66" fill="none" stroke="rgba(255,255,255,.45)" stroke-width="16" stroke-dasharray="0 ${feito.toFixed(1)} ${ritmo.toFixed(1)} ${C.toFixed(1)}"/>` : ''}
+          ${feito > 0 ? `<circle cx="80" cy="80" r="66" fill="none" stroke="#fff" stroke-width="16" stroke-linecap="round" stroke-dasharray="${feito.toFixed(1)} ${C.toFixed(1)}"/>` : ''}
+        </svg>
+        <div class="anelCentro"><b>${pct}%</b><span>do objetivo</span></div>
+      </div>`;
+    }
+
     function renderKpisPrincipal(resumo, alertas, metaMensal) {
+      // Procura o mês corrente pela data, não pela última linha da série: no
+      // dia 1º, sem pedido importado ainda, a última linha era o mês passado
+      // e os cartões ficavam mostrando o mês anterior inteiro.
       const mensal = resumo.mensal || [];
-      const atual = mensal[mensal.length - 1];
-      const anterior = mensal[mensal.length - 2];
+      const hoje = new Date();
+      const chaveMes = (ano, mes0) => { const d = new Date(ano, mes0, 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; };
+      const doMes = (chave) => mensal.find(m => String(m.periodo).slice(0, 7) === chave);
+      const atual = doMes(chaveMes(hoje.getFullYear(), hoje.getMonth()));
+      const anterior = doMes(chaveMes(hoje.getFullYear(), hoje.getMonth() - 1));
       // Entrada de pedidos (carteira + faturado, pela data de implantação - ver
       // SQL_ENTRADA_PEDIDOS_MENSAL em routes/relatorios.js), não faturamento.
       const fatAtual = atual ? Number(atual.valor) || 0 : 0;
       const pedidosAtual = atual ? Number(atual.pedidos) || 0 : 0;
-      const fatAnterior = anterior ? Number(anterior.valor) || 0 : 0;
+      const clientesAtual = atual ? Number(atual.clientes) || 0 : 0;
+      // Compara com o mesmo período do mês anterior (1º até o mesmo dia de
+      // hoje - SQL_ENTRADA_MES_ANTERIOR_ATE_HOJE): contra o mês anterior
+      // inteiro, todo começo de mês dava "↓ 100%". Servidor ainda sem esse
+      // campo (deploy do Render atrás do GitHub Pages) cai no mês inteiro.
+      const mesmoPeriodo = resumo.entradaMesAnteriorAteHoje;
+      let fatAnterior, rotuloComparacao;
+      if (mesmoPeriodo && mesmoPeriodo.ate) {
+        const [, mm, dd] = String(mesmoPeriodo.ate).slice(0, 10).split('-');
+        fatAnterior = Number(mesmoPeriodo.valor) || 0;
+        rotuloComparacao = dd === '01' ? `vs 1º/${mm}` : `vs 1º a ${dd}/${mm}`;
+      } else {
+        fatAnterior = anterior ? Number(anterior.valor) || 0 : 0;
+        rotuloComparacao = 'vs mês anterior';
+      }
       const deltaPct = fatAnterior ? ((fatAtual - fatAnterior) / fatAnterior) * 100 : null;
       const ticketMedio = pedidosAtual ? fatAtual / pedidosAtual : 0;
-      const deltaHtml = deltaPct == null ? 'vs mês anterior — sem dado' : `<span class="delta ${deltaPct >= 0 ? 'up' : 'down'}">${deltaPct >= 0 ? '↑' : '↓'} ${Math.abs(deltaPct).toFixed(1)}%</span> vs mês anterior`;
+      const deltaTxt = deltaPct == null ? `${rotuloComparacao} — sem pedido` : `${deltaPct >= 0 ? '↑' : '↓'} ${Math.abs(deltaPct).toFixed(1).replace('.', ',')}% ${rotuloComparacao}`;
 
       const canal = resumo.clientesAtivosPorCanal || { total: 0, porCanal: {} };
       const contas = resumo.contasSemComprar || { de3a5Meses: 0, de6a8Meses: 0 };
@@ -1130,52 +1429,162 @@
       document.getElementById('kpiExpandPanel').classList.add('hidden'); // reabre sob demanda no próximo clique
       kpiExpandAberto = null;
 
-      const metaPct = metaMensal ? Math.round((fatAtual / metaMensal) * 100) : null;
+      // ---- cartão do mês (vermelho) ----
       const lapisMeta = usuarioAtual?.is_admin
-        ? `<button type="button" onclick="editarMetaMensal()" title="Editar objetivo do mês" style="border:none;background:none;cursor:pointer;font-size:12px;padding:0 0 0 4px;vertical-align:middle;">✏️</button>`
+        ? `<button type="button" class="heroLapis" onclick="event.stopPropagation(); editarMetaMensal()" title="Editar objetivo do mês">✏️ objetivo</button>`
         : '';
+      const nomeMes = hoje.toLocaleDateString('pt-BR', { month: 'long' });
+      const uteis = diasUteisDoMes(hoje);
+      // Com menos de 3 dias úteis passados o ritmo ainda não diz nada.
+      const projecao = uteis.passados >= 3 ? fatAtual / uteis.passados * uteis.total : null;
+      let linhaMeta, numerosHtml, anel = '';
+      if (metaMensal) {
+        const metaPct = Math.round((fatAtual / metaMensal) * 100);
+        const falta = Math.max(0, metaMensal - fatAtual);
+        const pctRitmo = projecao == null ? null : Math.round((projecao / metaMensal) * 100);
+        anel = anelObjetivo(metaPct, pctRitmo);
+        linhaMeta = `<strong>${metaPct}%</strong> do objetivo de <strong>${escapeHtml(formatCompact(metaMensal, true))}</strong>`
+          + (projecao == null ? '' : ` · no ritmo atual fecha em ~<strong>${escapeHtml(formatCompact(projecao, true))}</strong> (${pctRitmo}%)`);
+        numerosHtml = falta === 0
+          ? `<div><b>Objetivo batido</b><span>${escapeHtml(formatCompact(fatAtual - metaMensal, true))} acima</span></div>`
+          : `<div><b>${escapeHtml(formatCompact(falta, true))}</b><span>faltam</span></div>`
+            + (uteis.restantes > 0 ? `<div><b>${escapeHtml(formatCompact(falta / uteis.restantes, true))}</b><span>por dia útil</span></div>` : '');
+      } else {
+        linhaMeta = 'Objetivo do mês ainda não definido'
+          + (projecao == null ? '' : ` · no ritmo atual fecha em ~<strong>${escapeHtml(formatCompact(projecao, true))}</strong>`);
+        numerosHtml = `<div><b>${pedidosAtual}</b><span>pedido${pedidosAtual === 1 ? '' : 's'}</span></div>`;
+      }
+      numerosHtml += `<div><b>${uteis.passados} de ${uteis.total}</b><span>dias úteis</span></div>`;
+      const hero = document.getElementById('dashHero');
+      hero.dataset.kpiTipo = 'entradaPedidos';
+      hero.setAttribute('role', 'button');
+      hero.tabIndex = 0;
+      hero.onclick = () => toggleKpiExpand('entradaPedidos');
+      hero.onkeydown = (e) => { if (e.target !== hero) return; if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleKpiExpand('entradaPedidos'); } };
+      hero.innerHTML = `
+        <div class="heroTexto">
+          <div class="heroTopo">
+            <span class="heroLbl">Entrada de pedidos · ${escapeHtml(nomeMes)} ▸</span>
+            <span class="heroPilula">${escapeHtml(deltaTxt)}</span>
+          </div>
+          <div class="heroValor">${escapeHtml(formatCompact(fatAtual, true))}</div>
+          <div class="heroLinha">${linhaMeta} ${lapisMeta}</div>
+          <div class="heroNums">${numerosHtml}</div>
+        </div>
+        ${anel}`;
 
+      // ---- indicadores com a tendência dos 12 meses ----
+      const serie = (chave) => mensal.map(m => Number(m[chave]) || 0);
+      const tickets = mensal.map(m => (Number(m.pedidos) || 0) ? (Number(m.valor) || 0) / Number(m.pedidos) : NaN);
+      const pedidosAnt = anterior ? Number(anterior.pedidos) || 0 : null;
+      // Mês passado INTEIRO (a série não tem o "até o mesmo dia") - o rótulo diz isso.
+      const nomeMesAnt = new Date(hoje.getFullYear(), hoje.getMonth() - 1, 1).toLocaleDateString('pt-BR', { month: 'long' });
+      const clientesAnt = anterior ? Number(anterior.clientes) || 0 : null;
       document.getElementById('kpiRowPrincipal').innerHTML = `
-        <div class="kpi">
-          <span class="lbl">Objetivo Mês${lapisMeta}</span>
-          <span class="val">${metaMensal ? formatCompact(metaMensal, true) : '—'}</span>
-          <span class="sub">${metaPct == null ? 'Meta ainda não definida' : `${metaPct}% do objetivo`}</span>
-        </div>
-        <div class="kpi kpiExpandable" data-kpi-tipo="entradaPedidos" onclick="toggleKpiExpand('entradaPedidos')">
-          <span class="lbl">Valor Entrada de Pedidos Mês ▸</span>
-          <span class="val">${formatCompact(fatAtual, true)}</span>
-          <span class="sub">${deltaHtml}</span>
-        </div>
         <div class="kpi">
           <span class="lbl">Ticket médio</span>
           <span class="val">${formatCompact(ticketMedio, true)}</span>
           <span class="sub">${pedidosAtual} pedido${pedidosAtual === 1 ? '' : 's'} no mês</span>
+          ${sparkline(tickets)}
         </div>
         <div class="kpi">
           <span class="lbl">Clientes Ativos por Canal</span>
           <span class="val">${canal.total || 0}</span>
           <span class="sub">Varejo: ${canal.porCanal.Varejo || 0} · Atacado: ${canal.porCanal.Atacado || 0} · Rede: ${canal.porCanal.Rede || 0}</span>
         </div>
-        <div class="kpi kpiExpandable" data-kpi-tipo="de3a5" onclick="toggleKpiExpand('de3a5')">
-          <span class="lbl">Contas - 3 a 5 Meses Sem Compra ▸</span>
-          <span class="val" style="color:#B36B00;">${contas.de3a5Meses || 0}</span>
-          <span class="sub">contas classificadas ou não</span>
+        <div class="kpi">
+          <span class="lbl">Pedidos no mês</span>
+          <span class="val">${pedidosAtual}</span>
+          <span class="sub">${pedidosAnt == null ? 'últimos 12 meses' : `${nomeMesAnt} inteiro: ${pedidosAnt}`}</span>
+          ${sparkline(serie('pedidos'))}
         </div>
-        <div class="kpi kpiExpandable" data-kpi-tipo="de6a8" onclick="toggleKpiExpand('de6a8')">
-          <span class="lbl">Contas - 6 a 8 Meses Sem Compra ▸</span>
-          <span class="val" style="color:#B3261E;">${contas.de6a8Meses || 0}</span>
-          <span class="sub">contas classificadas ou não</span>
-        </div>
-        <div class="kpi kpiExpandable" data-kpi-tipo="riscoQueda" onclick="toggleKpiExpand('riscoQueda')">
-          <span class="lbl">Em risco de queda ▸</span>
-          <span class="val" style="color:#B3261E;">${(alertas.riscoDeQueda || []).length}</span>
-          <span class="sub">clientes classificados</span>
-        </div>
-        <div class="kpi kpiExpandable" data-kpi-tipo="pertoSubir" onclick="toggleKpiExpand('pertoSubir')">
-          <span class="lbl">Perto de subir ▸</span>
-          <span class="val" style="color:#1E8E3E;">${(alertas.pertoDeSubir || []).length}</span>
-          <span class="sub">oportunidade de promover</span>
+        <div class="kpi">
+          <span class="lbl">Clientes no mês</span>
+          <span class="val">${clientesAtual}</span>
+          <span class="sub">${clientesAnt == null ? 'com pedido no mês' : `${nomeMesAnt} inteiro: ${clientesAnt}`}</span>
+          ${sparkline(serie('clientes'))}
         </div>`;
+
+      // ---- "Pede atenção": toque abre a lista (mesmo painel de antes) ----
+      const nomes = (lista, extra) => {
+        const l = lista || [];
+        if (!l.length) return extra || 'ninguém agora';
+        return l.slice(0, 2).map(c => c.nome).join(', ') + (l.length > 2 ? ` +${l.length - 2}` : '');
+      };
+      const itens = [
+        { tipo: 'riscoQueda', cor: 'danger', n: (alertas.riscoDeQueda || []).length, titulo: 'Em risco de cair de faixa', nomes: nomes(alertas.riscoDeQueda) },
+        { tipo: 'pertoSubir', cor: 'success', n: (alertas.pertoDeSubir || []).length, titulo: 'Perto de subir de faixa', nomes: nomes(alertas.pertoDeSubir) },
+        { tipo: 'de3a5', cor: 'warning', n: contas.de3a5Meses || 0, titulo: '3 a 5 meses sem compra', nomes: nomes(contas.clientesDe3a5Meses, 'contas classificadas ou não') },
+        { tipo: 'de6a8', cor: 'danger', n: contas.de6a8Meses || 0, titulo: '6 a 8 meses sem compra', nomes: nomes(contas.clientesDe6a8Meses, 'contas classificadas ou não') },
+      ];
+      document.getElementById('dashAtencao').innerHTML = itens.map(it => `
+        <button type="button" class="atItem" data-cor="${it.cor}" data-kpi-tipo="${it.tipo}" onclick="toggleKpiExpand('${it.tipo}')">
+          <span class="atNum">${it.n}</span>
+          <span class="atTexto"><span class="atTit">${escapeHtml(it.titulo)}</span><span class="atNomes">${escapeHtml(it.nomes)}</span></span>
+          <span class="atSeta" aria-hidden="true">›</span>
+        </button>`).join('');
+    }
+
+    // Gráfico mensal com as abas Valor/Pedidos/Clientes (eram 3 gráficos).
+    // Objetivo só na aba Valor; média pontilhada dos meses fechados.
+    let dashMensal = { resumo: null, meta: null, serie: 'valor' };
+    function renderMensal() {
+      const { resumo, meta, serie } = dashMensal;
+      if (!resumo) return;
+      const hoje = new Date();
+      const chaveAtual = `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}`;
+      const cfg = {
+        valor: { titulo: 'Entrada de pedidos por mês', formatarValor: v => formatCompact(v), formatarTitulo: brl, meta },
+        pedidos: { titulo: 'Pedidos por mês', formatarValor: v => String(Math.round(v)), formatarTitulo: v => `${Math.round(v)} pedidos` },
+        clientes: { titulo: 'Clientes com pedido por mês', formatarValor: v => String(Math.round(v)), formatarTitulo: v => `${Math.round(v)} clientes` },
+      }[serie];
+      document.getElementById('mensalTitulo').textContent = cfg.titulo;
+      document.querySelectorAll('#mensalSeg button').forEach(b => b.classList.toggle('active', b.dataset.serie === serie));
+      document.getElementById('mensalLegenda').innerHTML = `
+        <span><span class="sw" style="background:var(--red);"></span>Mês atual (parcial)</span>
+        <span><span class="sw" style="background:var(--accent-bg);box-shadow:inset 0 0 0 1px rgba(204,9,53,.25);"></span>Meses fechados</span>
+        ${cfg.meta ? '<span><span class="tr"></span>Objetivo do mês</span>' : ''}
+        <span><span class="md"></span>Média dos meses fechados</span>`;
+      renderBarras('chartMensalHost', resumo.mensal, {
+        rotulo: rotuloMes, valorKey: serie, formatarValor: cfg.formatarValor, formatarTitulo: cfg.formatarTitulo,
+        atual: p => String(p.periodo).slice(0, 7) === chaveAtual, meta: cfg.meta || null, media: true, ariaLabel: cfg.titulo,
+      });
+    }
+
+    // Semana e trimestre. As séries do servidor só trazem período com
+    // faturamento (sem generate_series): o período "atual" e a comparação do
+    // trimestre saem pela data, nunca pela posição na lista.
+    function renderSemanaTrimestre(resumo) {
+      const hoje = new Date();
+      const doisDig = n => String(n).padStart(2, '0');
+      const segunda = new Date(hoje.getFullYear(), hoje.getMonth(), hoje.getDate() - ((hoje.getDay() + 6) % 7));
+      const chaveSemana = `${segunda.getFullYear()}-${doisDig(segunda.getMonth() + 1)}-${doisDig(segunda.getDate())}`;
+      const semanal = resumo.semanal || [];
+      const ehSemanaAtual = p => String(p.periodo).slice(0, 10) === chaveSemana;
+      renderBarras('chartSemanalHost', semanal, { rotulo: rotuloSemana, valorKey: 'faturamento', atual: ehSemanaAtual, media: true, mediaSemPrimeiro: true, pontas: true, semValor: true, ariaLabel: 'Vendas por semana' });
+      const destSem = document.getElementById('semanalDestaque');
+      if (semanal.length) {
+        const daSemana = semanal.find(ehSemanaAtual);
+        const fechadas = semanal.filter((s, i) => !ehSemanaAtual(s) && !(i === 0 && semanal.length > 2)).map(s => Number(s.faturamento) || 0);
+        const media = fechadas.length ? fechadas.reduce((a, b) => a + b, 0) / fechadas.length : 0;
+        destSem.innerHTML = `<strong>${escapeHtml(formatCompact(daSemana ? Number(daSemana.faturamento) || 0 : 0, true))}</strong>esta semana até agora${media ? ` · média ${escapeHtml(formatCompact(media, true))}` : ''}`;
+      } else destSem.innerHTML = '';
+
+      const tri = resumo.trimestral || [];
+      const triDe = (ano, t) => tri.find(p => { const { ano: a, mes } = partesDoPeriodo(p.periodo); return a === ano && Math.floor((mes - 1) / 3) + 1 === t; });
+      const triAtual = Math.floor(hoje.getMonth() / 3) + 1;
+      const atualP = triDe(hoje.getFullYear(), triAtual);
+      renderBarras('chartTrimestralHost', tri, { rotulo: rotuloTrimestre, valorKey: 'faturamento', atual: p => p === atualP, pontas: true, semValor: true, ariaLabel: 'Vendas por trimestre' });
+      // Último trimestre fechado contra o mesmo trimestre do ano anterior.
+      const anoF = triAtual === 1 ? hoje.getFullYear() - 1 : hoje.getFullYear();
+      const tF = triAtual === 1 ? 4 : triAtual - 1;
+      const fechado = triDe(anoF, tF), anoAntes = triDe(anoF - 1, tF);
+      const destTri = document.getElementById('trimestralDestaque');
+      const vF = fechado ? Number(fechado.faturamento) || 0 : 0, vA = anoAntes ? Number(anoAntes.faturamento) || 0 : 0;
+      if (vF && vA) {
+        const d = (vF - vA) / vA * 100;
+        destTri.innerHTML = `<strong class="${d >= 0 ? 'up' : 'down'}">${d >= 0 ? '↑' : '↓'} ${Math.abs(d).toFixed(1).replace('.', ',')}%</strong>${escapeHtml(rotuloTrimestre(fechado.periodo))} vs ${escapeHtml(rotuloTrimestre(anoAntes.periodo))}`;
+      } else destTri.innerHTML = '';
     }
 
     async function carregarMetaMensal() {
@@ -1205,34 +1614,28 @@
       return { inicio: fmt(primeiro), fim: fmt(ultimo) };
     }
 
-    // Agrupa por família (categoria) e renderiza os dois gráficos que
-    // dependem dessa mesma busca do mês atual: todas as famílias, e só as
-    // marcadas como "foco" no admin - um fetch só, duas visões derivadas.
-    function renderGraficosProdutosMes(produtosMes, categoriasFoco) {
+    // Famílias do mês em barras deitadas (o nome cabe inteiro); as marcadas
+    // como foco no admin saem em vermelho com ★ - antes era um 2º gráfico só
+    // com elas.
+    function renderFamiliasMes(produtosMes, categoriasFoco) {
+      const host = document.getElementById('chartFamiliaHost');
       const porCategoria = new Map();
-      for (const p of produtosMes) {
-        const atual = porCategoria.get(p.categoria) || 0;
-        porCategoria.set(p.categoria, atual + p.faturamento_total);
-      }
-      // Eixo categórico (nome da família) em vez de datas - precisa de mais
-      // espaço por barra que o padrão de 46px usado nos gráficos de tempo
-      // (rótulos de data são sempre curtos, "out/25"), senão os nomes se
-      // sobrepõem.
-      const truncar = (c) => c.length > 12 ? c.slice(0, 11) + '…' : c;
-      const todasOrdenadas = [...porCategoria.entries()].sort((a, b) => b[1] - a[1]);
-      renderBarrasSerieTemporal('chartFamiliaHost', todasOrdenadas.map(([categoria, valor]) => ({ periodo: categoria, valor })), {
-        rotulo: truncar, valorKey: 'valor', msgVazio: 'Sem faturamento no mês ainda.', slot: 90,
-      });
+      for (const p of produtosMes) porCategoria.set(p.categoria, (porCategoria.get(p.categoria) || 0) + p.faturamento_total);
+      const ordenadas = [...porCategoria.entries()].filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+      if (!ordenadas.length) { host.innerHTML = '<div class="chartEmpty">Sem faturamento no mês ainda.</div>'; return; }
       const foco = new Set(categoriasFoco || []);
-      const focoOrdenado = todasOrdenadas.filter(([categoria]) => foco.has(categoria));
-      renderBarrasSerieTemporal('chartFocoHost', focoOrdenado.map(([categoria, valor]) => ({ periodo: categoria, valor })), {
-        rotulo: truncar, valorKey: 'valor', msgVazio: 'Nenhuma família marcada como foco (configure no painel admin).', slot: 90,
-      });
+      const maior = ordenadas[0][1];
+      host.innerHTML = ordenadas.map(([categoria, valor]) => `
+        <div class="famLinha${foco.has(categoria) ? ' foco' : ''}" title="${escapeHtml(`${categoria} — ${brl(valor)}`)}">
+          <span class="famNome">${escapeHtml(String(categoria).replace(/^\d+\s*-\s*/, ''))}${foco.has(categoria) ? ' ★' : ''}</span>
+          <span class="famTrilho"><span class="famBarra" style="display:block;width:${(valor / maior * 100).toFixed(1)}%;"></span></span>
+          <span class="famValor">${escapeHtml(formatCompact(valor, true))}</span>
+        </div>`).join('');
     }
 
     async function carregarDashboardPrincipal() {
-      const kpiHost = document.getElementById('kpiRowPrincipal');
-      kpiHost.innerHTML = '<div class="chartEmpty" style="grid-column:1/-1;">Carregando…</div>';
+      const hero = document.getElementById('dashHero');
+      hero.innerHTML = '<div class="chartEmpty">Carregando…</div>';
       try {
         const { inicio, fim } = datasDoMesAtual();
         const [resumo, alertas, metaMensal, produtosMesRaw, focoCfg] = await Promise.all([
@@ -1243,19 +1646,17 @@
           apiFetch('/api/configuracoes/produtos_foco_categorias').catch(() => ({ valor: [] })),
         ]);
         renderKpisPrincipal(resumo, alertas, metaMensal);
-        renderBarrasSerieTemporal('chartMensalHost', resumo.mensal, { rotulo: rotuloMes, valorKey: 'valor' });
-        renderBarrasSerieTemporal('chartPedidosMesHost', resumo.mensal, { rotulo: rotuloMes, valorKey: 'pedidos', formatarValor: v => String(Math.round(v)) });
-        renderBarrasSerieTemporal('chartClientesMesHost', resumo.mensal, { rotulo: rotuloMes, valorKey: 'clientes', formatarValor: v => String(Math.round(v)) });
-        renderBarrasSerieTemporal('chartSemanalHost', resumo.semanal, { rotulo: rotuloSemana, valorKey: 'faturamento' });
-        renderBarrasSerieTemporal('chartTrimestralHost', resumo.trimestral, { rotulo: rotuloTrimestre, valorKey: 'faturamento' });
+        dashMensal = { ...dashMensal, resumo, meta: metaMensal };
+        renderMensal();
+        renderSemanaTrimestre(resumo);
         renderListaAlerta('listaRiscoQueda', alertas.riscoDeQueda, c => `Faltam ${brl(c.faltaPraManter)}`);
         renderListaAlerta('listaPertoSubir', alertas.pertoDeSubir, c => `Faltam ${brl(c.faltaPraProximaFaixa)}`);
         renderListaAlerta('listaSemComprar', alertas.semComprarRecente, c => `${c.diasSemComprar} dias`);
         renderRankTopClientes(resumo.topClientes);
         carregarTopProdutos();
-        renderGraficosProdutosMes((produtosMesRaw || []).map(mapProdutoRow), focoCfg.valor);
+        renderFamiliasMes((produtosMesRaw || []).map(mapProdutoRow), focoCfg.valor);
       } catch (e) {
-        kpiHost.innerHTML = `<div class="ap-msg error inline" style="grid-column:1/-1;">${escapeHtml(e.message)}</div>`;
+        hero.innerHTML = `<div class="ap-msg error inline" style="margin:0;flex:1;">${escapeHtml(e.message)}</div>`;
       }
     }
 
@@ -1263,13 +1664,15 @@
       if (!dias) return { inicio: null, fim: null };
       const fim = new Date();
       const inicio = new Date(fim.getTime() - dias * 86400000);
-      const fmt = (d) => d.toISOString().slice(0, 10);
+      // dia do aparelho, não o de UTC: depois das 21h o toISOString já dava o
+      // dia seguinte e o período perdia o 1º dia
+      const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
       return { inicio: fmt(inicio), fim: fmt(fim) };
     }
 
     async function carregarDados() {
       if (state.carregando) return;
-      document.getElementById('kpiRow').innerHTML = '';
+      document.getElementById('kpiRow').innerHTML = ''; document.getElementById('abcDivisao').innerHTML = ''; document.getElementById('abcResumo').innerHTML = '';
       document.getElementById('topTableHost').innerHTML = '';
       document.getElementById('catHost').innerHTML = '';
       // modo "Por cliente" sem cliente escolhido ainda - nada pra buscar.
@@ -1331,7 +1734,7 @@
 
     function render() {
       if (state.raw.length === 0) {
-        document.getElementById('kpiRow').innerHTML = '';
+        document.getElementById('kpiRow').innerHTML = ''; document.getElementById('abcDivisao').innerHTML = ''; document.getElementById('abcResumo').innerHTML = '';
         document.getElementById('chartHost').innerHTML = '<div class="chartEmpty">Ainda não há dados de faturamento oficial suficientes nesse período pra calcular a curva ABC.</div>';
         document.getElementById('topTableHost').innerHTML = '<div class="lev-empty">Sem dados.</div>';
         document.getElementById('catHost').innerHTML = '<div class="lev-empty">Sem dados.</div>';
@@ -1356,11 +1759,44 @@
       return classificados.filter(p => {
         if (state.filtroClasse && p.classe !== state.filtroClasse) return false;
         if (state.filtroCategoria && p.categoria !== state.filtroCategoria) return false;
-        if (state.busca) {
-          const alvo = (p.produto + ' ' + p.codigo_sku).toLowerCase();
-          if (!alvo.includes(state.busca)) return false;
-        }
+        if (state.busca && !bateBusca(p.produto + ' ' + p.codigo_sku, state.busca)) return false;
         return true;
+      });
+    }
+
+    // Busca da lista (produtos ou clientes), mesmas regras da busca do app
+    // (index.html): sem acento, palavras em qualquer ordem, "50mm" = "50 mm",
+    // "4,5" = "4.5", medida exata ("50" não acha 150 nem 51; código com 4+
+    // dígitos vale pelo começo), começo de palavra ("diam" = diamantada) e 1
+    // letra errada em palavra de 4+. "de", "p/", "com"... não contam se faltarem.
+    // A ordem continua a da Curva (o ranking não muda pela busca).
+    function textoBusca(s) {
+      return String(s == null ? '' : s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+        .replace(/(\d),(\d)/g, '$1.$2')
+        .replace(/[^a-z0-9.]+/g, ' ')
+        .replace(/(\d)([a-z])/g, '$1 $2')
+        .replace(/(^|\s)\.+|\.+(?=\s|$)/g, ' ')
+        .replace(/\s+/g, ' ').trim();
+    }
+    const LIGACAO_BUSCA = new Set(['de', 'da', 'do', 'das', 'dos', 'e', 'em', 'p', 'para', 'com', 'a', 'o']);
+    function umaLetraDeDiferenca(a, b) {
+      if (Math.abs(a.length - b.length) > 1) return false;
+      let i = 0, j = 0, dif = 0;
+      while (i < a.length && j < b.length) {
+        if (a[i] === b[j]) { i++; j++; continue; }
+        if (++dif > 1) return false;
+        if (a.length > b.length) i++; else if (b.length > a.length) j++; else { i++; j++; }
+      }
+      return dif + (a.length - i) + (b.length - j) <= 1;
+    }
+    function bateBusca(alvo, busca) {
+      const tokens = textoBusca(alvo).split(' ');
+      const todas = textoBusca(busca).split(' ').filter(Boolean);
+      const palavras = todas.filter(w => !LIGACAO_BUSCA.has(w));
+      return (palavras.length ? palavras : todas).every(w => {
+        if (/^[\d.]+$/.test(w)) return tokens.includes(w) || (w.length >= 4 && tokens.some(t => t.startsWith(w)));
+        return tokens.some(t => t.startsWith(w) || (w.length >= 3 && t.includes(w)))
+          || (w.length >= 4 && tokens.some(t => !/^\d/.test(t) && umaLetraDeDiferenca(w, t)));
       });
     }
 
@@ -1376,108 +1812,98 @@
       else { select.value = ''; state.filtroCategoria = ''; }
     }
 
+    // Topo da Curva ABC: o cartão escuro ("N produtos fazem 80% do faturamento",
+    // com a fatia de cada classe no catálogo e no valor) e os blocos A/B/C, que
+    // filtram a lista ao tocar (o mesmo filtro dos botões Todas/A/B/C da lista).
     function renderKPIs(classificados) {
       const campo = state.campo;
-      const plural = (n) => `${itemLabel}${n === 1 ? '' : 's'}`;
+      const doQue = campo === 'faturamento_total' ? 'faturamento' : 'volume';
       const total = classificados.reduce((s, p) => s + p[campo], 0);
       const porClasse = { A: [], B: [], C: [] };
       classificados.forEach(p => porClasse[p.classe].push(p));
-      const somaClasse = (arr) => arr.reduce((s, p) => s + p[campo], 0);
-      const pctClasse = (arr) => total ? (somaClasse(arr) / total * 100) : 0;
-      const totalLbl = campo === 'faturamento_total' ? 'Faturamento no período' : 'Quantidade no período';
-      const caudaCount = porClasse.B.length + porClasse.C.length;
-      const caudaPct = pctClasse(porClasse.B) + pctClasse(porClasse.C);
-      document.getElementById('kpiRow').innerHTML = `
-        <div class="kpi">
-          <span class="lbl">${totalLbl}</span>
-          <span class="val">${formatValorCompact(total)}</span>
-          <span class="sub">${classificados.length} ${plural(classificados.length)} com faturamento</span>
-        </div>
-        <div class="kpi">
-          <span class="lbl">Produtos ativos</span>
-          <span class="val">${classificados.length}</span>
-          <span class="sub">no período selecionado</span>
-        </div>
-        <div class="kpi classA">
-          <span class="lbl">Classe A</span>
-          <span class="val">${porClasse.A.length} ${plural(porClasse.A.length)}</span>
-          <span class="sub">${pctClasse(porClasse.A).toFixed(0)}% do ${campo === 'faturamento_total' ? 'faturamento' : 'volume'}</span>
-        </div>
-        <div class="kpi classB">
-          <span class="lbl">Cauda (B + C)</span>
-          <span class="val">${caudaCount} ${plural(caudaCount)}</span>
-          <span class="sub">${caudaPct.toFixed(0)}% do ${campo === 'faturamento_total' ? 'faturamento' : 'volume'}</span>
-        </div>`;
+      const soma = (arr) => arr.reduce((s, p) => s + p[campo], 0);
+      const pctValor = (k) => total ? soma(porClasse[k]) / total * 100 : 0;
+      const pctQtd = (k) => classificados.length ? porClasse[k].length / classificados.length * 100 : 0;
+      const n = classificados.length;
+      const fmtPct = (v) => (v > 0 && v < 1 ? v.toFixed(1).replace('.', ',') : Math.round(v)) + '%';
+      const plural = (q) => `${q.toLocaleString('pt-BR')} ${itemLabel}${q === 1 ? '' : 's'}`;
+
+      document.getElementById('abcResumo').innerHTML = `<strong>${escapeHtml(formatValorCompact(total))}</strong> · ${plural(n)} com ${campo === 'faturamento_total' ? 'faturamento' : 'venda'}`;
+      const fatia = (k, pct, rotulo) => pct > 0 ? `<span class="div${k}" style="width:${pct.toFixed(2)}%;" title="Classe ${k}: ${fmtPct(pct)}">${pct >= 9 ? rotulo : ''}</span>` : '';
+      const dono = state.modo === 'porCliente' && state.clienteNome ? ` · ${escapeHtml(state.clienteNome)}` : '';
+      document.getElementById('abcDivisao').innerHTML = `
+        <span class="divLbl">Como o ${doQue} se divide${dono}</span>
+        <div class="divTitulo"><b>${plural(porClasse.A.length)}</b> ${porClasse.A.length === 1 ? 'faz' : 'fazem'} ${fmtPct(pctValor('A'))} do ${doQue}</div>
+        <div class="divLinha"><span>dos ${n.toLocaleString('pt-BR')} ${itemLabel}s</span>
+          <div class="divBarra">${fatia('A', pctQtd('A'), 'A')}${fatia('B', pctQtd('B'), 'B')}${fatia('C', pctQtd('C'), 'C')}</div></div>
+        <div class="divLinha"><span>do ${doQue}</span>
+          <div class="divBarra">${fatia('A', pctValor('A'), 'A · ' + fmtPct(pctValor('A')))}${fatia('B', pctValor('B'), 'B ' + fmtPct(pctValor('B')))}${fatia('C', pctValor('C'), 'C')}</div></div>
+        ${porClasse.C.length ? `<div class="divRodape">Os outros ${plural(porClasse.C.length)} (classe C, ${fmtPct(pctQtd('C'))} dos ${itemLabel}s) somam ${fmtPct(pctValor('C'))}.</div>` : ''}`;
+
+      document.getElementById('kpiRow').innerHTML = ['A', 'B', 'C'].map(k => {
+        const ativo = state.filtroClasse === k;
+        return `
+        <button type="button" class="abcClasse${ativo ? ' active' : ''}" data-classe="${k}" aria-pressed="${ativo}">
+          <span class="clLetra">${k}</span>
+          <span class="clQtd">${porClasse[k].length.toLocaleString('pt-BR')}</span>
+          <span class="clSub">${itemLabel}${porClasse[k].length === 1 ? '' : 's'}</span>
+          <span class="clValor">${escapeHtml(formatValorCompact(soma(porClasse[k])))}</span>
+          <span class="clSub">${fmtPct(pctValor(k))} do ${doQue}</span>
+          <span class="clAcao">${ativo ? '✓ filtrando a lista' : 'ver na lista →'}</span>
+        </button>`;
+      }).join('');
+    }
+
+    // Toque num bloco A/B/C: liga/desliga o filtro de classe da lista.
+    function filtrarClasse(classe) {
+      state.filtroClasse = state.filtroClasse === classe ? '' : classe;
+      document.querySelectorAll('#classeSeg button').forEach(b => b.classList.toggle('active', b.dataset.classe === state.filtroClasse));
+      renderKPIs(state.classificados);
+      renderProdutos();
     }
 
     const CORES_CLASSE = { A: 'var(--red)', B: 'var(--amber)', C: 'var(--hairline)', outros: '#9AA0A6' };
 
+    // Pareto em HTML: uma barra por produto até 120; acima disso, cada barra
+    // junta produtos vizinhos do ranking (a soma deles), na cor da classe do
+    // primeiro. A linha é o % acumulado no fim de cada barra. Altura fixa no
+    // CSS (o SVG antigo crescia com a largura e ficava enorme no laptop).
     function renderChart(classificados) {
       document.getElementById('chartLegend').innerHTML = `
         <span><i class="sw" style="background:var(--red)"></i>Classe A</span>
         <span><i class="sw" style="background:var(--amber)"></i>Classe B</span>
         <span><i class="sw" style="background:var(--hairline)"></i>Classe C</span>
-        <span><i class="ln"></i>Acumulado</span>`;
-
-      const totalGeral = classificados.reduce((s, p) => s + p[state.campo], 0) || 1;
-      const LIMITE = 18;
-      const shown = classificados.slice(0, LIMITE).map(p => ({ label: p.produto, valor: p[state.campo], pct: p.pct, classe: p.classe, cum: p.cumulativoPct }));
-      const tail = classificados.slice(LIMITE);
-      if (tail.length > 0) {
-        const tailValor = tail.reduce((s, p) => s + p[state.campo], 0);
-        shown.push({ label: `+${tail.length} outros`, valor: tailValor, pct: (tailValor / totalGeral) * 100, classe: 'outros', cum: 100, isOutros: true });
+        <span><i class="ln"></i>% acumulado</span>`;
+      const campo = state.campo;
+      const n = classificados.length;
+      const MAX_BARRAS = 120;
+      const porBarra = Math.max(1, Math.ceil(n / MAX_BARRAS));
+      const barras = [];
+      for (let i = 0; i < n; i += porBarra) {
+        const grupo = classificados.slice(i, i + porBarra);
+        barras.push({
+          valor: grupo.reduce((s, p) => s + p[campo], 0),
+          classe: grupo[0].classe,
+          cum: grupo[grupo.length - 1].cumulativoPct,
+          titulo: grupo.length === 1
+            ? `${i + 1}º · ${grupo[0].produto} — ${formatValor(grupo[0][campo])} · Classe ${grupo[0].classe} · ${grupo[0].cumulativoPct.toFixed(0)}% acumulado`
+            : `${i + 1}º a ${i + grupo.length}º (${grupo[0].produto}…) — ${formatValor(grupo.reduce((s, p) => s + p[campo], 0))} · ${grupo[grupo.length - 1].cumulativoPct.toFixed(0)}% acumulado`,
+        });
       }
-
-      const n = shown.length;
-      const slot = 52;
-      const plotLeft = 54, plotRight = plotLeft + n * slot, plotTop = 20, plotBottom = 220;
-      const W = plotRight + 20, H = 258;
-      const alturaUtil = plotBottom - plotTop;
-      const barW = Math.min(24, slot * 0.55);
-
-      const yFor = (pct) => plotBottom - (pct / 100) * alturaUtil;
-
-      const barsSvg = shown.map((b, i) => {
-        const x = plotLeft + i * slot + (slot - barW) / 2;
-        const y = yFor(b.pct);
-        const h = plotBottom - y;
-        const cor = CORES_CLASSE[b.classe] || CORES_CLASSE.C;
-        const titulo = `${b.label} — ${formatValor(b.valor)}${b.isOutros ? '' : ' · Classe ' + b.classe}`;
-        return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(h, 1).toFixed(1)}" rx="4" fill="${cor}"${b.isOutros ? ' opacity="0.75"' : ''}><title>${escapeHtml(titulo)}</title></rect>`;
-      }).join('');
-
-      const pontos = shown.map((b, i) => {
-        const x = plotLeft + i * slot + slot / 2;
-        const y = yFor(b.cum);
-        return `${x.toFixed(1)},${y.toFixed(1)}`;
-      }).join(' ');
-
-      const rotulos = shown.map((b, i) => {
-        if (i >= 6 && !b.isOutros) return '';
-        const x = plotLeft + i * slot + slot / 2;
-        const texto = b.label.length > 16 ? b.label.slice(0, 15) + '…' : b.label;
-        return `<text x="${x.toFixed(1)}" y="${(plotBottom + 16).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="var(--gray)"${b.isOutros ? ' font-weight="700" fill="var(--ink)"' : ''}>${escapeHtml(texto)}</text>`;
-      }).join('');
-
-      const y80 = yFor(80), y95 = yFor(95);
-
-      const svg = `
-      <svg viewBox="0 0 ${W} ${H}" width="100%" style="min-width:${Math.min(W, 640)}px;height:auto;display:block;" role="img" aria-label="Curva de Pareto de produtos">
-        <line x1="${plotLeft}" y1="${plotBottom}" x2="${plotRight}" y2="${plotBottom}" stroke="var(--hairline)" stroke-width="1"/>
-        <line x1="${plotLeft}" y1="${yFor(50)}" x2="${plotRight}" y2="${yFor(50)}" stroke="var(--hairline)" stroke-width="1" opacity="0.5"/>
-        <line x1="${plotLeft}" y1="${plotTop}" x2="${plotRight}" y2="${plotTop}" stroke="var(--hairline)" stroke-width="1" opacity="0.5"/>
-        <text x="${plotLeft - 8}" y="${plotBottom + 3}" text-anchor="end" font-size="10" fill="var(--gray)">0%</text>
-        <text x="${plotLeft - 8}" y="${(yFor(50) + 3).toFixed(1)}" text-anchor="end" font-size="10" fill="var(--gray)">50%</text>
-        <text x="${plotLeft - 8}" y="${plotTop + 3}" text-anchor="end" font-size="10" fill="var(--gray)">100%</text>
-        <line x1="${plotLeft}" y1="${y80.toFixed(1)}" x2="${plotRight}" y2="${y80.toFixed(1)}" stroke="var(--red)" stroke-width="1" stroke-opacity="0.3"/>
-        <text x="${plotRight}" y="${(y80 - 3).toFixed(1)}" text-anchor="end" font-size="9.5" fill="var(--red)" opacity="0.8">80%</text>
-        <line x1="${plotLeft}" y1="${y95.toFixed(1)}" x2="${plotRight}" y2="${y95.toFixed(1)}" stroke="var(--amber)" stroke-width="1" stroke-opacity="0.3"/>
-        <text x="${plotRight}" y="${(y95 - 3).toFixed(1)}" text-anchor="end" font-size="9.5" fill="var(--amber)" opacity="0.85">95%</text>
-        ${barsSvg}
-        <polyline fill="none" stroke="var(--ink)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="${pontos}"/>
-        ${rotulos}
-      </svg>`;
-      document.getElementById('chartHost').innerHTML = svg;
+      const maior = Math.max(...barras.map(b => b.valor), 1);
+      const colunas = barras.map(b => `<div class="parBarra ${b.classe}" style="height:${(b.valor / maior * 92).toFixed(1)}%;" title="${escapeHtml(b.titulo)}"></div>`).join('');
+      const pontos = barras.map((b, i) => `${((i + 0.5) / barras.length * 100).toFixed(2)},${(100 - b.cum).toFixed(2)}`).join(' ');
+      const fimA = classificados.filter(p => p.classe === 'A').length;
+      const fimB = fimA + classificados.filter(p => p.classe === 'B').length;
+      const ord = (k) => `${k.toLocaleString('pt-BR')}º ${itemLabel}`;
+      document.getElementById('chartHost').innerHTML = `
+        <div class="pareto" role="img" aria-label="Curva de Pareto: ${fimA} de ${n} ${itemLabel}s na classe A">
+          <div class="parBarras">${colunas}</div>
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pontos}" fill="none" stroke="var(--ink)" stroke-width="2.5" vector-effect="non-scaling-stroke" stroke-linejoin="round"/></svg>
+          ${fimA ? `<div class="parCorte a" style="top:20%;"><span>80% · fim da classe A (${ord(fimA)})</span></div>` : ''}
+          ${fimB > fimA ? `<div class="parCorte b" style="top:5%;"><span>95% · fim da B (${ord(fimB)})</span></div>` : ''}
+        </div>
+        <div class="parEixo"><span>1º</span>${n > 2 ? `<span>${Math.round(n / 2).toLocaleString('pt-BR')}º</span>` : ''}<span>${n.toLocaleString('pt-BR')}º</span></div>`;
     }
 
     // Mostra TODOS os produtos que passam nos filtros (Classe/Categoria/Busca),
@@ -1502,15 +1928,15 @@
       }
       const linhas = filtrados.map(p => `
         <tr>
-          <td><span class="prodName">${escapeHtml(p.produto)}</span><span class="prodCat">${escapeHtml(p.categoria)}</span></td>
           <td><span class="badge ${p.classe.toLowerCase()}">${p.classe}</span></td>
-          <td class="num">${formatValor(p[state.campo])}</td>
-          <td class="num">${p.cumulativoPct.toFixed(0)}%</td>
+          <td><span class="prodName">${escapeHtml(p.produto)}</span><span class="prodCat">${escapeHtml(p.codigo_sku)} · ${escapeHtml(p.categoria)}</span></td>
+          <td class="num">${formatValor(p[state.campo])}<span class="prodValPct">${p.pct < 0.1 ? '<0,1' : p.pct.toFixed(1).replace('.', ',')}% do total</span></td>
+          <td class="num">${p.cumulativoPct.toFixed(0)}%<span class="acumBarra"><i class="${p.classe.toLowerCase()}" style="width:${p.cumulativoPct.toFixed(1)}%;"></i></span></td>
           <td class="num"><button type="button" class="addCartBtn" data-add-cod="${escapeHtml(p.codigo_sku)}" data-add-nome="${escapeHtml(p.produto)}" aria-label="Adicionar ao orçamento" title="Adicionar ao orçamento"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button></td>
         </tr>`).join('');
       document.getElementById('topTableHost').innerHTML = `
         <table>
-          <thead><tr><th>${itemLabelCap}</th><th>Classe</th><th class="num">${state.campo === 'faturamento_total' ? 'Faturamento' : 'Qtd.'}</th><th class="num">% acum.</th><th class="num"></th></tr></thead>
+          <thead><tr><th></th><th>${itemLabelCap}</th><th class="num">${state.campo === 'faturamento_total' ? 'Faturamento' : 'Qtd.'}</th><th class="num">% acum.</th><th class="num"></th></tr></thead>
           <tbody>${linhas}</tbody>
         </table>`;
     }
@@ -1518,17 +1944,23 @@
     function renderCategorias(classificados) {
       const porCategoria = new Map();
       classificados.forEach(p => {
-        const atual = porCategoria.get(p.categoria) || { valor: 0, n: 0 };
+        const atual = porCategoria.get(p.categoria) || { valor: 0, n: 0, porClasse: { A: 0, B: 0, C: 0 } };
         atual.valor += p[state.campo];
+        atual.porClasse[p.classe] += p[state.campo];
         atual.n += 1;
         porCategoria.set(p.categoria, atual);
       });
       const lista = [...porCategoria.entries()].sort((a, b) => b[1].valor - a[1].valor).slice(0, 12);
       const max = Math.max(...lista.map(([, v]) => v.valor), 1);
+      // A barra da categoria vem dividida pela classe dos produtos dela (A/B/C).
+      const fatias = (v) => ['A', 'B', 'C'].map(k => {
+        const w = v.porClasse[k] / max * 100;
+        return w > 0 ? `<div class="fillbar f${k}" style="width:${w.toFixed(2)}%" title="Classe ${k}: ${escapeHtml(formatValor(v.porClasse[k]))}"></div>` : '';
+      }).join('');
       document.getElementById('catHost').innerHTML = lista.map(([nome, v]) => `
         <button type="button" class="catBar catBarBtn${state.filtroCategoria === nome ? ' active' : ''}" data-categoria="${escapeHtml(nome)}">
-          <span class="name" title="${escapeHtml(nome)}">${escapeHtml(nome)}</span>
-          <div class="track"><div class="fillbar" style="width:${Math.max((v.valor / max) * 100, 3).toFixed(1)}%"></div></div>
+          <span class="name" title="${escapeHtml(nome)}">${escapeHtml(String(nome).replace(/^\d+\s*-\s*/, ''))}</span>
+          <div class="track">${fatias(v)}</div>
           <span class="amt">${formatValorCompact(v.valor)}</span>
         </button>`).join('');
       document.querySelectorAll('.catBarBtn').forEach(btn => {

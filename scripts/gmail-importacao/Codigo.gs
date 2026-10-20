@@ -1,0 +1,451 @@
+// Cortag Revolution Tools - importação automática dos relatórios pelo Gmail.
+//
+// Roda no Google Apps Script da conta que recebe os relatórios (russo2055),
+// a cada 15 minutos: procura os e-mails da Cortag com planilha anexa e manda
+// cada anexo pro servidor do app (POST /api/importacao-email/arquivo), que lê
+// a planilha e publica sozinho - mesmo efeito de importar pelo Painel (⚙).
+// O "Relatório de Clientes Sem Compra" (todo dia 2, anexo de nome cortado e sem
+// extensão) e a "Previa Relatório de Inadimplência" (anexo sempre "20.xlsx")
+// são reconhecidos pelo assunto (CONFIG.porAssunto).
+// Os avisos sem planilha (Pedido Bloqueado, Pedido de Venda à Vista e o
+// "Cancelamento saldo em carteira" das assistentes comerciais) vão só com
+// assunto + texto + HTML do corpo (POST /api/importacao-email/mensagem).
+// O servidor NÃO recebe acesso à caixa de e-mail: só os anexos e textos que
+// este script escolhe mandar.
+//
+// Instalação (uma vez): ver docs/IMPORTACAO-EMAIL.md
+//  1. script.google.com (logado no russo2055) › Novo projeto › colar este arquivo;
+//  2. Configurações do projeto › Propriedades do script › CHAVE = a chave da
+//     importação (a mesma de IMPORTACAO_EMAIL_CHAVE no Render);
+//  3. escolher a função "configurar" e tocar em Executar › autorizar.
+//
+// Resultado de cada e-mail fica num marcador do Gmail:
+//  - "Cortag/Importado": entrou no app;
+//  - "Cortag/Falhou": o app recusou a planilha (formato estranho, corrompida) -
+//    importar na mão pelo Painel. Ninguém é avisado no app (decisão do usuário);
+//  - "Cortag/Nao autenticado": o e-mail diz vir da Cortag mas o Gmail não
+//    confirmou (DKIM/DMARC) - NÃO é mandado pro app. Ver "Segurança" abaixo.
+// Servidor dormindo/fora do ar: não marca nada e tenta de novo na próxima rodada.
+// Servidor que RESPONDE com erro (5xx) pro mesmo e-mail: tenta de novo nas
+// próximas rodadas e, na 4ª vez (~1 h), desiste dele ("Cortag/Falhou") pra não
+// travar a fila - senão o relatório diário e os pedidos bloqueados que
+// chegassem depois ficavam parados atrás dele pra sempre.
+//
+// Segurança: o app publica direto (inclusive preços), então só vale e-mail que
+// é mesmo da Cortag. O "De:" se falsifica à vontade ("vendas@cortag.com"
+// <qualquer@outro.com>), então: (1) o endereço tem que ser EXATAMENTE o da
+// regra e (2) o Gmail tem que ter autenticado o domínio dele - DMARC ou DKIM
+// "pass" do próprio domínio no cabeçalho Authentication-Results que o Gmail
+// põe por cima de tudo ao receber. Pra conferir os e-mails reais antes de
+// valer: rodar a função "conferirAutenticacao" (ver docs/IMPORTACAO-EMAIL.md).
+
+const CONFIG = {
+  urlServidor: 'https://appdb-z6uh.onrender.com',
+  minutos: 15,
+  diasParaTras: 7,
+  marcadorImportado: 'Cortag/Importado',
+  marcadorFalhou: 'Cortag/Falhou',
+  marcadorNaoAutenticado: 'Cortag/Nao autenticado',
+  // remetente + nome do anexo de cada relatório (o servidor confere de novo
+  // o tipo pelas abas/colunas da planilha)
+  regras: [
+    { remetente: 'noreply@cortag.com.br', anexo: /^Repres-.*\.xlsx$/i }, // Carteira/Faturamento (todo dia)
+    { remetente: 'noreply@cortag.com.br', anexo: /Classificatorio\.xlsx$/i }, // Classificatório
+    { remetente: 'noreply@cortag.com.br', anexo: /^ESCE007-.*\.xlsx$/i }, // itens em falta = previsão de estoque
+    { remetente: 'vendas@cortag.com', anexo: /LISTA PADR\S{1,2}O.*SUL SUDESTE.*\.xlsx$/i }, // Lista de Preços
+  ],
+  // relatórios cujo anexo vem com o nome cortado e SEM extensão
+  // ("02_10_2026_RUSSO"'S_REPRESENTACOES_COMERCIAIS_LTDA_Clientes_s"): vale o
+  // assunto, e o anexo vai pro servidor com o nome `${nome}_AAAA-MM-DD.xlsx`
+  // (data do e-mail). O servidor confere de novo o tipo pelas colunas.
+  porAssunto: [
+    { remetente: 'noreply@cortag.com.br', assunto: /Clientes Sem Compra|Base de Clientes x Compra/i,
+      busca: '(subject:"Clientes Sem Compra" OR subject:"Base de Clientes")', nome: 'ClientesSemCompra' }, // todo dia 2
+    // anexo sempre "20.xlsx" (o código do representante): só o assunto diz o que é
+    { remetente: 'noreply@cortag.com.br', assunto: /Relat[óo]rio de Inadimpl/i,
+      busca: 'subject:Inadimplência', nome: 'Inadimplencia' }, // sem dia fixo, 2-4x por mês
+  ],
+  // e-mails sem planilha: vai o texto (o servidor lê pedido, cliente, motivo/valor)
+  mensagens: [
+    { remetente: 'noreply@cortag.com.br', assunto: /^\s*Pedido Bloqueado\b/i, busca: 'subject:"Pedido Bloqueado"' },
+    { remetente: 'noreply@cortag.com.br', assunto: /Pedido de Venda [àa] Vista/i, busca: 'subject:"Pedido de Venda"' },
+    // aviso final antes de cortar o saldo em carteira (tabela no corpo); só o
+    // e-mail original - "RES:"/"Re:"/"Fwd:" ficam de fora
+    { remetente: 'thamiris.sabino@cortag.com', assunto: /^\s*Cancelamento saldo em carteira\b/i, busca: 'subject:"Cancelamento saldo em carteira"' },
+    { remetente: 'paloma.mantovani@cortag.com', assunto: /^\s*Cancelamento saldo em carteira\b/i, busca: 'subject:"Cancelamento saldo em carteira"' },
+    { remetente: 'atendimento01@cortag.com', assunto: /^\s*Cancelamento saldo em carteira\b/i, busca: 'subject:"Cancelamento saldo em carteira"' },
+  ],
+  maxProcessadosGuardados: 400,
+  // e-mail com erro do servidor (5xx) nesta quantidade de rodadas seguidas:
+  // desiste dele e segue a fila
+  maxTentativasErroServidor: 4,
+  // o Google corta cada execução em 6 min, e cada relatório leva ~1-3 min no
+  // servidor: depois de 3 min não começa outro arquivo (fica pra próxima rodada)
+  tempoMaximoMs: 3 * 60 * 1000,
+};
+
+// Rodar uma vez: confere a chave, cria os marcadores e o agendamento de 15 min.
+function configurar() {
+  chave_();
+  marcador_(CONFIG.marcadorImportado);
+  marcador_(CONFIG.marcadorFalhou);
+  marcador_(CONFIG.marcadorNaoAutenticado);
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'verificarEmails')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('verificarEmails').timeBased().everyMinutes(CONFIG.minutos).create();
+  verificarEmails();
+  Logger.log('Pronto: verificando o e-mail a cada %s minutos.', CONFIG.minutos);
+}
+
+function verificarEmails() {
+  const inicio = Date.now();
+  const props = PropertiesService.getScriptProperties();
+  const chave = chave_();
+  const processados = JSON.parse(props.getProperty('PROCESSADOS') || '[]');
+  const jaFeito = new Set(processados);
+  const remetentes = Array.from(new Set(CONFIG.regras.map(r => r.remetente)));
+  const remetentesTodos = Array.from(new Set(remetentes
+    .concat(CONFIG.mensagens.map(m => m.remetente), CONFIG.porAssunto.map(r => r.remetente))));
+  const periodo = `newer_than:${CONFIG.diasParaTras}d`;
+  const consultas = [`from:(${remetentes.join(' OR ')}) has:attachment filename:xlsx ${periodo}`]
+    .concat(CONFIG.porAssunto.map(r => `from:${r.remetente} has:attachment ${r.busca} ${periodo}`))
+    .concat(CONFIG.mensagens.map(m => `from:${m.remetente} ${m.busca} ${periodo}`));
+  const limite = new Date(Date.now() - CONFIG.diasParaTras * 86400000);
+
+  // junta os e-mails novos e importa do MAIS ANTIGO pro mais novo - senão uma
+  // Lista de Preços antiga podia sobrescrever a errata que chegou depois
+  const fila = [];
+  const naFila = new Set();
+  consultas.forEach(consulta => GmailApp.search(consulta, 0, 50).forEach(thread => {
+    thread.getMessages().forEach(msg => {
+      const id = msg.getId();
+      if (jaFeito.has(id) || naFila.has(id) || msg.getDate() < limite) return;
+      const de = enderecoDe_(msg.getFrom());
+      const todosAnexos = msg.getAttachments({ includeInlineImages: false });
+      const peloAssunto = CONFIG.porAssunto.find(r => de === r.remetente && r.assunto.test(msg.getSubject()));
+      const anexos = peloAssunto
+        ? todosAnexos.map((a, i) => ({ anexo: a, nome: nomePeloAssunto_(peloAssunto, msg, i, todosAnexos.length) }))
+        : todosAnexos.filter(a => CONFIG.regras.some(r => de === r.remetente && r.anexo.test(a.getName())))
+          .map(a => ({ anexo: a, nome: a.getName() }));
+      const ehMensagem = CONFIG.mensagens.some(m => de === m.remetente && m.assunto.test(msg.getSubject()));
+      if (anexos.length === 0 && !ehMensagem) {
+        // "De:" que cita um remetente da Cortag mas não é exatamente ele: fica de
+        // fora, mas deixa rastro no log (pode ser a Cortag mudando o formato)
+        if (remetentesTodos.some(r => msg.getFrom().toLowerCase().indexOf(r) !== -1 && de !== r)) {
+          Logger.log('Ignorado - o endereço não é exatamente o da Cortag: "%s" de %s', msg.getSubject(), msg.getFrom());
+        }
+        processados.push(id); jaFeito.add(id); return;
+      }
+      if (!autenticadoComCache_(props, msg, de)) {
+        Logger.log('NÃO autenticado (não vai pro app): "%s" de %s', msg.getSubject(), msg.getFrom());
+        thread.addLabel(marcador_(CONFIG.marcadorNaoAutenticado));
+        processados.push(id); jaFeito.add(id);
+        return;
+      }
+      naFila.add(id);
+      fila.push({ thread, msg, anexos, ehMensagem });
+    });
+  }));
+  fila.sort((a, b) => a.msg.getDate() - b.msg.getDate());
+
+  const salvar = () => props.setProperty('PROCESSADOS', JSON.stringify(processados.slice(-CONFIG.maxProcessadosGuardados)));
+  salvar();
+  let servidorAcordado = false;
+  for (const item of fila) {
+    if (Date.now() - inicio > CONFIG.tempoMaximoMs) {
+      Logger.log('Tempo da rodada esgotado - o resto fica pra próxima (%s e-mail(s)).', fila.length - fila.indexOf(item));
+      break;
+    }
+    if (!servidorAcordado) {
+      if (!acordarServidor_()) break; // fora do ar: tenta tudo de novo na próxima rodada
+      servidorAcordado = true;
+    }
+    let falhou = false;
+    let tentarDeNovo = false;
+    let erroServidor = false;
+    let algumOk = false;
+    const resultados = item.anexos.length
+      ? item.anexos.map(a => enviar_(chave, a.anexo, a.nome, item.msg))
+      : [enviarMensagem_(chave, item.msg)];
+    for (const r of resultados) {
+      if (r === 'tentar-de-novo') tentarDeNovo = true;
+      else if (r === 'erro-servidor') erroServidor = true;
+      else if (r === 'falhou') falhou = true;
+      else if (r === 'ok') algumOk = true;
+    }
+    if (tentarDeNovo) break; // mantém a ordem: o resto fica pra próxima rodada
+    if (erroServidor) {
+      const tentativas = contarTentativa_(props, item.msg.getId());
+      if (tentativas < CONFIG.maxTentativasErroServidor) {
+        Logger.log('Erro do servidor em "%s" (%s de %s) - tento de novo na próxima rodada.', item.msg.getSubject(), tentativas, CONFIG.maxTentativasErroServidor);
+        break; // mantém a ordem
+      }
+      Logger.log('Erro do servidor em "%s" %s vezes seguidas - desisto dele e sigo a fila.', item.msg.getSubject(), tentativas);
+      falhou = true;
+    }
+    // e-mail com mais de um anexo pode ter parte importada e parte recusada:
+    // ganha os dois marcadores (antes ficava só "Falhou", com anexo dentro do app)
+    if (algumOk || !falhou) item.thread.addLabel(marcador_(CONFIG.marcadorImportado));
+    if (falhou) item.thread.addLabel(marcador_(CONFIG.marcadorFalhou));
+    if (algumOk && falhou) Logger.log('"%s": parte dos anexos entrou e parte não - veja acima quais.', item.msg.getSubject());
+    processados.push(item.msg.getId());
+    esquecerTentativas_(props, item.msg.getId());
+    esquecerAutenticacao_(props, item.msg.getId());
+    salvar(); // a cada e-mail: se a execução for cortada, o que já foi não volta
+  }
+}
+
+// 'ok' | 'falhou' (planilha recusada - não adianta repetir) | 'erro-servidor'
+// (o servidor respondeu com erro - tenta de novo, até um limite) |
+// 'tentar-de-novo' (sem resposta, limite de uso - tenta de novo, sem limite)
+function enviar_(chave, anexo, nome, msg) {
+  return postar_(chave, '/api/importacao-email/arquivo', nome, {
+    nome,
+    arquivoBase64: Utilities.base64Encode(anexo.getBytes()),
+    remetente: msg.getFrom(),
+    assunto: msg.getSubject(),
+    recebidoEm: msg.getDate().toISOString(),
+    mensagemId: msg.getId(),
+  });
+}
+
+// "ClientesSemCompra_2026-10-02.xlsx" (com _2, _3... se o e-mail tiver mais de um anexo)
+function nomePeloAssunto_(regra, msg, i, total) {
+  const dia = Utilities.formatDate(msg.getDate(), 'America/Sao_Paulo', 'yyyy-MM-dd');
+  return `${regra.nome}_${dia}${total > 1 ? '_' + (i + 1) : ''}.xlsx`;
+}
+
+// E-mail sem planilha (Pedido Bloqueado, Pedido de Venda à Vista, Cancelamento
+// saldo em carteira): o texto e o HTML (a tabela do cancelamento só dá pra ler
+// pelo HTML - no texto puro as células viram uma linha só).
+function enviarMensagem_(chave, msg) {
+  return postar_(chave, '/api/importacao-email/mensagem', msg.getSubject(), {
+    assunto: msg.getSubject(),
+    texto: msg.getPlainBody().slice(0, 20000),
+    html: htmlEnxuto_(msg.getBody()).slice(0, 300000),
+    remetente: msg.getFrom(),
+    recebidoEm: msg.getDate().toISOString(),
+    mensagemId: msg.getId(),
+  });
+}
+
+// Tira do HTML o que não é conteúdo (comentários, <style>, atributos style/class,
+// <o:p> do Outlook) antes de cortar no limite - e-mail do Outlook tem uns KB de
+// enfeite por linha da tabela, e o corte no meio dela perdia os itens do fim.
+function htmlEnxuto_(html) {
+  return String(html || '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<style\b[\s\S]*?<\/style>/gi, '')
+    .replace(/<\/?o:p>/gi, '')
+    .replace(/\s(?:style|class|lang)=("[^"]*"|'[^']*')/gi, '');
+}
+
+function postar_(chave, caminho, rotulo, corpo) {
+  let resp;
+  try {
+    resp = UrlFetchApp.fetch(CONFIG.urlServidor + caminho, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { 'X-Chave-Importacao': chave },
+      payload: JSON.stringify(corpo),
+      muteHttpExceptions: true,
+    });
+  } catch (e) {
+    Logger.log('Sem resposta do servidor (%s) - tento de novo na próxima rodada.', e);
+    return 'tentar-de-novo';
+  }
+  const codigo = resp.getResponseCode();
+  Logger.log('%s: %s %s', rotulo, codigo, resp.getContentText().slice(0, 300));
+  if (codigo === 401) throw new Error('O servidor recusou a CHAVE - confira a propriedade CHAVE do script e IMPORTACAO_EMAIL_CHAVE no Render.');
+  if (codigo >= 200 && codigo < 300) return 'ok';
+  if (codigo === 422) return 'falhou';
+  if (codigo >= 500) return 'erro-servidor';
+  return 'tentar-de-novo'; // 429 (limite), 408...
+}
+
+// Rodadas seguidas com erro do servidor por e-mail (id -> n), guardadas entre
+// as execuções. Devolve a contagem com esta.
+function contarTentativa_(props, id) {
+  const tentativas = JSON.parse(props.getProperty('TENTATIVAS') || '{}');
+  tentativas[id] = (tentativas[id] || 0) + 1;
+  const ids = Object.keys(tentativas);
+  if (ids.length > 50) ids.slice(0, ids.length - 50).forEach(k => { delete tentativas[k]; });
+  props.setProperty('TENTATIVAS', JSON.stringify(tentativas));
+  return tentativas[id];
+}
+
+function esquecerTentativas_(props, id) {
+  const tentativas = JSON.parse(props.getProperty('TENTATIVAS') || '{}');
+  if (!(id in tentativas)) return;
+  delete tentativas[id];
+  props.setProperty('TENTATIVAS', JSON.stringify(tentativas));
+}
+
+// O Render gratuito dorme sem uso: chama /health e espera acordar (até ~1,5 min).
+// Depois confere o banco (/health/banco): com o banco fora, a rodada acaba sem
+// mandar nada - os 503 de uma queda longa do banco não contam como tentativa e
+// o script não desiste de e-mails bons. Servidor sem a rota (404, versão
+// anterior) conta como banco no ar.
+function acordarServidor_() {
+  for (let i = 0; i < 4; i++) {
+    try {
+      const r = UrlFetchApp.fetch(CONFIG.urlServidor + '/health', { muteHttpExceptions: true });
+      if (r.getResponseCode() === 200) return bancoNoAr_();
+    } catch (e) { /* ainda acordando */ }
+    Utilities.sleep(20000);
+  }
+  Logger.log('Servidor não respondeu - tento de novo na próxima rodada.');
+  return false;
+}
+
+function bancoNoAr_() {
+  try {
+    const r = UrlFetchApp.fetch(CONFIG.urlServidor + '/health/banco', { muteHttpExceptions: true });
+    if (r.getResponseCode() === 200 || r.getResponseCode() === 404) return true;
+  } catch (e) { /* sem resposta */ }
+  Logger.log('Banco de dados do app fora do ar - tento de novo na próxima rodada (sem contar tentativa).');
+  return false;
+}
+
+// "Vendas <vendas@cortag.com>" -> "vendas@cortag.com". Só o que está dentro
+// de <...>: o nome de exibição é texto livre de quem mandou.
+function enderecoDe_(from) {
+  const s = String(from || '');
+  const m = s.match(/<([^<>]*)>\s*$/);
+  return (m ? m[1] : s).trim().toLowerCase();
+}
+
+// autenticadoPeloGmail_ com memória entre as rodadas: o cabeçalho só vem com
+// o e-mail inteiro (getRawContent, ~9 MB numa Lista de Preços), e um e-mail
+// que espera na fila (servidor com erro, tempo esgotado) era relido a cada 15
+// min. Guarda só o "autenticado" dos que estão na fila (some ao processar).
+// A chave tem versão: quando a checagem muda (ficou mais rígida em 10/2026), o
+// "autenticado" guardado pela regra antiga não vale mais - o e-mail é conferido
+// de novo pela regra nova.
+const CHAVE_AUTENTICADOS = 'AUTENTICADOS_v2';
+function autenticadoComCache_(props, msg, de) {
+  const id = msg.getId();
+  if (props.getProperty('AUTENTICADOS') !== null) props.deleteProperty('AUTENTICADOS'); // versão anterior
+  const guardados = JSON.parse(props.getProperty(CHAVE_AUTENTICADOS) || '{}');
+  if (guardados[id] === de) return true;
+  const ok = autenticadoPeloGmail_(cabecalhos_(msg), de);
+  if (ok) {
+    guardados[id] = de;
+    const ids = Object.keys(guardados);
+    if (ids.length > 100) ids.slice(0, ids.length - 100).forEach(k => { delete guardados[k]; });
+    props.setProperty(CHAVE_AUTENTICADOS, JSON.stringify(guardados));
+  }
+  return ok;
+}
+
+function esquecerAutenticacao_(props, id) {
+  const guardados = JSON.parse(props.getProperty(CHAVE_AUTENTICADOS) || '{}');
+  if (!(id in guardados)) return;
+  delete guardados[id];
+  props.setProperty(CHAVE_AUTENTICADOS, JSON.stringify(guardados));
+}
+
+// Só os cabeçalhos do e-mail (até a 1ª linha em branco), com as linhas
+// continuadas juntadas.
+function cabecalhos_(msg) {
+  const bruto = msg.getRawContent();
+  const fim = bruto.search(/\r?\n\r?\n/);
+  return (fim === -1 ? bruto : bruto.slice(0, fim)).replace(/\r?\n[ \t]+/g, ' ');
+}
+
+// O Gmail autenticou o domínio do remetente? Lê o PRIMEIRO cabeçalho
+// "Authentication-Results" - o Gmail escreve o dele em todo e-mail que chega
+// de fora, acima dos cabeçalhos de quem mandou; um que venha mais abaixo foi
+// escrito pelo remetente e não vale.
+// Aceita DMARC "pass" do domínio ou DKIM "pass" assinado pelo domínio (não um
+// subdomínio nem um domínio que só começa igual). A noreply@cortag.com.br passa
+// pelo DMARC: o DKIM dela é assinado por cortagind.onmicrosoft.com (conferido
+// em 05/10/2026 com o conferirAutenticacao).
+// Texto entre aspas e entre parênteses sai antes de separar os resultados por
+// ";": o Gmail repete ali o endereço de envio (smtp.mailfrom, o comentário do
+// spf), que é escolhido por quem manda - um "x;dmarc=pass header.from=..."@golpe
+// virava um resultado falso (achado do revisor-cortag, 10/2026).
+function autenticadoPeloGmail_(cabecalhos, endereco) {
+  const dominio = String(endereco || '').split('@')[1];
+  if (!dominio) return false;
+  const linha = String(cabecalhos || '').split(/\r?\n/).find(l => /^Authentication-Results:/i.test(l));
+  if (!linha || !/^Authentication-Results:\s*mx\.google\.com\s*;/i.test(linha)) return false;
+  let limpa = linha.replace(/^Authentication-Results:\s*mx\.google\.com\s*;/i, '').replace(/"(?:[^"\\]|\\.)*"/g, '""');
+  for (let antes = ''; antes !== limpa;) { antes = limpa; limpa = limpa.replace(/\([^()]*\)/g, ' '); }
+  if (/["()]/.test(limpa.replace(/""/g, ''))) return false; // aspas ou parênteses soltos: não dá pra confiar
+  const dom = dominio.toLowerCase();
+  return resultadosAutenticacao_(limpa).some(r => r.resultado === 'pass' && (
+    (r.metodo === 'dmarc' && r.props['header.from'] === dom)
+    || (r.metodo === 'dkim' && (r.props['header.d'] === dom || dominioDoI_(r.props['header.i']) === dom))));
+}
+function dominioDoI_(valor) {
+  const m = /^[^@]*@(.+)$/.exec(valor || '');
+  return m ? m[1] : null;
+}
+
+// Separa os resultados ("metodo=resultado chave.sub=valor ...", RFC 8601), já sem
+// comentários e com o texto entre aspas vazio. Resultado com qualquer pedaço fora
+// desse formato, ou com a mesma chave duas vezes, é descartado inteiro - antes
+// bastava ter "dmarc=pass" no começo e "header.from=dominio" em qualquer lugar
+// depois (achado do revisor-cortag, 10/2026).
+function resultadosAutenticacao_(limpa) {
+  const resultados = [];
+  for (const trecho of limpa.split(';')) {
+    const pedacos = trecho.trim().split(/\s+/).filter(Boolean);
+    const m = /^([a-z0-9-]+)=([a-z]+)$/i.exec(pedacos[0] || '');
+    if (!m) continue;
+    const props = {};
+    let valido = true;
+    for (const pedaco of pedacos.slice(1)) {
+      const p = /^([a-z0-9-]+\.[a-z0-9-]+)=(\S*)$/i.exec(pedaco);
+      const chave = p && p[1].toLowerCase();
+      if (!p || chave in props) { valido = false; break; }
+      props[chave] = p[2].toLowerCase();
+    }
+    if (valido) resultados.push({ metodo: m[1].toLowerCase(), resultado: m[2].toLowerCase(), props });
+  }
+  return resultados;
+}
+
+// Rodar à mão antes de deixar esta versão valer (e sempre que a Cortag trocar o
+// jeito de mandar e-mail): lista os e-mails dos últimos 30 dias de cada
+// remetente e diz se passariam na checagem. Não manda nada pro app.
+function conferirAutenticacao() {
+  const remetentes = Array.from(new Set(CONFIG.regras.map(r => r.remetente)
+    .concat(CONFIG.mensagens.map(m => m.remetente), CONFIG.porAssunto.map(r => r.remetente))));
+  remetentes.forEach(remetente => {
+    const threads = GmailApp.search(`from:${remetente} newer_than:30d`, 0, 10);
+    let ok = 0;
+    let total = 0;
+    let outroEndereco = 0;
+    threads.forEach(t => t.getMessages().forEach(msg => {
+      if (enderecoDe_(msg.getFrom()) !== remetente) {
+        // a busca do Gmail achou, mas o endereço não é exatamente este: não
+        // seria importado (antes era pulado sem aviso)
+        outroEndereco++;
+        Logger.log('OUTRO ENDEREÇO (não seria importado)  %s | %s | De: %s', remetente, msg.getSubject(), msg.getFrom());
+        return;
+      }
+      const cab = cabecalhos_(msg);
+      const passou = autenticadoPeloGmail_(cab, remetente);
+      total++;
+      if (passou) ok++;
+      const linha = cab.split(/\r?\n/).find(l => /^Authentication-Results:/i.test(l)) || '(sem Authentication-Results)';
+      Logger.log('%s  %s | %s | %s', passou ? 'OK ' : 'NÃO', remetente, msg.getSubject(), linha.slice(0, 400));
+    }));
+    Logger.log('== %s: %s de %s e-mail(s) autenticado(s)%s%s', remetente, String(ok), String(total),
+      total && ok < total ? ' - os que deram NÃO não seriam importados; avise antes de usar esta versão' : '',
+      outroEndereco ? ` - e ${outroEndereco} com outro formato de endereço (veja "OUTRO ENDEREÇO" acima)` : '');
+  });
+}
+
+function chave_() {
+  const chave = PropertiesService.getScriptProperties().getProperty('CHAVE');
+  if (!chave) throw new Error('Falta a CHAVE: Configurações do projeto › Propriedades do script › adicionar "CHAVE".');
+  return chave.trim();
+}
+
+function marcador_(nome) {
+  return GmailApp.getUserLabelByName(nome) || GmailApp.createLabel(nome);
+}

@@ -6,6 +6,7 @@ require('express-async-errors');
 const rateLimit = require('express-rate-limit');
 const { pool, runMigrations } = require('./db');
 const { requireAuth } = require('./middleware/auth');
+const { limiteRotasPesadas } = require('./middleware/limiteRotasPesadas');
 
 const authRoutes = require('./routes/auth');
 const clientesRoutes = require('./routes/clientes');
@@ -23,7 +24,18 @@ const catalogoPrecosRoutes = require('./routes/catalogoPrecos');
 const radarCnpjRoutes = require('./routes/radarCnpj');
 const clientesClassificatorioRoutes = require('./routes/clientesClassificatorio');
 const produtosPromocionaisRoutes = require('./routes/produtosPromocionais');
+const recompraRoutes = require('./routes/recompra');
+const ocorrenciasRoutes = require('./routes/ocorrencias');
+const reativacaoRoutes = require('./routes/reativacao');
+const visitasRoutes = require('./routes/visitas');
+const inadimplenciaRoutes = require('./routes/inadimplencia');
+const produtoFotosRoutes = require('./routes/produtoFotos');
+const novidadesRoutes = require('./routes/novidades');
+const importacaoEmailRoutes = require('./routes/importacaoEmail');
+const segundaTelaRoutes = require('./routes/segundaTela');
 const { iniciarPreenchimentoAutomatico } = require('./routes/lib/preenchimentoCnpj');
+const { iniciarGeocodificacaoAutomatica } = require('./routes/lib/geocodificacao');
+const { iniciarEnvioAgendado } = require('./routes/lib/novidades');
 
 const app = express();
 app.set('trust proxy', 1);  
@@ -43,8 +55,13 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', origin);
     res.header('Vary', 'Origin');
   }
+  // a API só responde JSON e a foto JPEG: o navegador não tenta adivinhar
+  // outro tipo (ex.: tratar uma resposta como HTML/script)
+  res.header('X-Content-Type-Options', 'nosniff');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  // PUT: nome do arquivo do cliente (PUT /api/clientes/:id/nome-arquivo) - sem ele o
+  // navegador barrava a chamada do app publicado (outro domínio) antes de chegar aqui
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -60,13 +77,66 @@ app.use((req, res, next) => {
 const jsonPadrao = express.json({ limit: '1mb' });
 const jsonGrande = express.json({ limit: '25mb' });
 const ROTAS_PAYLOAD_GRANDE = ['/api/catalogo-precos', '/api/fichas-tecnicas'];
+// Importação por e-mail (routes/importacaoEmail.js): arquivo grande, mas sem
+// login - só aceita quem manda a chave certa, conferida ANTES de ler o corpo.
+const ROTA_IMPORTACAO_EMAIL = '/api/importacao-email/arquivo';
 app.use((req, res, next) => {
-  const parser = ROTAS_PAYLOAD_GRANDE.some(p => req.path.startsWith(p)) ? jsonGrande : jsonPadrao;
-  parser(req, res, next);
+  if (req.path === ROTA_IMPORTACAO_EMAIL) {
+    if (!importacaoEmailRoutes.chaveImportacaoValida(req)) return res.status(401).json({ erro: 'Chave de importação inválida.' });
+    return jsonGrande(req, res, next);
+  }
+  // Rota de payload grande: confere o login ANTES de ler o corpo - senão qualquer
+  // um sem token mandava 25 MB e o servidor fazia o parse inteiro antes do 401.
+  // (o requireAuth do app.use da rota, mais abaixo, vê req.usuario e não consulta de novo)
+  if (ROTAS_PAYLOAD_GRANDE.some(p => req.path.startsWith(p))) {
+    return requireAuth(req, res, (err) => (err ? next(err) : jsonGrande(req, res, next)));
+  }
+  jsonPadrao(req, res, next);
 });
 
 app.get('/', (req, res) => res.json({ status: 'ok', servico: 'Cortag - histórico e relatórios' }));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
+// Servidor no ar E banco respondendo - usado pelo script do Gmail antes de
+// mandar arquivo: com o banco fora, a rodada acaba sem contar tentativa (senão
+// o script desistia de e-mails bons numa queda longa do banco). O /health
+// continua sem tocar no banco (keep-alive, e o Render pode usá-lo pra decidir
+// se reinicia o serviço).
+// Rota pública: a resposta fica guardada por 15 s e requisições ao mesmo tempo
+// esperam a mesma consulta - quem chamar em loop não ocupa conexões do banco
+// (no máximo 1 consulta a cada 15 s, qualquer que seja o volume).
+const HEALTH_BANCO_CACHE_MS = Number(process.env.HEALTH_BANCO_CACHE_MS) || 15000;
+const healthBanco = { ok: false, em: 0, emAndamento: null };
+function conferirBanco() {
+  if (Date.now() - healthBanco.em < HEALTH_BANCO_CACHE_MS) return Promise.resolve(healthBanco.ok);
+  if (!healthBanco.emAndamento) {
+    const consulta = (async () => {
+      let timer;
+      try {
+        await Promise.race([
+          pool.query('/* health:banco */ SELECT 1'),
+          new Promise((_, rejeitar) => { timer = setTimeout(() => rejeitar(new Error('tempo esgotado')), 5000); }),
+        ]);
+        healthBanco.ok = true;
+      } catch (e) {
+        console.error('Health do banco:', e.message);
+        healthBanco.ok = false;
+      } finally {
+        clearTimeout(timer);
+        healthBanco.em = Date.now();
+      }
+      return healthBanco.ok;
+    })();
+    // limpa por fora: se a consulta terminasse antes desta atribuição (erro
+    // síncrono), um "= null" lá dentro seria sobrescrito e nada consultaria mais
+    healthBanco.emAndamento = consulta;
+    consulta.finally(() => { if (healthBanco.emAndamento === consulta) healthBanco.emAndamento = null; });
+  }
+  return healthBanco.emAndamento;
+}
+app.get('/health/banco', async (req, res) => {
+  if (await conferirBanco()) return res.json({ status: 'ok', banco: 'ok' });
+  res.status(503).json({ status: 'erro', banco: 'fora do ar' });
+});
 
 // Limite de tentativas na rota de login com Google - protege o endpoint que
 // chama a API do Google pra validar o id_token contra abuso/flood (mesmo sem
@@ -84,22 +154,33 @@ const authLimiter = rateLimit({
 app.use('/api/auth/google', authLimiter);
 app.use('/api/auth', authRoutes);
 
-// todas as rotas de dados exigem estar logado (ver middleware/auth.js)
-app.use('/api/clientes', requireAuth, clientesRoutes);
-app.use('/api/clientes', requireAuth, clientesClassificatorioRoutes); // /classificatorio/... - registrado depois, cai aqui só se clientesRoutes não bater
-app.use('/api/produtos', requireAuth, produtosRoutes);
-app.use('/api/pedidos', requireAuth, pedidosRoutes);
-app.use('/api/levantamentos', requireAuth, levantamentosRoutes);
-app.use('/api/previsao-estoque', requireAuth, previsaoEstoqueRoutes);
-app.use('/api/configuracoes', requireAuth, configuracoesRoutes);
-app.use('/api/fichas-tecnicas', requireAuth, fichasTecnicasRoutes);
-app.use('/api/codigos-produto', requireAuth, codigosProdutoRoutes);
-app.use('/api/pedidos-oficiais', requireAuth, pedidosOficiaisRoutes);
-app.use('/api/assistente', requireAuth, assistenteRoutes);
-app.use('/api/catalogo-precos', requireAuth, catalogoPrecosRoutes);
-app.use('/api/produtos-promocionais', requireAuth, produtosPromocionaisRoutes);
-app.use('/api', requireAuth, relatoriosRoutes); // /api/clientes/:id/historico, /rotatividade, etc.
-app.use('/api', requireAuth, radarCnpjRoutes); // /api/clientes/:id/ficha-cnpj, /api/radar-cnpj/:cnpj
+// todas as rotas de dados exigem estar logado (ver middleware/auth.js); as de
+// leitura pesada têm limite de requisições por usuário (middleware/limiteRotasPesadas.js)
+app.use('/api/clientes', requireAuth, limiteRotasPesadas, clientesRoutes);
+app.use('/api/clientes', requireAuth, limiteRotasPesadas, clientesClassificatorioRoutes); // /classificatorio/... - registrado depois, cai aqui só se clientesRoutes não bater
+app.use('/api/produtos', requireAuth, limiteRotasPesadas, produtosRoutes);
+app.use('/api/pedidos', requireAuth, limiteRotasPesadas, pedidosRoutes);
+app.use('/api/levantamentos', requireAuth, limiteRotasPesadas, levantamentosRoutes);
+app.use('/api/previsao-estoque', requireAuth, limiteRotasPesadas, previsaoEstoqueRoutes);
+app.use('/api/configuracoes', requireAuth, limiteRotasPesadas, configuracoesRoutes);
+app.use('/api/fichas-tecnicas', requireAuth, limiteRotasPesadas, fichasTecnicasRoutes);
+app.use('/api/codigos-produto', requireAuth, limiteRotasPesadas, codigosProdutoRoutes);
+app.use('/api/pedidos-oficiais', requireAuth, limiteRotasPesadas, pedidosOficiaisRoutes);
+app.use('/api/assistente', requireAuth, limiteRotasPesadas, assistenteRoutes);
+app.use('/api/catalogo-precos', requireAuth, limiteRotasPesadas, catalogoPrecosRoutes);
+app.use('/api/produtos-promocionais', requireAuth, limiteRotasPesadas, produtosPromocionaisRoutes);
+app.use('/api/recompra', requireAuth, limiteRotasPesadas, recompraRoutes);
+app.use('/api/ocorrencias', requireAuth, limiteRotasPesadas, ocorrenciasRoutes); // ocorrência no Pós-Vendas (selo no pedido)
+app.use('/api/reativacao', requireAuth, limiteRotasPesadas, reativacaoRoutes);
+app.use('/api/visitas', requireAuth, limiteRotasPesadas, visitasRoutes);
+app.use('/api/inadimplencia', requireAuth, limiteRotasPesadas, inadimplenciaRoutes);
+app.use('/api/produto-fotos', requireAuth, limiteRotasPesadas, produtoFotosRoutes);
+app.use('/api/novidades', requireAuth, limiteRotasPesadas, novidadesRoutes);
+app.use('/api/segunda-tela', requireAuth, limiteRotasPesadas, segundaTelaRoutes); // tablet como tela do cliente
+// /arquivo pela chave do script do Gmail; /status exige login (dentro da rota)
+app.use('/api/importacao-email', rateLimit({ windowMs: 15 * 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false }), importacaoEmailRoutes);
+app.use('/api', requireAuth, limiteRotasPesadas, relatoriosRoutes); // /api/clientes/:id/historico, /rotatividade, etc.
+app.use('/api', requireAuth, limiteRotasPesadas, radarCnpjRoutes); // /api/clientes/:id/ficha-cnpj, /api/radar-cnpj/:cnpj
 
 // Rede de segurança final: qualquer erro que escape dos try/catch das rotas
 // (síncrono ou de promise, via express-async-errors) cai aqui em vez de
@@ -112,15 +193,55 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 10000;
 
+let servidor = null;
+
 runMigrations()
   .then(() => {
-    app.listen(PORT, () => {
+    servidor = app.listen(PORT, () => {
       console.log(`Servidor rodando na porta ${PORT}`);
       // completa sozinho, de madrugada, as fichas de CNPJ que faltam
       iniciarPreenchimentoAutomatico(pool, radarCnpjRoutes.obterFicha);
+      // e a posição aproximada das lojas pelo endereço da ficha ("Perto de mim")
+      iniciarGeocodificacaoAutomatica(pool);
+      // avisos no celular de importação feita fora do horário (dia útil, 7h-20h)
+      iniciarEnvioAgendado();
     });
   })
   .catch(err => {
     console.error('Erro ao rodar migrações do banco:', err);
     process.exit(1);
   });
+
+// Desligamento organizado. O Render manda SIGTERM a cada deploy/reinício e mata
+// o processo uns 30 s depois. Sem isso a requisição em andamento (importação,
+// pedido) era cortada no meio - o Postgres desfaz a transação, mas o app recebia
+// erro. Agora: para de aceitar conexão nova, deixa as em andamento terminarem,
+// fecha o pool e sai; se passar de PRAZO_DESLIGAMENTO_MS, sai assim mesmo.
+const PRAZO_DESLIGAMENTO_MS = 25000;
+let desligando = false;
+function desligar(sinal) {
+  if (desligando) return;
+  desligando = true;
+  console.log(`${sinal} recebido: encerrando (esperando as requisições em andamento)...`);
+  const forcar = setTimeout(() => {
+    console.error('Desligamento passou do prazo; saindo assim mesmo.');
+    process.exit(1);
+  }, PRAZO_DESLIGAMENTO_MS);
+  forcar.unref();
+  // o tablet da tela do cliente deixa uma requisição esperando até 25 s: responde já
+  segundaTelaRoutes.acordarTodas();
+  const fecharPool = () => Promise.resolve()
+    .then(() => pool.end && pool.end())
+    .catch((e) => console.error('Erro ao fechar o pool do banco:', e))
+    .then(() => process.exit(0));
+  if (!servidor) return fecharPool();
+  servidor.close(fecharPool);
+  // conexões keep-alive paradas não seguram o close (repetido porque a conexão
+  // de uma requisição em andamento só fica parada depois que a resposta sai)
+  if (servidor.closeIdleConnections) {
+    servidor.closeIdleConnections();
+    setInterval(() => servidor.closeIdleConnections(), 250).unref();
+  }
+}
+process.on('SIGTERM', () => desligar('SIGTERM'));
+process.on('SIGINT', () => desligar('SIGINT'));

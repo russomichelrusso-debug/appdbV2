@@ -1,3 +1,5 @@
+const { ErroPermanente } = require('./routes/lib/produtoPorSku');
+
 // Lógica de "achar ou criar cliente" compartilhada entre pedidos.js,
 // levantamentos.js e a importação de faturamento - centralizada aqui pra não
 // triplicar a mesma regra em três arquivos.
@@ -8,7 +10,16 @@
 //      vírgula) - resolve casos tipo "EDD AL LTDA." vs "EDD AL LTDA" sem
 //      pedir confirmação, já que a diferença é só um caractere de pontuação.
 
+// Barra invertida no nome é erro de exportação de planilha ("MATS. P\/ CONSTR.",
+// com o "/" escapado): nenhum nome de empresa tem "\". Sai na comparação e na
+// gravação - em 09/2026 ela tinha criado 15 clientes duplicados (05/10/2026,
+// relato do usuário).
+function limparNomeCliente(nome) {
+  return String(nome == null ? '' : nome).replace(/\\/g, '').replace(/\s+/g, ' ').trim();
+}
+
 async function acharClientePorNome(client, nome){
+  nome = limparNomeCliente(nome);
   const exato = await client.query(
     `SELECT id FROM clientes
      WHERE regexp_replace(upper(trim(nome)), '\\s+', ' ', 'g') = regexp_replace(upper(trim($1)), '\\s+', ' ', 'g')
@@ -29,7 +40,31 @@ async function acharClientePorNome(client, nome){
 }
 
 async function acharOuCriarCliente(client, { cliente_id, nome, documento, codigo_oficial, contato }) {
-  if (cliente_id) return cliente_id;
+  // O id vem da cópia do aparelho: cliente apagado/mesclado depois (12 em
+  // 09/10/2026) fazia o pedido ou levantamento da fila offline bater na FK e
+  // voltar 400 pra sempre. Id que não existe mais cai na busca por código/CNPJ/nome.
+  // O app manda só id + nome: filiais com a mesma razão social são clientes
+  // diferentes, então pelo nome só vale se for um só; senão (ou sem nenhum) o
+  // envio é recusado (422, fica em "recusados" na fila) em vez de cair na filial
+  // errada ou criar um cliente sem CNPJ (achado do revisor-cortag).
+  if (cliente_id) {
+    const id = Number(cliente_id);
+    if (Number.isSafeInteger(id) && id > 0) {
+      const existe = await client.query('/* cliente:existe */ SELECT id FROM clientes WHERE id = $1', [id]);
+      if (existe.rows.length > 0) return existe.rows[0].id;
+    }
+    if (!codigo_oficial && !documento) {
+      const mesmoNome = await client.query(
+        `/* cliente:mesmo-nome */ SELECT id FROM clientes
+         WHERE regexp_replace(upper(trim(nome)), '[.,\\s]+', ' ', 'g') = regexp_replace(upper(trim($1)), '[.,\\s]+', ' ', 'g')
+         LIMIT 2`,
+        [limparNomeCliente(nome)]
+      );
+      if (mesmoNome.rows.length === 1) return mesmoNome.rows[0].id;
+      throw new ErroPermanente(`O cliente "${limparNomeCliente(nome)}" não existe mais no cadastro (pode ter sido mesclado) — escolha o cliente de novo e salve outra vez.`);
+    }
+  }
+  nome = limparNomeCliente(nome) || nome;
   // Cod.Cliente do ERP é a chave mais confiável quando existe - vem antes de
   // CNPJ e nome porque diferencia clientes com o mesmo nome mas CNPJs
   // diferentes (o nome sozinho, e às vezes até o CNPJ digitado errado na
@@ -88,4 +123,4 @@ async function acharOuCriarCliente(client, { cliente_id, nome, documento, codigo
   throw new Error(`Corrida ao criar cliente "${nome}" - não encontrei o registro depois do conflito.`);
 }
 
-module.exports = { acharOuCriarCliente, acharClientePorNome };
+module.exports = { acharOuCriarCliente, acharClientePorNome, limparNomeCliente };

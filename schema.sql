@@ -23,6 +23,32 @@ ALTER TABLE clientes ADD COLUMN IF NOT EXISTS classificatorio_pic BOOLEAN DEFAUL
 ALTER TABLE clientes ADD COLUMN IF NOT EXISTS classificatorio_vl_acordo NUMERIC;
 CREATE INDEX IF NOT EXISTS idx_clientes_matriz_grupo ON clientes (matriz_grupo) WHERE matriz_grupo IS NOT NULL;
 
+-- Foto dos números financeiros da planilha "Classificatório" do ERP, um por
+-- cliente, trocada a cada importação (a do relatório mais novo vence). São os
+-- números OFICIAIS da apuração mensal do ERP - fechada até `apurado_ate`
+-- (maior Ult.Compra da planilha), por isso podem ficar abaixo do que o app
+-- soma ao vivo. Ano anterior, acumulado e 12 meses da matriz são do grupo
+-- INTEIRO no ERP (inclusive filiais de outros representantes, que não estão
+-- no app); só fat_12m_cliente é do próprio cliente. `diferenca` = coluna
+-- "Diferenca" (quanto falta pra manter a faixa atual ou subir pra próxima).
+CREATE TABLE IF NOT EXISTS cliente_classificatorio_erp (
+  cliente_id INTEGER PRIMARY KEY REFERENCES clientes(id) ON DELETE CASCADE,
+  data_relatorio DATE NOT NULL,
+  apurado_ate DATE,
+  fat_ano_anterior NUMERIC,
+  fat_acumulado NUMERIC,
+  fat_12m_cliente NUMERIC,
+  fat_12m_matriz NUMERIC,
+  diferenca NUMERIC,
+  gestor TEXT,
+  situacao TEXT,
+  cidade TEXT,
+  uf TEXT,
+  cliente_desde DATE,
+  ultima_compra DATE,
+  atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS produtos (
   id SERIAL PRIMARY KEY,
   codigo_sku TEXT UNIQUE NOT NULL,
@@ -34,6 +60,10 @@ CREATE TABLE IF NOT EXISTS vendedores (
   id SERIAL PRIMARY KEY,
   nome TEXT UNIQUE NOT NULL
 );
+-- O UNIQUE acima só vale em banco novo: o de produção tinha a tabela sem ele e o
+-- "ON CONFLICT (nome)" de acharOuCriarVendedor (pedido e levantamento) dava erro
+-- 42P10 com qualquer nome de vendedor ainda não cadastrado (10/2026).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vendedores_nome ON vendedores(nome);
 
 CREATE TABLE IF NOT EXISTS pedidos (
   id SERIAL PRIMARY KEY,
@@ -49,10 +79,39 @@ ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS numero_cotacao TEXT;
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS origem TEXT NOT NULL DEFAULT 'app';
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS pdf_modificado_em TIMESTAMPTZ;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pedidos_numero_cotacao ON pedidos(numero_cotacao) WHERE numero_cotacao IS NOT NULL;
+-- usuarios vem antes da primeira referência a ela (o ALTER TABLE pedidos logo
+-- abaixo): num banco novo, criar depois fazia a 1ª execução do schema falhar.
+CREATE TABLE IF NOT EXISTS usuarios (
+  id SERIAL PRIMARY KEY,
+  nome TEXT NOT NULL,
+  usuario TEXT UNIQUE,             -- sistema antigo (usuário/senha) - mantido só pra não perder histórico, não é mais usado pra login
+  senha_hash TEXT,                 -- idem - login hoje é só via Google (id_token), não por senha
+  email TEXT UNIQUE,               -- e-mail da conta Google - é isso que identifica o login agora
+  google_sub TEXT UNIQUE,          -- "sub" (id único da conta) devolvido pelo Google, gravado no primeiro login de fato
+  is_admin BOOLEAN NOT NULL DEFAULT false,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 -- Quem gravou o pedido - usado pra só deixar o autor (ou um admin) sobrescrever
 -- uma cotação já existente reenviando o mesmo numero_cotacao. NULL em pedidos
 -- antigos e nos importados do relatório oficial (não têm um usuário "dono").
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS usuario_id INTEGER REFERENCES usuarios(id);
+-- Pedido do app reaberto pra editar (cliente pediu pra mudar quantidade ou
+-- incluir produto): atualizado_em marca a última edição (data_pedido continua
+-- a do fechamento) e contexto guarda como o orçamento estava montado (estado,
+-- canal, classificatório, prazo, descontos e preços editados por item) pra
+-- reabrir com os mesmos preços. NULL nos pedidos gravados antes disso.
+ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ;
+ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS contexto JSONB;
+-- Identificador que o app gera no toque em "Finalizar pedido": com sinal
+-- fraco o servidor gravava, a resposta se perdia, o pedido ia pra fila offline
+-- e o reenvio criava um segundo pedido. O reenvio com o mesmo id_envio devolve
+-- o pedido já gravado. NULL nos pedidos antigos e nos de PDF.
+ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS id_envio TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pedidos_id_envio ON pedidos(id_envio) WHERE id_envio IS NOT NULL;
+-- Hora (relógio do aparelho) em que o vendedor tocou em Finalizar/Atualizar na
+-- versão gravada. Uma versão mais velha que chegue depois (fila offline atrasada,
+-- reenvio de outro aparelho) não apaga a mais nova. NULL nos pedidos antigos.
+ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS versao_app TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS pedido_itens (
   id SERIAL PRIMARY KEY,
@@ -78,16 +137,6 @@ CREATE TABLE IF NOT EXISTS levantamento_itens (
   quantidade_pedido NUMERIC NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS usuarios (
-  id SERIAL PRIMARY KEY,
-  nome TEXT NOT NULL,
-  usuario TEXT UNIQUE,             -- sistema antigo (usuário/senha) - mantido só pra não perder histórico, não é mais usado pra login
-  senha_hash TEXT,                 -- idem - login hoje é só via Google (id_token), não por senha
-  email TEXT UNIQUE,               -- e-mail da conta Google - é isso que identifica o login agora
-  google_sub TEXT UNIQUE,          -- "sub" (id único da conta) devolvido pelo Google, gravado no primeiro login de fato
-  is_admin BOOLEAN NOT NULL DEFAULT false,
-  criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 -- Garante as colunas também em bancos que já tinham a tabela criada antes
 -- delas existirem (sem isso, "CREATE TABLE IF NOT EXISTS" não adicionaria
 -- coluna nova em quem já tinha rodado uma versão anterior do schema).
@@ -100,6 +149,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_google_sub ON usuarios(google_sub
 -- como obrigatórios - relaxa isso pra permitir cadastrar gente só com e-mail.
 ALTER TABLE usuarios ALTER COLUMN usuario DROP NOT NULL;
 ALTER TABLE usuarios ALTER COLUMN senha_hash DROP NOT NULL;
+-- Vendedor que saiu é DESATIVADO, não excluído: pedidos e importações dele
+-- (pedidos.usuario_id, import_log.usuario_id) continuam com o nome no histórico.
+-- Inativo não entra (login Google recusa) e a sessão que ele tinha deixa de valer
+-- (middleware/auth.js); ao desativar, as sessões e os avisos no celular dele são apagados.
+ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ativo BOOLEAN NOT NULL DEFAULT true;
 
 -- Registro de quem fez cada importação em massa (catálogo, produtos, clientes,
 -- previsão de estoque, pedidos oficiais) - essas rotas continuam liberadas pra
@@ -197,14 +251,64 @@ ALTER TABLE clientes ADD COLUMN IF NOT EXISTS latitude NUMERIC;
 ALTER TABLE clientes ADD COLUMN IF NOT EXISTS longitude NUMERIC;
 ALTER TABLE clientes ADD COLUMN IF NOT EXISTS localizacao_precisao_m NUMERIC;
 ALTER TABLE clientes ADD COLUMN IF NOT EXISTS localizacao_atualizada_em TIMESTAMPTZ;
+-- Identificador que o app gera no toque em salvar o levantamento (mesmo padrão
+-- de pedidos.id_envio): com sinal fraco o servidor gravava, a resposta se
+-- perdia, o levantamento ia pra fila offline e o reenvio gravava outro. O
+-- reenvio com o mesmo id_envio devolve o já gravado. NULL nos antigos.
+ALTER TABLE levantamentos ADD COLUMN IF NOT EXISTS id_envio TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_levantamentos_id_envio ON levantamentos(id_envio) WHERE id_envio IS NOT NULL;
+-- Quantidade de pedido do item (coluna "Ped." do levantamento), gravada pelo
+-- POST /api/levantamentos. Estava só no CREATE TABLE: o banco de produção, com a
+-- tabela já criada, ficou sem a coluna e todo levantamento salvo dava "Erro ao
+-- gravar levantamento" (10/2026).
+ALTER TABLE levantamento_itens ADD COLUMN IF NOT EXISTS quantidade_pedido NUMERIC NOT NULL DEFAULT 0;
+-- Quem salvou o levantamento (o usuário logado). O "Registro de visita"
+-- (routes/visitas.js) mostra só as visitas do próprio vendedor; vendedor_id é o
+-- nome digitado no app ("RUSSO", "Russo", "Admin"), sem ligação com o login.
+-- Sem ON DELETE, como pedidos.usuario_id: excluir quem tem levantamento responde
+-- 409 (desativar em vez disso) e o histórico continua com o dono.
+ALTER TABLE levantamentos ADD COLUMN IF NOT EXISTS usuario_id INTEGER REFERENCES usuarios(id);
+-- Os gravados antes da coluna: pelo nome do vendedor = nome de um único usuário
+-- (em 10/2026: RUSSO/Russo -> RUSSO, Admin -> Admin). Os que não casam ficam sem dono.
+UPDATE levantamentos l SET usuario_id = u.id
+FROM vendedores v, usuarios u
+WHERE l.usuario_id IS NULL AND v.id = l.vendedor_id AND lower(trim(v.nome)) = lower(trim(u.nome))
+  AND (SELECT count(*) FROM usuarios u2 WHERE lower(trim(u2.nome)) = lower(trim(u.nome))) = 1;
+CREATE INDEX IF NOT EXISTS idx_levantamentos_usuario ON levantamentos(usuario_id, cliente_id);
+
+-- Nome que o vendedor escolheu pro arquivo CSV do cliente (orçamento e cópia
+-- do pedido no Drive) - "DEPOSITO", "COMERCIAL"... são comuns no ramo e a 1ª
+-- palavra do nome não diferenciava. Só letras e números (ex: DepositoSaoJose);
+-- NULL = 1ª palavra do nome. nome_arquivo_em decide, no aparelho, entre o
+-- valor do servidor e uma troca feita offline ainda na fila (o mais novo vale).
+ALTER TABLE clientes ADD COLUMN IF NOT EXISTS nome_arquivo TEXT;
+ALTER TABLE clientes ADD COLUMN IF NOT EXISTS nome_arquivo_em TIMESTAMPTZ;
+
+-- WhatsApp do comprador da loja (quem recebe o orçamento), escolhido pelo
+-- vendedor no card do cliente: com ele o texto do orçamento abre direto na
+-- conversa (wa.me). Só dígitos com o 55 na frente (ex: 5543999998888); NULL =
+-- sem número (compartilhar normal). whatsapp_comprador_em decide, no aparelho,
+-- entre o valor do servidor e uma troca feita offline ainda na fila.
+ALTER TABLE clientes ADD COLUMN IF NOT EXISTS whatsapp_comprador TEXT;
+ALTER TABLE clientes ADD COLUMN IF NOT EXISTS whatsapp_comprador_nome TEXT;
+ALTER TABLE clientes ADD COLUMN IF NOT EXISTS whatsapp_comprador_em TIMESTAMPTZ;
+-- Contatos comerciais do cliente pro Salesforce (janela "Contatos" do card do
+-- cliente; a Ficha cadastral mostra e copia): telefone 55+DDD+número, e-mails em
+-- minúsculas (NF/XML pode ter até 3, separados por "; "). O comprador é o
+-- whatsapp_comprador(_nome) acima. contatos_em decide, no aparelho, entre a troca
+-- ainda na fila offline e a do servidor (vale a mais nova), como no WhatsApp.
+ALTER TABLE clientes ADD COLUMN IF NOT EXISTS telefone_comercial TEXT;
+ALTER TABLE clientes ADD COLUMN IF NOT EXISTS email_comercial TEXT;
+ALTER TABLE clientes ADD COLUMN IF NOT EXISTS email_nfe TEXT;
+ALTER TABLE clientes ADD COLUMN IF NOT EXISTS contatos_em TIMESTAMPTZ;
 
 -- Situação de pedidos no sistema OFICIAL da empresa (relatório de Carteira +
 -- Faturamento), guardada separada da tabela "pedidos" (que é só o que o
 -- vendedor bate no próprio app). As duas fontes não têm número em comum,
 -- então em vez de tentar mesclar (arriscado), mostramos as duas lado a lado
--- no histórico do cliente. "Nr.Pedido" + "codigo_sku" é a chave - o mesmo
--- Nr.Pedido aparece na Carteira (ainda não faturado) e depois no Faturamento
--- (já faturado); reimportar não duplica, só atualiza o status pra faturado.
+-- no histórico do cliente. "Nr.Pedido" + "codigo_sku" + nota fiscal é a chave
+-- (ver `nota_chave` abaixo) - o mesmo item aparece na Carteira (ainda não
+-- faturado) e depois no Faturamento (já faturado); reimportar não duplica.
 CREATE TABLE IF NOT EXISTS pedidos_oficiais_itens (
   nr_pedido TEXT NOT NULL,
   codigo_sku TEXT NOT NULL,
@@ -232,6 +336,26 @@ ALTER TABLE pedidos_oficiais_itens ADD COLUMN IF NOT EXISTS situacao_pedido TEXT
 -- produtos que saíram da tabela de preços (não estão em `produtos`), que
 -- antes apareciam só com o código nas telas (94 códigos em 09/2026).
 ALTER TABLE pedidos_oficiais_itens ADD COLUMN IF NOT EXISTS descricao TEXT;
+-- Produto faturado só em parte: o saldo continua na aba Carteira e cada nota
+-- fiscal do mesmo produto vem numa linha do Faturamento. Com a chave antiga
+-- (nr_pedido + codigo_sku) essas linhas se sobrescreviam - sumia o saldo, e
+-- do produto entregue em duas notas ficava só a última. `nota_chave` é a nota
+-- fiscal na linha faturada e '' na linha de carteira (o saldo); a chave passa
+-- a ser nr_pedido + codigo_sku + nota_chave. O bloco roda uma vez só (confere
+-- se a chave primária já tem a coluna).
+ALTER TABLE pedidos_oficiais_itens ADD COLUMN IF NOT EXISTS nota_chave TEXT NOT NULL DEFAULT '';
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint c
+    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+    WHERE c.conrelid = 'pedidos_oficiais_itens'::regclass AND c.contype = 'p' AND a.attname = 'nota_chave'
+  ) THEN
+    UPDATE pedidos_oficiais_itens SET nota_chave = COALESCE(nota_fiscal, '') WHERE status = 'faturado';
+    ALTER TABLE pedidos_oficiais_itens DROP CONSTRAINT IF EXISTS pedidos_oficiais_itens_pkey;
+    ALTER TABLE pedidos_oficiais_itens ADD PRIMARY KEY (nr_pedido, codigo_sku, nota_chave);
+  END IF;
+END $$;
 -- Apoia as agregações por mês/semana/trimestre do Dashboard principal
 -- (ver routes/relatorios.js, GET /dashboard/resumo) - antes só havia
 -- índice por cliente_codigo_oficial.
@@ -239,6 +363,36 @@ CREATE INDEX IF NOT EXISTS idx_pedidos_oficiais_status_data ON pedidos_oficiais_
 -- Entrada de pedidos mensal do Dashboard (agrupa por data de implantação,
 -- carteira + faturado - ver SQL_ENTRADA_PEDIDOS_MENSAL em routes/relatorios.js).
 CREATE INDEX IF NOT EXISTS idx_pedidos_oficiais_implantacao ON pedidos_oficiais_itens (data_implantacao);
+
+-- Pedidos à vista aguardando pagamento: aba "Aguardando Pagamento" do
+-- relatório oficial (mesmo layout da Carteira, pedido ainda não liberado -
+-- não aparece na aba Carteira). Uma linha por pedido. É a foto do último
+-- relatório que trouxe a aba: cada importação com ela troca a lista inteira,
+-- e o pedido que sumiu da aba foi pago. Relatório sem a aba não mexe.
+CREATE TABLE IF NOT EXISTS pedidos_pendentes_pagamento (
+  nr_pedido TEXT PRIMARY KEY,
+  cliente_codigo_oficial TEXT,
+  cliente_nome TEXT,
+  valor NUMERIC,
+  data_implantacao DATE,
+  atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_pendentes_pagamento_cliente ON pedidos_pendentes_pagamento (cliente_codigo_oficial);
+-- Títulos à vista em aberto: aba "Pendentes à Vista" do relatório oficial -
+-- pedido já faturado cujo boleto à vista não foi pago. Não tem Nr.Pedido: o
+-- "Título" é o número da nota fiscal (liga em pedidos_oficiais_itens.nota_fiscal).
+-- Mesma regra de foto da tabela acima (sumiu da aba = pago).
+CREATE TABLE IF NOT EXISTS titulos_avista_pendentes (
+  titulo TEXT NOT NULL,
+  parcela TEXT NOT NULL DEFAULT '',
+  cliente_codigo_oficial TEXT,
+  cliente_nome TEXT,
+  vencimento DATE,
+  valor NUMERIC,
+  atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (titulo, parcela)
+);
+CREATE INDEX IF NOT EXISTS idx_titulos_avista_cliente ON titulos_avista_pendentes (cliente_codigo_oficial);
 
 -- Catálogo completo de preços: um valor por produto x canal x estado (27 UFs
 -- x 6 canais). Guardado em JSONB por produto (não um blob único gigante) pra
@@ -328,6 +482,10 @@ ALTER TABLE cliente_cnpj_ficha ADD COLUMN IF NOT EXISTS socios JSONB;
 ALTER TABLE cliente_cnpj_ficha ADD COLUMN IF NOT EXISTS complemento TEXT;
 ALTER TABLE cliente_cnpj_ficha ADD COLUMN IF NOT EXISTS matriz_filial TEXT;
 ALTER TABLE cliente_cnpj_ficha ADD COLUMN IF NOT EXISTS cnae_secundario TEXT;
+-- quando a BrasilAPI foi consultada pra completar a ficha "mascarada" do
+-- radar-cnpj: sócio abreviado e telefone escondido (routes/lib/nomesSocios.js,
+-- routes/lib/telefoneMascarado.js); NULL = ainda não
+ALTER TABLE cliente_cnpj_ficha ADD COLUMN IF NOT EXISTS mascarado_completado_em TIMESTAMPTZ;
 -- RLS ligado (mesmo motivo de levantamento_rascunhos acima) - guarda dados
 -- de CNPJ/sócios que não podem ficar públicos via PostgREST.
 ALTER TABLE cliente_cnpj_ficha ENABLE ROW LEVEL SECURITY;
@@ -342,3 +500,318 @@ CREATE TABLE IF NOT EXISTS cnpj_preenchimento_falhas (
   erro TEXT
 );
 ALTER TABLE cnpj_preenchimento_falhas ENABLE ROW LEVEL SECURITY;
+
+-- Posição APROXIMADA da loja tirada do endereço da ficha de CNPJ
+-- (routes/lib/geocodificacao.js, de madrugada, pelo Nominatim/OpenStreetMap) -
+-- pra "Clientes perto de mim" funcionar com quem nunca teve levantamento com
+-- GPS. A posição do GPS (clientes.latitude/longitude) sempre vale mais.
+-- endereco = o endereço consultado (mesma chave de SQL_CHAVE_ENDERECO): ficha
+-- com endereço diferente = consulta de novo. latitude NULL = não achou
+-- (tentativas conta, desiste em 3). nivel: 'numero' (achou o prédio),
+-- 'interpolado' (calculado pelos outros números da rua no OSM, preciso como o
+-- número), 'estimado' (idem, mais longe dos números conhecidos - aproximado) ou
+-- 'rua' (ponto da rua - em avenida longa pode ficar a quilômetros da loja).
+-- numero_tentado_em: quando a posição pelo número foi tentada (rua/estimado
+-- tentam de novo a cada 60 dias; NULL = Overpass falhou, tenta na noite seguinte).
+CREATE TABLE IF NOT EXISTS cliente_geocodificacao (
+  cliente_id INTEGER PRIMARY KEY REFERENCES clientes(id) ON DELETE CASCADE,
+  endereco TEXT NOT NULL,
+  latitude NUMERIC,
+  longitude NUMERIC,
+  nivel TEXT,
+  tentativas INTEGER NOT NULL DEFAULT 0,
+  consultado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  erro TEXT
+);
+ALTER TABLE cliente_geocodificacao ADD COLUMN IF NOT EXISTS numero_tentado_em TIMESTAMPTZ;
+ALTER TABLE cliente_geocodificacao ENABLE ROW LEVEL SECURITY;
+
+-- "Já falei" da Recompra da semana (routes/recompra.js): o vendedor já
+-- contatou o cliente atrasado/com compra prevista e ele some da lista até
+-- `ate` (7 dias). Um por cliente; vale em todos os aparelhos.
+CREATE TABLE IF NOT EXISTS recompra_adiamentos (
+  cliente_id INTEGER PRIMARY KEY REFERENCES clientes(id) ON DELETE CASCADE,
+  ate DATE NOT NULL,
+  usuario_id INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE recompra_adiamentos ENABLE ROW LEVEL SECURITY;
+
+-- Relatório de Clientes Sem Compra (noreply@cortag.com.br, todo dia 2 -
+-- routes/reativacao.js): foto do ÚLTIMO relatório, trocada inteira a cada
+-- importação (relatório mais antigo que o importado é ignorado). Traz todo
+-- cliente que comprou nos 12 meses do período, com o mês da última compra pelo
+-- ERP; quem não está nele não compra há mais de 12 meses. Dados do relatório
+-- (data, período) ficam em configuracoes, chave 'clientes_sem_compra_relatorio'.
+CREATE TABLE IF NOT EXISTS clientes_sem_compra (
+  codigo_oficial TEXT PRIMARY KEY,
+  cliente_id INTEGER REFERENCES clientes(id) ON DELETE CASCADE,
+  data_relatorio DATE NOT NULL,
+  meses_sem_compra INTEGER,
+  mes_ultima_compra DATE,          -- dia 1º do mês da última compra (ERP)
+  fat_12m NUMERIC,                 -- "12 Meses - Faturamento Cliente"
+  grupo TEXT,
+  matriz TEXT,
+  telefone TEXT,
+  cidade TEXT,
+  uf TEXT,
+  gestor TEXT,
+  atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_clientes_sem_compra_cliente ON clientes_sem_compra (cliente_id);
+ALTER TABLE clientes_sem_compra ENABLE ROW LEVEL SECURITY;
+
+-- "Para reativar" (routes/reativacao.js): "Já falei" tira o cliente da lista
+-- até `ate` (30 dias); "Não reativar" (ate NULL) tira até ele comprar de novo
+-- depois de `desde`. Um por cliente; vale em todos os aparelhos.
+CREATE TABLE IF NOT EXISTS reativacao_adiamentos (
+  cliente_id INTEGER PRIMARY KEY REFERENCES clientes(id) ON DELETE CASCADE,
+  tipo TEXT NOT NULL,              -- 'ja_falei' | 'nao_reativar'
+  desde DATE NOT NULL,
+  ate DATE,
+  usuario_id INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE reativacao_adiamentos ENABLE ROW LEVEL SECURITY;
+
+-- Relatório "Todas Contas - Representante" do Salesforce (routes/contasSalesforce.js,
+-- importado pelo Painel): foto do ÚLTIMO relatório, trocada inteira. Traz o
+-- proprietário de cada conta e a situação (Ativo = comprou nos últimos ~6
+-- meses, com qualquer vendedor). Política da Cortag: conta inativa fica aberta
+-- pra qualquer vendedor (vai pra base de outro representante e, depois, do
+-- telemarketing/vendas internas); quem vender pede pra ativar e transferir pra
+-- sua base. Conta ativa de outro vendedor (de_outro_vendedor) sai das listas de
+-- oportunidade; inativa entra no "Para reativar" com a última compra do
+-- Salesforce (a do ERP só tem os pedidos do representante) e a base em que está. Dados do relatório (dia, proprietário principal) em
+-- configuracoes, chave 'contas_salesforce_relatorio'.
+CREATE TABLE IF NOT EXISTS contas_salesforce (
+  codigo_oficial TEXT PRIMARY KEY,
+  cliente_id INTEGER REFERENCES clientes(id) ON DELETE SET NULL,
+  data_relatorio DATE NOT NULL,
+  nome TEXT,
+  documento TEXT,
+  proprietario TEXT,
+  regiao TEXT,                     -- "Código Região": 'R2', 'VENDAS INTERNAS' (telemarketing)
+  base TEXT,                       -- de quem é a base: 'Telemarketing' (vendas internas) ou o proprietário
+  situacao TEXT,                   -- 'Ativo' | 'Inativo'
+  de_outro_vendedor BOOLEAN NOT NULL DEFAULT false,
+  ultima_compra DATE,
+  cidade TEXT,
+  uf TEXT,
+  telefone TEXT,
+  email TEXT,
+  classificatorio TEXT,
+  transportadora TEXT,
+  atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_contas_salesforce_cliente ON contas_salesforce (cliente_id);
+ALTER TABLE contas_salesforce ENABLE ROW LEVEL SECURITY;
+
+-- Placar "Recuperados" do Para reativar: cliente que estava inativo no
+-- relatório do Salesforce a partir de `desde` (dia da 1ª importação em que
+-- apareceu inativo). Recuperado = pediu a partir desse dia. Nunca é apagado
+-- pela importação (a foto seguinte já o traz "Ativo"). `proprietario` = a base
+-- em que a conta estava (contas_salesforce.base).
+CREATE TABLE IF NOT EXISTS reativacao_alvos (
+  cliente_id INTEGER PRIMARY KEY REFERENCES clientes(id) ON DELETE CASCADE,
+  desde DATE NOT NULL,
+  proprietario TEXT,
+  ultima_compra_antes DATE,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE reativacao_alvos ENABLE ROW LEVEL SECURITY;
+
+-- Relatório de Inadimplência (noreply@cortag.com.br, "Previa Relatório de
+-- Inadimplência", sem dia fixo - routes/inadimplencia.js): títulos vencidos e
+-- não pagos. Foto do ÚLTIMO relatório, trocada inteira (sumiu = pago);
+-- relatório com período mais antigo que o importado é ignorado. Dados do
+-- relatório em configuracoes, chave 'inadimplencia_relatorio'.
+CREATE TABLE IF NOT EXISTS titulos_inadimplentes (
+  titulo TEXT NOT NULL,
+  parcela TEXT NOT NULL DEFAULT '',
+  codigo_oficial TEXT NOT NULL,
+  cliente_id INTEGER REFERENCES clientes(id) ON DELETE SET NULL,
+  cliente_nome TEXT,
+  cidade TEXT,
+  uf TEXT,
+  emissao DATE,
+  vencimento DATE NOT NULL,
+  saldo NUMERIC NOT NULL,
+  valor_liquido NUMERIC,
+  cobranca_terceirizada BOOLEAN NOT NULL DEFAULT false,
+  data_relatorio DATE NOT NULL,     -- fim do período do relatório (posição)
+  PRIMARY KEY (titulo, parcela)
+);
+CREATE INDEX IF NOT EXISTS idx_titulos_inadimplentes_cliente ON titulos_inadimplentes (cliente_id);
+ALTER TABLE titulos_inadimplentes ENABLE ROW LEVEL SECURITY;
+
+-- Avisos de importação (routes/lib/novidades.js): cada importação de relatório
+-- oficial, catálogo de preços, previsão de estoque, Classificatório ou objetivos
+-- trimestrais vira uma novidade - faixa "🔔 N novidades" no app e push no
+-- celular. O mesmo tipo importado de novo em até 30 min atualiza a mesma linha
+-- (atualizado_em) em vez de criar outra. Push só sai em dia útil, 7h-20h de
+-- Brasília: push_enviar_em guarda quando; push_pendente = ainda falta enviar.
+CREATE TABLE IF NOT EXISTS novidades (
+  id SERIAL PRIMARY KEY,
+  tipo TEXT NOT NULL,
+  titulo TEXT NOT NULL,
+  texto TEXT,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  push_enviar_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  push_pendente BOOLEAN NOT NULL DEFAULT true,
+  push_enviado_em TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_novidades_atualizado ON novidades (atualizado_em DESC);
+CREATE INDEX IF NOT EXISTS idx_novidades_push_pendente ON novidades (push_enviar_em) WHERE push_pendente;
+ALTER TABLE novidades ENABLE ROW LEVEL SECURITY;
+-- Até quando o usuário já viu as novidades (abriu a lista) - vale em todos os
+-- aparelhos dele.
+ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS novidades_vistas_ate TIMESTAMPTZ;
+
+-- Aparelhos que ativaram "Avisos no celular" (Web Push). endpoint é único por
+-- navegador/aparelho; o push service devolve 404/410 quando a inscrição morre
+-- e aí a linha é apagada.
+CREATE TABLE IF NOT EXISTS push_inscricoes (
+  id SERIAL PRIMARY KEY,
+  usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ultimo_envio_em TIMESTAMPTZ
+);
+ALTER TABLE push_inscricoes ENABLE ROW LEVEL SECURITY;
+
+-- Importação automática por e-mail (routes/importacaoEmail.js): um registro
+-- por arquivo recebido (hash SHA-256 do conteúdo) - o mesmo arquivo nunca é
+-- importado duas vezes - com o resultado ('ok'/'falhou') pro Painel.
+CREATE TABLE IF NOT EXISTS importacoes_email (
+  id SERIAL PRIMARY KEY,
+  hash TEXT NOT NULL UNIQUE,
+  nome_arquivo TEXT,
+  tipo TEXT,
+  remetente TEXT,
+  assunto TEXT,
+  mensagem_id TEXT,
+  recebido_em TIMESTAMPTZ,
+  status TEXT NOT NULL,
+  erro TEXT,
+  resultado JSONB,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_importacoes_email_tipo ON importacoes_email (tipo, atualizado_em DESC);
+ALTER TABLE importacoes_email ENABLE ROW LEVEL SECURITY;
+
+-- Pedidos bloqueados pela Cortag (e-mail "Pedido Bloqueado NNNNNN" da
+-- noreply@cortag.com.br, lido pela importação por e-mail). O selo "⛔
+-- Bloqueado" vale enquanto o pedido não aparece faturado no relatório oficial
+-- e por no máximo 30 dias (pedido que nunca fatura = cancelado) - regra em
+-- routes/lib/pedidosBloqueados.js.
+CREATE TABLE IF NOT EXISTS pedidos_bloqueados (
+  nr_pedido TEXT PRIMARY KEY,
+  cliente_codigo_oficial TEXT,
+  cliente_nome TEXT,
+  motivo TEXT,
+  recebido_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_pedidos_bloqueados_cliente ON pedidos_bloqueados (cliente_codigo_oficial);
+ALTER TABLE pedidos_bloqueados ENABLE ROW LEVEL SECURITY;
+
+-- Aviso de cancelamento do saldo em carteira (e-mail "Cancelamento saldo em
+-- carteira DD.MM.AAAA" das assistentes comerciais, lido pela importação por
+-- e-mail): um por item do saldo. É o aviso final antes do corte - o vendedor
+-- ainda pode pedir pra aumentar a quantidade. Vale 15 dias ou até o item
+-- aparecer faturado depois do aviso (routes/lib/cancelamentoSaldo.js).
+CREATE TABLE IF NOT EXISTS avisos_cancelamento_saldo (
+  nr_pedido TEXT NOT NULL,
+  codigo_sku TEXT NOT NULL,
+  cliente_codigo_oficial TEXT,
+  cliente_nome TEXT,
+  descricao TEXT,
+  ordem_compra TEXT,
+  motivo TEXT,
+  minimo NUMERIC,
+  quantidade NUMERIC,
+  valor NUMERIC,
+  data_aviso DATE NOT NULL,
+  remetente TEXT,
+  recebido_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (nr_pedido, codigo_sku)
+);
+CREATE INDEX IF NOT EXISTS idx_avisos_cancelamento_cliente ON avisos_cancelamento_saldo (cliente_codigo_oficial);
+ALTER TABLE avisos_cancelamento_saldo ENABLE ROW LEVEL SECURITY;
+
+-- Foto do produto pro card de oferta (aba Produtos, routes/produtoFotos.js).
+-- Qualquer vendedor cadastra (decisão do usuário, 10/2026); o app manda JPEG já
+-- reduzido no celular. Variação que recebe a mesma foto ganha uma cópia própria
+-- (trocar a foto de um tamanho não mexe nos outros).
+CREATE TABLE IF NOT EXISTS produto_fotos (
+  codigo_sku TEXT PRIMARY KEY,
+  imagem BYTEA NOT NULL,
+  tamanho INTEGER NOT NULL,
+  atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  atualizado_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL
+);
+-- Miniatura (lado maior 300 px) pro catálogo sem internet: gerada pelo servidor
+-- na primeira vez que o app pede (routes/lib/miniaturaFoto.js); trocar a foto zera.
+ALTER TABLE produto_fotos ADD COLUMN IF NOT EXISTS miniatura BYTEA;
+
+-- Ocorrência no Pós-Vendas (botão "Abrir ocorrência" no card do pedido oficial
+-- com NF, routes/ocorrencias.js). O e-mail sai do celular do vendedor (o app só
+-- monta o texto e as fotos); aqui fica só o registro, gravado quando ele confirma
+-- "Enviei", pro selo "Ocorrência aberta" aparecer pra todos os vendedores até
+-- alguém marcar resolvida. `id_envio` (gerado no aparelho) = reenvio da fila
+-- offline devolve o já gravado.
+CREATE TABLE IF NOT EXISTS ocorrencias_pos_venda (
+  id SERIAL PRIMARY KEY,
+  cliente_id INTEGER NOT NULL REFERENCES clientes(id) ON DELETE CASCADE,
+  nr_pedido TEXT NOT NULL,
+  nota_fiscal TEXT NOT NULL,
+  tipo TEXT NOT NULL,
+  resumo TEXT,
+  enviado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+  resolvida_em TIMESTAMPTZ,
+  usuario_id INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+  id_envio TEXT,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ocorrencias_id_envio ON ocorrencias_pos_venda (id_envio);
+CREATE INDEX IF NOT EXISTS idx_ocorrencias_cliente ON ocorrencias_pos_venda (cliente_id);
+
+-- RLS em TODAS as tabelas do schema (verificador do Supabase: rls_disabled_in_public).
+-- Mesmo motivo do bloco de levantamento_rascunhos acima: fecha o acesso pela API
+-- REST pública do Supabase (PostgREST, roles anon/authenticated); sem política =
+-- nega tudo pra quem não é dono. O app conecta como DONO das tabelas e não é
+-- afetado - por isso nunca usar FORCE ROW LEVEL SECURITY aqui (aí o dono também
+-- passaria a ser barrado). Idempotente: ligar de novo não muda nada. Tabela nova
+-- neste arquivo entra nesta lista (o test/run_tests.js confere).
+ALTER TABLE clientes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cliente_classificatorio_erp ENABLE ROW LEVEL SECURITY;
+ALTER TABLE produtos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vendedores ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pedidos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pedido_itens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE levantamentos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE levantamento_itens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE usuarios ENABLE ROW LEVEL SECURITY;
+ALTER TABLE import_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessoes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE previsao_estoque ENABLE ROW LEVEL SECURITY;
+ALTER TABLE configuracoes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fichas_tecnicas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE codigos_produto ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pedidos_oficiais_itens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pedidos_pendentes_pagamento ENABLE ROW LEVEL SECURITY;
+ALTER TABLE titulos_avista_pendentes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE catalogo_precos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clientes_sem_compra ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reativacao_adiamentos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE contas_salesforce ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reativacao_alvos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE titulos_inadimplentes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE produto_fotos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ocorrencias_pos_venda ENABLE ROW LEVEL SECURITY;

@@ -3,6 +3,10 @@ const router = express.Router();
 const { pool } = require('../db');
 const { validarIdInteiro } = require('../middleware/validarId');
 const { descontoPelaPolitica, chaveTipo } = require('./lib/politicaComercial');
+const { sqlFaturadoDeFato } = require('./lib/faturadoDeFato');
+const { SQL_HOJE_BR, SQL_PEDIDO_APP_VALIDO, sqlDiaDoPedido } = require('./lib/comprasApp');
+const { avisarImportacao, quantos } = require('./lib/novidades');
+const { clientesDeOutroVendedor, clientesInativosNoSalesforce } = require('./lib/contasSalesforce');
 
 router.param('id', validarIdInteiro);
 
@@ -29,11 +33,59 @@ function faixaDoTipo(tipo) {
   return FAIXAS_POR_CHAVE.get(chaveTipo(tipo)) || null;
 }
 
+// Degraus da régua do card (do menor pro maior), andando pela faixa anterior
+// e pela próxima a partir da do cliente: [{ tipo, min, atual }].
+function degrausDaFaixa(tipo) {
+  const inicio = faixaDoTipo(tipo);
+  if (!inicio) return [];
+  const nomeDe = f => Object.keys(FAIXAS).find(k => FAIXAS[k] === f);
+  const lista = [{ tipo: nomeDe(inicio), min: inicio.min, atual: true }];
+  for (let f = inicio, n = 0; f.faixaAnterior && FAIXAS[f.faixaAnterior] && n < 6; n++) {
+    f = FAIXAS[f.faixaAnterior];
+    lista.unshift({ tipo: nomeDe(f), min: f.min });
+  }
+  for (let f = inicio, n = 0; f.proximaFaixa && FAIXAS[f.proximaFaixa] && n < 6; n++) {
+    f = FAIXAS[f.proximaFaixa];
+    lista.push({ tipo: nomeDe(f), min: f.min });
+  }
+  return lista;
+}
+
 const LIMIAR_PERTO_DE_SUBIR = 0.15; // falta <= 15% do tamanho da faixa conta como "perto"
+// Coluna DATE: o pg entrega como Date à meia-noite LOCAL (sem setTypeParser no
+// projeto) e o mock como texto 'AAAA-MM-DD' - String(d).slice(0, 10) de um Date
+// dá "Tue Oct 13" (achado do revisor-cortag, 10/2026). Lê os dois.
+function diaDoBanco(d) {
+  if (d == null || d === '') return null;
+  if (d instanceof Date) {
+    if (isNaN(d.getTime())) return null;
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+  return String(d).slice(0, 10);
+}
+
+function hojeBrasil() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+}
+
 const DIAS_SEM_COMPRAR_ALERTA = 60; // mesmo limiar já usado na "carteira antiga"
 
 function normalizarDoc(v) {
   return String(v || '').replace(/\D/g, '');
+}
+function numeroOuNull(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function textoOuNull(v) {
+  const t = v == null ? '' : String(v).trim();
+  return t ? t : null;
+}
+// Só aceita AAAA-MM-DD (o navegador já converte as datas da planilha).
+function dataIsoOuNull(v) {
+  const t = v == null ? '' : String(v).trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(t) ? t : null;
 }
 
 // Soma pedidos_oficiais_itens.valor por data_implantacao dentro de
@@ -61,18 +113,32 @@ async function calcularEntradaTrimestralPeriodo(pool, cliente, periodoInicio, pe
 }
 
 // Calcula o status de classificatório (quanto falta pra subir/cair) de um
-// cliente. Política Comercial rev. 06 (item 4): a faixa é decidida pelo
-// faturamento líquido dos ÚLTIMOS 12 MESES (régua móvel) - apuração mensal,
-// pode subir em qualquer mês que bater o teto; ficar abaixo do mínimo da
-// própria faixa é risco real de queda (a Cortag ajusta pra baixo em 01/01 e
-// 01/07). Meta individual (PIC/Vl.Acordo) continua contra o acumulado do
-// ano corrente, com o risco decidido pelo ritmo trimestral.
+// cliente. Regra explicada pelo usuário (10/2026): a faixa vale pelo ANO
+// FISCAL jan-dez - em 01/01 ela só desce, pelo ano fechado; subir é pedido
+// ao gerente quando o acumulado do ano já bateu a faixa (a nova vale até
+// junho do ano seguinte). Antes a conta era pelos 12 meses móveis (política
+// rev. 06) e o card dizia "faltam R$ 12 mil" de quem precisava de R$ 23,5
+// mil no ano (as vendas do ano anterior saem da conta em 01/01).
+// Abaixo do mínimo da faixa só é risco de queda quando o acumulado está
+// atrás do ritmo pra chegar nele até 31/12 (`fracaoDoAno` = parte do ano já
+// passada; sem ela, conta como ano inteiro). Meta individual (PIC/Vl.Acordo)
+// também é contra o acumulado, com o risco decidido pelo ritmo trimestral.
 // `faturamentoFaixa` na resposta = o valor que foi comparado com a faixa
 // (a barra de progresso do app usa esse).
 // Função pura - sem acesso a banco - pra ser testável direto.
-function calcularStatusClassificatorio({ tipo, pic, vlAcordo, faturamento12m, faturamentoAnoCorrente, atrasadoNoRitmo }) {
+// Parte do ano já passada (0-1) pelo dia do ano de Brasília vindo do banco.
+function fracaoDoAnoPeloDia(diaDoAno, ano) {
+  const dia = Number(diaDoAno);
+  if (!Number.isFinite(dia) || dia <= 0) return null;
+  const a = Number(ano);
+  const bissexto = Number.isFinite(a) && ((a % 4 === 0 && a % 100 !== 0) || a % 400 === 0);
+  return Math.min(1, dia / (bissexto ? 366 : 365));
+}
+
+function calcularStatusClassificatorio({ tipo, pic, vlAcordo, faturamento12m, faturamentoAnoCorrente, atrasadoNoRitmo, fracaoDoAno }) {
   const fat12m = Number(faturamento12m) || 0;
   const fatAnoCorrente = Number(faturamentoAnoCorrente) || 0;
+  const fracao = Number.isFinite(Number(fracaoDoAno)) && fracaoDoAno != null ? Math.min(1, Math.max(0, Number(fracaoDoAno))) : 1;
   if (!tipo) return { classificado: false };
 
   const base = { classificado: true, tipo, faturamento12m: fat12m };
@@ -92,16 +158,24 @@ function calcularStatusClassificatorio({ tipo, pic, vlAcordo, faturamento12m, fa
   const faixa = faixaDoTipo(tipo);
   if (!faixa) return { ...base, semFaixaDefinida: true };
 
-  const fat = fat12m;
+  const fat = fatAnoCorrente;
   base.faturamentoFaixa = fat;
+  // o app escolhe o texto por isto (app novo com servidor antigo, de 12
+  // meses, mostraria o número velho como "até 31/12")
+  base.regraFaixa = 'ano_fiscal';
   if (fat < faixa.min) {
-    // Abaixo do mínimo da própria faixa nos últimos 12 meses - risco real
-    // de cair no próximo ajuste (01/01 ou 01/07).
+    // Abaixo do mínimo da própria faixa no ano: cai em 01/01 se não chegar
+    // nele até 31/12 - risco quando está atrás do ritmo pra isso.
     return {
       ...base,
-      emRiscoDeQueda: true,
+      // no 1º trimestre ainda não é risco: o 1º faturamento do ano costuma
+      // sair em meados de janeiro e a carteira inteira entraria nos alertas
+      emRiscoDeQueda: fracao >= 0.25 && fat < faixa.min * fracao,
       faixaAnterior: faixa.faixaAnterior || null,
       faltaPraManter: faixa.min - fat,
+      // e quanto falta no ano pra pedir a próxima (o card mostra as duas)
+      proximaFaixa: faixa.proximaFaixa || null,
+      faltaPraProximaFaixa: faixa.proximaFaixa && faixa.max != null ? faixa.max - fat : null,
       faixaMin: 0,
       faixaMax: faixa.min,
     };
@@ -117,9 +191,55 @@ function calcularStatusClassificatorio({ tipo, pic, vlAcordo, faturamento12m, fa
       faixaMax: faixa.max,
     };
   }
-  // Já bateu o teto da faixa este ano (ou a faixa não tem teto definido) -
-  // qualifica pra subir agora mesmo, não precisa esperar o fim do ano.
+  // Já bateu o teto da faixa no ano (ou a faixa não tem teto definido) -
+  // dá pra pedir a subida ao gerente agora, sem esperar o fim do ano.
   return { ...base, emRiscoDeQueda: false, jaQualificaProximaFaixa: !!faixa.proximaFaixa, proximaFaixa: faixa.proximaFaixa || null };
+}
+
+// Lê a coluna "Diferenca" da planilha Classificatório do ERP. Ela não diz o
+// que mede - conferido contra o relatório real de 02/10/2026 (287 clientes):
+// abaixo do mínimo da faixa atual (12 meses da matriz), é quanto falta pra
+// MANTER a faixa (Premium < 30 mil, Master < 50 mil); dentro da faixa, quanto
+// falta pra SUBIR pra próxima; vazia = já qualifica pra próxima / faixa máxima.
+// PIC: quanto falta pra meta do acordo (vazia = não dá pra afirmar nada).
+// Rede não tem faixa. Função pura, testável direto.
+function interpretarDiferencaErp({ tipo, pic, vlAcordo, fat12mMatriz, diferenca }) {
+  if (!tipo || tipo === 'Rede') return null;
+  const dif = diferenca == null || diferenca === '' ? null : Number(diferenca);
+  const temDif = dif != null && Number.isFinite(dif) && dif > 0;
+  if (pic && vlAcordo) return temDif ? { situacao: 'meta', falta: dif, meta: Number(vlAcordo) } : null;
+  const faixa = faixaDoTipo(tipo);
+  if (!faixa) return temDif ? { situacao: 'outro', falta: dif } : null;
+  const fat = Number(fat12mMatriz) || 0;
+  if (fat < faixa.min) {
+    return { situacao: 'manter', falta: temDif ? dif : faixa.min - fat, faixaAnterior: faixa.faixaAnterior || null };
+  }
+  if (faixa.proximaFaixa) {
+    return temDif
+      ? { situacao: 'subir', falta: dif, proximaFaixa: faixa.proximaFaixa }
+      : { situacao: 'qualifica', proximaFaixa: faixa.proximaFaixa };
+  }
+  return { situacao: 'topo' };
+}
+
+// Troca o veredito de faixa ao vivo pelo oficial do ERP (leitura da coluna
+// "Diferenca", ver interpretarDiferencaErp). Usado quando a matriz do cliente
+// também compra por empresas FORA do app (filiais de outros representantes):
+// aí a soma ao vivo fica abaixo da real e "vai cair"/"falta pra subir" sairiam
+// errados. Mesma regra do card compacto do app (statusComFaixaOficialErp em
+// index.html). Sem barra (faixaMin/faixaMax), que é calculada com o ao vivo.
+// Desde a faixa pelo ano fiscal (10/2026) a Diferenca (12 meses da apuração)
+// não decide mais: os alertas chamam com leitura null (sem veredito de faixa)
+// e só a meta do PIC continua valendo.
+function aplicarLeituraErp(status, leitura) {
+  const s = { ...status, emRiscoDeQueda: false, faltaPraManter: null, faltaPraProximaFaixa: null, faltaPraMeta: null,
+    jaQualificaProximaFaixa: false, faixaMin: null, faixaMax: null, fonteFaixa: 'erp' };
+  if (!leitura) return s;
+  if (leitura.situacao === 'manter') Object.assign(s, { emRiscoDeQueda: true, faltaPraManter: leitura.falta, faixaAnterior: leitura.faixaAnterior });
+  else if (leitura.situacao === 'subir') Object.assign(s, { faltaPraProximaFaixa: leitura.falta, proximaFaixa: leitura.proximaFaixa });
+  else if (leitura.situacao === 'qualifica') Object.assign(s, { jaQualificaProximaFaixa: true, proximaFaixa: leitura.proximaFaixa });
+  else if (leitura.situacao === 'meta') Object.assign(s, { faltaPraMeta: leitura.falta });
+  return s;
 }
 
 // Quebra o faturamento em até 4 trimestres civis (mais recentes primeiro
@@ -199,9 +319,12 @@ function calcularRitmoTrimestral({ tipo, pic, vlAcordo, trimestres, anoReferenci
 // fechado que valia antes). Os limites do ano civil abaixo continuam só pro
 // comparativo "acumulado do ano corrente x mesmo período do ano anterior"
 // da ficha do cliente.
-const JANELA_12M_SQL = `CURRENT_DATE - INTERVAL '12 months'`;
-const PERIODO_CLASSIFICATORIO_INICIO_SQL = `date_trunc('year', CURRENT_DATE) - INTERVAL '1 year'`;
-const PERIODO_CLASSIFICATORIO_FIM_SQL = `date_trunc('year', CURRENT_DATE)`; // exclusivo
+// "Hoje" é o dia de Brasília (SQL_HOJE_BR): o banco roda em UTC e CURRENT_DATE
+// virava o dia às 21h - das 21h à meia-noite a janela, o ano e o trimestre
+// andavam um dia antes.
+const JANELA_12M_SQL = `${SQL_HOJE_BR} - INTERVAL '12 months'`;
+const PERIODO_CLASSIFICATORIO_INICIO_SQL = `date_trunc('year', ${SQL_HOJE_BR}) - INTERVAL '1 year'`;
+const PERIODO_CLASSIFICATORIO_FIM_SQL = `date_trunc('year', ${SQL_HOJE_BR})`; // exclusivo
 
 // Monta a subconsulta que soma faturamento (do ano civil fechado mais
 // recente, ver comentário acima), com `agruparPorMatrizGrupo` decidindo se
@@ -223,11 +346,11 @@ function sqlFaturamentoClassificatorioPorCliente(agruparPorMatrizGrupo) {
   return `
   SELECT c.id AS cliente_id,
          COALESCE(SUM(poi.valor) FILTER (
-           WHERE poi.status = 'faturado'
+           WHERE ${sqlFaturadoDeFato('poi')}
              AND poi.data_faturamento > ${JANELA_12M_SQL}
          ), 0) AS faturamento_12m,
          COALESCE(SUM(poi.valor) FILTER (
-           WHERE poi.status = 'faturado'
+           WHERE ${sqlFaturadoDeFato('poi')}
              AND poi.data_faturamento >= ${PERIODO_CLASSIFICATORIO_FIM_SQL}
          ), 0) AS faturamento_ano_corrente,
          -- Mesmo período do ano fechado (mesma contagem de dias decorridos
@@ -236,11 +359,24 @@ function sqlFaturamentoClassificatorioPorCliente(agruparPorMatrizGrupo) {
          -- ano fechado INTEIRO, que sempre parece maior só porque o ano
          -- corrente ainda não terminou. Pedido do usuário na aba Clientes.
          COALESCE(SUM(poi.valor) FILTER (
-           WHERE poi.status = 'faturado'
+           WHERE ${sqlFaturadoDeFato('poi')}
              AND poi.data_faturamento >= ${PERIODO_CLASSIFICATORIO_INICIO_SQL}
-             AND poi.data_faturamento < ${PERIODO_CLASSIFICATORIO_INICIO_SQL} + (CURRENT_DATE - ${PERIODO_CLASSIFICATORIO_FIM_SQL})
+             AND poi.data_faturamento < ${PERIODO_CLASSIFICATORIO_INICIO_SQL} + (${SQL_HOJE_BR} - ${PERIODO_CLASSIFICATORIO_FIM_SQL})
          ), 0) AS faturamento_mesmo_periodo_ano_anterior,
-         MAX(poi.data_faturamento) FILTER (WHERE poi.status = 'faturado') AS ultima_compra
+         MAX(poi.data_faturamento) FILTER (WHERE ${sqlFaturadoDeFato('poi')}) AS ultima_compra,
+         -- Último PEDIDO (pra "sem comprar há N dias"): a nota faturada, a
+         -- entrada do pedido no ERP (implantação, inclusive em carteira, sem a
+         -- série de 7 dígitos) ou o pedido do app ainda não faturado. Só pela
+         -- nota, em 14/10/2026 o alerta "sem comprar há 60+ dias" listava 5
+         -- clientes que já tinham pedido de novo (um Master "há 209 dias" com
+         -- pedido implantado na véspera).
+         GREATEST(
+           MAX(poi.data_faturamento) FILTER (WHERE ${sqlFaturadoDeFato('poi')}),
+           MAX(poi.data_implantacao) FILTER (WHERE length(poi.nr_pedido) <= 6),
+           (SELECT MAX(${sqlDiaDoPedido('ped')}) FROM pedidos ped JOIN clientes c3 ON c3.id = ped.cliente_id
+            WHERE ${SQL_PEDIDO_APP_VALIDO}
+              AND ${agruparPorMatrizGrupo ? '(c3.id = c.id OR (c.matriz_grupo IS NOT NULL AND c3.matriz_grupo = c.matriz_grupo))' : 'c3.id = c.id'})
+         ) AS ultimo_pedido
   FROM clientes c
   ${joinC2}
   LEFT JOIN pedidos_oficiais_itens poi ON poi.cliente_codigo_oficial = c2.codigo_oficial
@@ -266,13 +402,14 @@ router.get('/:id/classificatorio/status', async (req, res) => {
     // O ano fechado (usado só pra rotular a resposta e fechar os 4 trimestres
     // em calcularRitmoTrimestral) vem do PRÓPRIO Postgres, na mesma consulta -
     // nunca de um "new Date()" separado no Node, que teria que só torcer pra
-    // concordar com o fuso do CURRENT_DATE do banco. Cliente Rede usa a
+    // concordar com o "hoje" do banco (SQL_HOJE_BR, dia de Brasília). Cliente Rede usa a
     // variante INDIVIDUAL (sem somar matriz_grupo) - ver comentário na
     // função sqlFaturamentoClassificatorioPorCliente.
     const fatResult = await pool.query(
       `SELECT sub.*, EXTRACT(YEAR FROM ${PERIODO_CLASSIFICATORIO_INICIO_SQL})::int AS ano_fechado,
-              EXTRACT(YEAR FROM CURRENT_DATE)::int AS ano_atual,
-              EXTRACT(QUARTER FROM CURRENT_DATE)::int - 1 AS trimestre_atual_idx
+              EXTRACT(YEAR FROM ${SQL_HOJE_BR})::int AS ano_atual,
+              EXTRACT(QUARTER FROM ${SQL_HOJE_BR})::int - 1 AS trimestre_atual_idx,
+              EXTRACT(DOY FROM ${SQL_HOJE_BR})::int AS dia_do_ano
        FROM (${ehRede ? SQL_FATURAMENTO_CLASSIFICATORIO_INDIVIDUAL_POR_CLIENTE : SQL_FATURAMENTO_CLASSIFICATORIO_POR_CLIENTE} WHERE c.id = $1 GROUP BY c.id) sub`,
       [req.params.id]
     );
@@ -280,6 +417,7 @@ router.get('/:id/classificatorio/status', async (req, res) => {
     const faturamentoAnoCorrente = fatResult.rows[0] ? Number(fatResult.rows[0].faturamento_ano_corrente) : 0;
     const faturamentoMesmoPeriodoAnoAnterior = fatResult.rows[0] ? Number(fatResult.rows[0].faturamento_mesmo_periodo_ano_anterior) : 0;
     const ultimaCompra = fatResult.rows[0] ? fatResult.rows[0].ultima_compra : null;
+    const ultimoPedido = fatResult.rows[0] ? diaDoBanco(fatResult.rows[0].ultimo_pedido) : null;
     const anoPeriodo = fatResult.rows[0] ? Number(fatResult.rows[0].ano_fechado) : new Date().getUTCFullYear() - 1;
     const anoAtual = fatResult.rows[0] ? Number(fatResult.rows[0].ano_atual) : new Date().getUTCFullYear();
     const trimestreAtualIdx = fatResult.rows[0] ? Number(fatResult.rows[0].trimestre_atual_idx) : Math.floor(new Date().getUTCMonth() / 3);
@@ -304,14 +442,14 @@ router.get('/:id/classificatorio/status', async (req, res) => {
            FROM pedidos_oficiais_itens poi
            JOIN clientes c ON c.id = $1
            WHERE poi.cliente_codigo_oficial = c.codigo_oficial
-             AND poi.data_implantacao >= date_trunc('quarter', CURRENT_DATE) - INTERVAL '9 months'
+             AND poi.data_implantacao >= date_trunc('quarter', ${SQL_HOJE_BR}) - INTERVAL '9 months'
            GROUP BY 1 ORDER BY 1`
         : `SELECT date_trunc('quarter', poi.data_implantacao) AS trimestre, SUM(poi.valor) AS faturado
            FROM pedidos_oficiais_itens poi
            JOIN clientes c2 ON poi.cliente_codigo_oficial = c2.codigo_oficial
            JOIN clientes c ON c.id = $1
            WHERE (c2.id = c.id OR (c.matriz_grupo IS NOT NULL AND c2.matriz_grupo = c.matriz_grupo))
-             AND poi.data_implantacao >= date_trunc('quarter', CURRENT_DATE) - INTERVAL '9 months'
+             AND poi.data_implantacao >= date_trunc('quarter', ${SQL_HOJE_BR}) - INTERVAL '9 months'
            GROUP BY 1 ORDER BY 1`,
       [req.params.id]
     );
@@ -337,6 +475,7 @@ router.get('/:id/classificatorio/status', async (req, res) => {
       faturamento12m,
       faturamentoAnoCorrente,
       atrasadoNoRitmo: ritmo.situacao === 'atrasado',
+      fracaoDoAno: fracaoDoAnoPeloDia(fatResult.rows[0] && fatResult.rows[0].dia_do_ano, anoAtual),
     });
 
     // Objetivo trimestral customizado (vindo do relatório oficial do ERP,
@@ -344,33 +483,183 @@ router.get('/:id/classificatorio/status', async (req, res) => {
     // - meta explícita por cliente/grupo, diferente da meta automática por
     // FAIXA calculada acima. Só aparece quando existe um objetivo importado
     // pra esse cliente/grupo; convive com (não substitui) a meta por faixa.
+    // Período já encerrado (ninguém importou os objetivos do trimestre novo):
+    // não é mais "o objetivo do trimestre" - em 14/10/2026 o card dizia
+    // "Faltam R$ 5.448 pra bater o objetivo do trimestre" com a entrada de
+    // jul-set. Vai à parte em `objetivoEncerrado`, só como resultado.
     let objetivoTrimestral = null;
     let entradaTrimestral = null;
     let faltaPObjetivo = null;
+    let objetivoEncerrado = null;
     const objetivosConfigResult = await pool.query('SELECT valor FROM configuracoes WHERE chave = $1', ['objetivos_trimestrais']);
     const objetivosConfig = objetivosConfigResult.rows[0]?.valor;
     if (objetivosConfig && objetivosConfig.periodoInicio && objetivosConfig.periodoFim) {
       const chaveGrupo = cliente.matriz_grupo || cliente.nome;
       const objetivo = objetivosConfig.objetivos?.[chaveGrupo];
       if (objetivo != null) {
-        objetivoTrimestral = Number(objetivo);
-        entradaTrimestral = await calcularEntradaTrimestralPeriodo(pool, cliente, objetivosConfig.periodoInicio, objetivosConfig.periodoFim);
-        faltaPObjetivo = Math.max(0, objetivoTrimestral - entradaTrimestral);
+        const valorObjetivo = Number(objetivo);
+        const entrada = await calcularEntradaTrimestralPeriodo(pool, cliente, objetivosConfig.periodoInicio, objetivosConfig.periodoFim);
+        const falta = Math.max(0, valorObjetivo - entrada);
+        if (String(objetivosConfig.periodoFim).slice(0, 10) < hojeBrasil()) {
+          objetivoEncerrado = {
+            periodoInicio: String(objetivosConfig.periodoInicio).slice(0, 10),
+            periodoFim: String(objetivosConfig.periodoFim).slice(0, 10),
+            objetivo: valorObjetivo,
+            entrada,
+            falta,
+          };
+        } else {
+          objetivoTrimestral = valorObjetivo;
+          entradaTrimestral = entrada;
+          faltaPObjetivo = falta;
+        }
       }
     }
 
+    // Foto oficial do ERP (planilha Classificatório) - os mesmos números da
+    // planilha, pro vendedor não precisar abri-la. Convive com os números
+    // ao vivo acima (que somam o faturamento importado até hoje).
+    // Datas como texto AAAA-MM-DD direto do Postgres (nunca passam por Date - ver CLAUDE.md).
+    const erpResult = await pool.query(
+      `SELECT fat_ano_anterior, fat_acumulado, fat_12m_cliente, fat_12m_matriz, diferenca, gestor, situacao, cidade, uf,
+              data_relatorio::text AS data_relatorio, apurado_ate::text AS apurado_ate,
+              cliente_desde::text AS cliente_desde, ultima_compra::text AS ultima_compra
+       FROM cliente_classificatorio_erp WHERE cliente_id = $1`,
+      [req.params.id]
+    );
+    const erpRow = erpResult.rows[0];
+    const dataTxt = diaDoBanco;
+    // "Ult.Compra" da planilha é congelada na apuração do ERP (relatório de
+    // 02/10 = até 31/08): o card dizia "Última compra 20/08" de quem já tinha
+    // faturado em 16/09 e 13/10. Vai junto a última compra faturada DESTE
+    // CNPJ que o app conhece (sem somar o grupo, como a da planilha).
+    let ultimaCompraClienteApp = null;
+    if (erpRow) {
+      if (ehRede) ultimaCompraClienteApp = dataTxt(ultimaCompra);
+      else {
+        const r = await pool.query(`${SQL_FATURAMENTO_CLASSIFICATORIO_INDIVIDUAL_POR_CLIENTE} WHERE c.id = $1 GROUP BY c.id`, [req.params.id]);
+        ultimaCompraClienteApp = dataTxt(r.rows[0] && r.rows[0].ultima_compra);
+      }
+    }
+    // Parte dos 12 meses da matriz que vem de empresas FORA do app (filiais
+    // atendidas por outros representantes): matriz do ERP menos o "12 meses ·
+    // cliente" das empresas do grupo que estão no app, no mesmo relatório.
+    // Quando existe, a soma ao vivo do app fica abaixo da real e o veredito de
+    // faixa dele estaria errado (ex.: "vai cair" quando o ERP diz "falta pouco
+    // pra subir") - o card esconde esse veredito e manda olhar o oficial.
+    let fat12mOutrasEmpresas = null;
+    if (erpRow && !ehRede && erpRow.fat_12m_matriz != null) {
+      const somaResult = await pool.query(
+        `SELECT COALESCE(SUM(e.fat_12m_cliente), 0) AS soma
+         FROM clientes c2
+         JOIN cliente_classificatorio_erp e ON e.cliente_id = c2.id AND e.data_relatorio = $2::date
+         WHERE c2.id = $1 OR ($3::text IS NOT NULL AND c2.matriz_grupo = $3::text)`,
+        [req.params.id, erpRow.data_relatorio, cliente.matriz_grupo]
+      );
+      const fora = Number(erpRow.fat_12m_matriz) - Number(somaResult.rows[0]?.soma || 0);
+      if (fora > 1) fat12mOutrasEmpresas = Math.round(fora * 100) / 100;
+    }
+    // Conciliação ERP × app (pedido do usuário: "mostra no card a diferença
+    // explicada"). O ERP fecha a apuração no fim do mês (apurado_ate) e o app
+    // soma até hoje, então os dois olham janelas diferentes:
+    //   app 12m - vendas depois da apuração + vendas que o ERP ainda conta e
+    //   o app já tirou da janela = número do ERP, a menos de "outras
+    //   diferenças" (devolução/abatimento lançado no ERP - o relatório de
+    //   faturamento traz as notas pelo valor bruto - ou empresas da matriz
+    //   fora do app). Mesmo agrupamento da conta ao vivo (Rede: só o cliente).
+    let conciliacao = null;
+    if (erpRow && erpRow.apurado_ate) {
+      const r = (await pool.query(
+        `SELECT
+           COALESCE(SUM(poi.valor) FILTER (WHERE poi.data_faturamento > $2::date
+             AND poi.data_faturamento > ${JANELA_12M_SQL}), 0) AS depois_12m,
+           COALESCE(SUM(poi.valor) FILTER (WHERE poi.data_faturamento >= ($2::date + 1) - INTERVAL '12 months'
+             AND poi.data_faturamento <= ${JANELA_12M_SQL}), 0) AS fora_janela_app,
+           COALESCE(SUM(poi.valor) FILTER (WHERE poi.data_faturamento > $2::date
+             AND poi.data_faturamento >= ${PERIODO_CLASSIFICATORIO_FIM_SQL}), 0) AS depois_ano,
+           (($2::date + 1) - INTERVAL '12 months')::date::text AS inicio_erp,
+           (${JANELA_12M_SQL})::date::text AS fim_fora_janela_app,
+           (${JANELA_12M_SQL} + INTERVAL '1 day')::date::text AS inicio_app,
+           ${SQL_HOJE_BR}::text AS hoje,
+           EXTRACT(YEAR FROM $2::date) = EXTRACT(YEAR FROM ${SQL_HOJE_BR}) AS mesmo_ano
+         FROM clientes c
+         JOIN clientes c2 ON c2.id = c.id ${ehRede ? '' : 'OR (c.matriz_grupo IS NOT NULL AND c2.matriz_grupo = c.matriz_grupo)'}
+         JOIN pedidos_oficiais_itens poi ON poi.cliente_codigo_oficial = c2.codigo_oficial
+         WHERE c.id = $1 AND ${sqlFaturadoDeFato('poi')}`,
+        [req.params.id, erpRow.apurado_ate]
+      )).rows[0] || {};
+      const r2 = v => Math.round((Number(v) || 0) * 100) / 100;
+      // Rede: o ERP só tem o 12 meses do próprio cliente comparável (ano
+      // anterior/acumulado da planilha são da rede inteira).
+      const erp12 = ehRede ? erpRow.fat_12m_cliente : erpRow.fat_12m_matriz;
+      const doze = erp12 == null ? null : {
+        app: r2(faturamento12m),
+        depoisApuracao: r2(r.depois_12m),
+        foraDaJanelaApp: r2(r.fora_janela_app),
+        erp: r2(erp12),
+      };
+      if (doze) doze.outras = r2(doze.erp - (doze.app - doze.depoisApuracao + doze.foraDaJanelaApp));
+      const ano = ehRede || erpRow.fat_acumulado == null || !r.mesmo_ano ? null : {
+        app: r2(faturamentoAnoCorrente),
+        depoisApuracao: r2(r.depois_ano),
+        erp: r2(erpRow.fat_acumulado),
+      };
+      if (ano) ano.outras = r2(ano.erp - (ano.app - ano.depoisApuracao));
+      conciliacao = {
+        periodoErp: { inicio: r.inicio_erp || null, fim: dataTxt(erpRow.apurado_ate) },
+        periodoApp: { inicio: r.inicio_app || null, fim: r.hoje || null },
+        // vendas que o ERP ainda conta e o app já tirou: de periodoErp.inicio até aqui
+        fimForaDaJanelaApp: r.fim_fora_janela_app || null,
+        doze,
+        ano,
+      };
+    }
+    const numOuNull = v => (v == null ? null : Number(v));
+    const erp = erpRow ? {
+      dataRelatorio: dataTxt(erpRow.data_relatorio),
+      apuradoAte: dataTxt(erpRow.apurado_ate),
+      fatAnoAnterior: numOuNull(erpRow.fat_ano_anterior),
+      fatAcumulado: numOuNull(erpRow.fat_acumulado),
+      fat12mCliente: numOuNull(erpRow.fat_12m_cliente),
+      fat12mMatriz: numOuNull(erpRow.fat_12m_matriz),
+      diferenca: numOuNull(erpRow.diferenca),
+      fat12mOutrasEmpresas,
+      conciliacao,
+      leituraDiferenca: interpretarDiferencaErp({
+        tipo: cliente.classificatorio_tipo,
+        pic: cliente.classificatorio_pic,
+        vlAcordo: cliente.classificatorio_vl_acordo,
+        fat12mMatriz: erpRow.fat_12m_matriz,
+        diferenca: erpRow.diferenca,
+      }),
+      gestor: erpRow.gestor,
+      situacao: erpRow.situacao,
+      cidade: erpRow.cidade,
+      uf: erpRow.uf,
+      clienteDesde: dataTxt(erpRow.cliente_desde),
+      ultimaCompra: dataTxt(erpRow.ultima_compra),
+      ultimaCompraApp: ultimaCompraClienteApp,
+    } : null;
+
     res.json({
       ...status,
+      // régua do card (só aqui: os alertas não usam e ficam guardados no aparelho)
+      degraus: status.regraFaixa ? degrausDaFaixa(cliente.classificatorio_tipo) : undefined,
       ultimaCompra,
+      ultimoPedido,
       matrizGrupo: cliente.matriz_grupo,
+      pic: !!cliente.classificatorio_pic,
+      vlAcordo: cliente.classificatorio_vl_acordo != null ? Number(cliente.classificatorio_vl_acordo) : null,
+      erp,
       trimestral: ritmo,
-      periodoReferencia: { janela: 'ultimos_12_meses', anoAnterior: anoPeriodo },
-      revisao: 'Apuração mensal · ajuste pra baixo em 01/01 e 01/07',
+      periodoReferencia: { janela: 'ano_fiscal', anoAnterior: anoPeriodo },
+      revisao: 'Ano fiscal jan–dez · em 01/01 só desce, pelo ano fechado · subir: pedir ao gerente quando o acumulado do ano bater a faixa',
       anoCorrente: anoPeriodo + 1,
       faturamentoAnoCorrente,
       faturamentoMesmoPeriodoAnoAnterior,
       objetivoTrimestral,
       entradaTrimestral,
+      objetivoEncerrado,
       faltaPObjetivo,
     });
   } catch (e) {
@@ -394,14 +683,14 @@ router.get('/:id/classificatorio/grupo', async (req, res) => {
     const membrosResult = await pool.query(
       `SELECT c.id, c.nome, c.documento, c.classificatorio_tipo,
               COALESCE(SUM(poi.valor) FILTER (
-                WHERE poi.status = 'faturado'
+                WHERE ${sqlFaturadoDeFato('poi')}
                   AND poi.data_faturamento > ${JANELA_12M_SQL}
               ), 0) AS faturamento_12m,
               COALESCE(SUM(poi.valor) FILTER (
-                WHERE poi.status = 'faturado'
+                WHERE ${sqlFaturadoDeFato('poi')}
                   AND poi.data_faturamento >= ${PERIODO_CLASSIFICATORIO_FIM_SQL}
               ), 0) AS faturamento_ano_corrente,
-              MAX(poi.data_faturamento) FILTER (WHERE poi.status = 'faturado') AS ultima_compra
+              MAX(poi.data_faturamento) FILTER (WHERE ${sqlFaturadoDeFato('poi')}) AS ultima_compra
        FROM clientes c
        LEFT JOIN pedidos_oficiais_itens poi ON poi.cliente_codigo_oficial = c.codigo_oficial
        WHERE c.matriz_grupo = $1
@@ -432,7 +721,7 @@ router.get('/:id/classificatorio/grupo', async (req, res) => {
 // diário, não coisa de admin). Separa clientes classificados em 3 grupos.
 router.get('/classificatorio/alertas', async (req, res) => {
   try {
-    const [result, clientesResult, anoResult, trimResult] = await Promise.all([
+    const [result, clientesResult, anoResult, trimResult, erpResult] = await Promise.all([
       pool.query(
         `${SQL_FATURAMENTO_CLASSIFICATORIO_POR_CLIENTE}
          WHERE c.classificatorio_tipo IS NOT NULL
@@ -442,7 +731,7 @@ router.get('/classificatorio/alertas', async (req, res) => {
         `SELECT id, nome, documento, classificatorio_tipo, classificatorio_pic, classificatorio_vl_acordo, matriz_grupo
          FROM clientes WHERE classificatorio_tipo IS NOT NULL`
       ),
-      pool.query(`SELECT EXTRACT(YEAR FROM CURRENT_DATE)::int AS ano_atual, EXTRACT(QUARTER FROM CURRENT_DATE)::int - 1 AS trimestre_atual_idx`),
+      pool.query(`SELECT EXTRACT(YEAR FROM ${SQL_HOJE_BR})::int AS ano_atual, EXTRACT(QUARTER FROM ${SQL_HOJE_BR})::int - 1 AS trimestre_atual_idx, EXTRACT(DOY FROM ${SQL_HOJE_BR})::int AS dia_do_ano`),
       // Mesma janela móvel de 4 trimestres do status individual, mas pra
       // TODOS os clientes classificados de uma vez só (não N+1) - usada pra
       // saber quem está com o ritmo "atrasado" (ver comentário em
@@ -454,13 +743,34 @@ router.get('/classificatorio/alertas', async (req, res) => {
          JOIN clientes c2 ON (c2.id = c.id OR (c.matriz_grupo IS NOT NULL AND c2.matriz_grupo = c.matriz_grupo))
          JOIN pedidos_oficiais_itens poi ON poi.cliente_codigo_oficial = c2.codigo_oficial
          WHERE c.classificatorio_tipo IS NOT NULL
-           AND poi.data_implantacao >= date_trunc('quarter', CURRENT_DATE) - INTERVAL '9 months'
+           AND poi.data_implantacao >= date_trunc('quarter', ${SQL_HOJE_BR}) - INTERVAL '9 months'
          GROUP BY c.id, 2 ORDER BY c.id, 2`
       ),
+      // Foto oficial do ERP + quanto dos 12 meses da matriz vem de empresas
+      // fora do app (mesma conta do status individual, pra todos de uma vez).
+      pool.query(
+        `SELECT e.cliente_id, e.fat_12m_matriz, e.diferenca,
+                e.fat_12m_matriz - COALESCE((
+                  SELECT SUM(e2.fat_12m_cliente)
+                  FROM clientes c2
+                  JOIN cliente_classificatorio_erp e2 ON e2.cliente_id = c2.id AND e2.data_relatorio = e.data_relatorio
+                  WHERE c2.id = c.id OR (c.matriz_grupo IS NOT NULL AND c2.matriz_grupo = c.matriz_grupo)
+                ), 0) AS fat_12m_outras_empresas
+         FROM cliente_classificatorio_erp e
+         JOIN clientes c ON c.id = e.cliente_id
+         WHERE c.classificatorio_tipo IS NOT NULL`
+      ),
     ]);
-    const porId = new Map(clientesResult.rows.map(c => [c.id, c]));
+    // ativo com outro vendedor (Salesforce) não entra nos alertas
+    const outros = await clientesDeOutroVendedor();
+    const inativosSf = await clientesInativosNoSalesforce();
+    const porId = new Map(clientesResult.rows.filter(c => !outros.has(String(c.id))).map(c => [c.id, c]));
+    const erpPorCliente = new Map(erpResult.rows.map(r => [r.cliente_id, r]));
     const anoAtual = Number(anoResult.rows[0].ano_atual);
-    const trimestreAtualIdx = Number(trimResult.rows[0].trimestre_atual_idx);
+    // (era trimResult.rows[0] - linhas de trimestre, sem esse campo: NaN, e
+    // nenhum PIC entrava como "atrasado" nos alertas; sem linha, erro 500)
+    const trimestreAtualIdx = Number(anoResult.rows[0].trimestre_atual_idx);
+    const fracaoDoAno = fracaoDoAnoPeloDia(anoResult.rows[0].dia_do_ano, anoAtual);
     const trimestresPorCliente = new Map();
     for (const r of trimResult.rows) {
       const lista = trimestresPorCliente.get(r.cliente_id) || [];
@@ -476,6 +786,9 @@ router.get('/classificatorio/alertas', async (req, res) => {
     for (const row of result.rows) {
       const cliente = porId.get(row.cliente_id);
       if (!cliente) continue;
+      // conta inativa que veio do Salesforce com classificatório e nunca comprou
+      // no app: está no Para reativar, não tem faixa a perder
+      if (inativosSf.has(String(row.cliente_id)) && !diaDoBanco(row.ultimo_pedido) && !diaDoBanco(row.ultima_compra)) continue;
       const ritmo = calcularRitmoTrimestral({
         tipo: cliente.classificatorio_tipo,
         pic: cliente.classificatorio_pic,
@@ -484,14 +797,27 @@ router.get('/classificatorio/alertas', async (req, res) => {
         anoReferencia: anoAtual,
         trimestreReferenciaIdx: trimestreAtualIdx,
       });
-      const status = calcularStatusClassificatorio({
+      let status = calcularStatusClassificatorio({
         tipo: cliente.classificatorio_tipo,
         pic: cliente.classificatorio_pic,
         vlAcordo: cliente.classificatorio_vl_acordo,
         faturamento12m: Number(row.faturamento_12m),
         faturamentoAnoCorrente: Number(row.faturamento_ano_corrente),
         atrasadoNoRitmo: ritmo.situacao === 'atrasado',
+        fracaoDoAno,
       });
+      // Matriz com empresas fora do app: vale o veredito oficial do ERP.
+      const erp = erpPorCliente.get(cliente.id);
+      if (erp && !status.ehRede && Number(erp.fat_12m_outras_empresas) > 1) {
+        const leitura = interpretarDiferencaErp({
+          tipo: cliente.classificatorio_tipo,
+          pic: cliente.classificatorio_pic,
+          vlAcordo: cliente.classificatorio_vl_acordo,
+          fat12mMatriz: erp.fat_12m_matriz,
+          diferenca: erp.diferenca,
+        });
+        status = aplicarLeituraErp(status, leitura && leitura.situacao === 'meta' ? leitura : null);
+      }
       const item = { id: cliente.id, nome: cliente.nome, documento: cliente.documento, ...status };
 
       if (status.emRiscoDeQueda) {
@@ -504,8 +830,9 @@ router.get('/classificatorio/alertas', async (req, res) => {
         }
       }
 
-      if (!status.ehRede && row.ultima_compra) {
-        const diasSemComprar = Math.floor((hoje - new Date(row.ultima_compra).getTime()) / 86400000);
+      const ultimoPedido = diaDoBanco(row.ultimo_pedido) || diaDoBanco(row.ultima_compra);
+      if (!status.ehRede && ultimoPedido) {
+        const diasSemComprar = Math.floor((hoje - new Date(`${ultimoPedido}T00:00:00Z`).getTime()) / 86400000);
         if (diasSemComprar >= DIAS_SEM_COMPRAR_ALERTA) {
           semComprarRecente.push({ ...item, diasSemComprar });
         }
@@ -525,8 +852,21 @@ router.get('/classificatorio/alertas', async (req, res) => {
 // CNPJ diferente), com CNPJ como segundo critério.
 router.post('/classificatorio/importar', async (req, res) => {
   if (!req.usuario?.is_admin) return res.status(403).json({ erro: 'Só administrador pode importar o classificatório.' });
-  const itens = req.body.itens;
-  if (!Array.isArray(itens) || itens.length === 0) return res.status(400).json({ erro: 'Envie { itens: [...] }' });
+  const r = await importarClassificatorioErp(req.body || {});
+  res.status(r.status).json(r.json);
+});
+
+// Também chamada pela importação automática por e-mail (routes/importacaoEmail.js)
+// - devolve { status, json } em vez de responder direto.
+async function importarClassificatorioErp(body) {
+  const itens = body.itens;
+  if (!Array.isArray(itens) || itens.length === 0) return { status: 400, json: { erro: 'Envie { itens: [...] }' } };
+  // Data do relatório (do nome do arquivo, "02.10.2026_..._Classificatorio.xlsx")
+  // e até quando o ERP apurou (maior Ult.Compra da planilha). Sem data válida,
+  // o import continua funcionando como antes (sem foto financeira e sem
+  // trocar um classificatório que já existe).
+  const dataRelatorio = dataIsoOuNull(body.dataRelatorio);
+  const apuradoAte = dataIsoOuNull(body.apuradoAte);
 
   let client;
   try {
@@ -535,51 +875,122 @@ router.post('/classificatorio/importar', async (req, res) => {
     let atualizados = 0;
     let naoEncontrados = 0;
 
+    // Em lote (antes eram ~3 consultas por linha da planilha, cada uma uma ida
+    // de Oregon a São Paulo): os clientes que podem casar vêm numa consulta, o
+    // casamento é feito em memória na ordem da planilha e a gravação sai num
+    // UPDATE + um INSERT da foto por rodada. Cliente que aparece duas vezes
+    // (pelo código e pelo CNPJ) vai na rodada seguinte, comparando com o que a
+    // 1ª gravou - como no laço antigo.
+    const codigosEntrada = [...new Set(itens.map(it => (it.codigoOficial != null ? String(it.codigoOficial) : null)).filter(Boolean))];
+    const docsEntrada = [...new Set(itens.map(it => (it.cnpj ? normalizarDoc(it.cnpj) : null)).filter(Boolean))];
+    const carga = await client.query(
+      `/* classificatorio:clientes */
+       SELECT id, codigo_oficial, regexp_replace(documento, '\\D', '', 'g') AS doc FROM clientes
+       WHERE codigo_oficial = ANY($1::text[]) OR regexp_replace(documento, '\\D', '', 'g') = ANY($2::text[])
+       ORDER BY id`,
+      [codigosEntrada, docsEntrada]
+    );
+    const porCodigo = new Map();
+    const porDoc = new Map();
+    for (const r of carga.rows) {
+      const reg = { id: r.id, codigo: r.codigo_oficial || null };
+      if (reg.codigo) porCodigo.set(reg.codigo, reg);
+      if (r.doc && !porDoc.has(r.doc)) porDoc.set(r.doc, reg);
+    }
+    const rodadas = [];
+    const vezes = new Map();
     for (const it of itens) {
       const codigoOficial = it.codigoOficial != null ? String(it.codigoOficial) : null;
       const documento = it.cnpj ? normalizarDoc(it.cnpj) : null;
       if (!codigoOficial && !documento) { naoEncontrados++; continue; }
-
-      let cliente = null;
-      if (codigoOficial) {
-        const r = await client.query('SELECT id, codigo_oficial FROM clientes WHERE codigo_oficial = $1', [codigoOficial]);
-        if (r.rows.length > 0) cliente = r.rows[0];
-      }
-      if (!cliente && documento) {
-        const r = await client.query(
-          `SELECT id, codigo_oficial FROM clientes WHERE regexp_replace(documento, '\\D', '', 'g') = $1`,
-          [documento]
-        );
-        if (r.rows.length > 0) cliente = r.rows[0];
-      }
+      let cliente = (codigoOficial && porCodigo.get(codigoOficial)) || null;
+      if (!cliente && documento) cliente = porDoc.get(documento) || null;
       if (!cliente) { naoEncontrados++; continue; }
-
-      await client.query(
-        `UPDATE clientes SET
-           codigo_oficial = COALESCE(codigo_oficial, $1),
-           matriz_grupo = COALESCE($2, matriz_grupo),
-           classificatorio_pic = $3,
-           classificatorio_vl_acordo = COALESCE($4, classificatorio_vl_acordo),
-           classificatorio_tipo = COALESCE(classificatorio_tipo, $5),
-           classificatorio_desconto = COALESCE(classificatorio_desconto, $6)
-         WHERE id = $7`,
-        [codigoOficial, it.matrizGrupo || null, !!it.pic, it.vlAcordo ?? null, it.classificatorioTipo || null, it.classificatorioTipo ? descontoPelaPolitica(it.classificatorioTipo, it.classificatorioDesconto ?? null) : null, cliente.id]
-      );
+      // codigo_oficial = COALESCE(codigo_oficial, código da planilha): a linha
+      // seguinte com esse código já acha o cliente
+      if (!cliente.codigo && codigoOficial) { cliente.codigo = codigoOficial; porCodigo.set(codigoOficial, cliente); }
+      const n = vezes.get(cliente) || 0;
+      vezes.set(cliente, n + 1);
+      (rodadas[n] = rodadas[n] || []).push({ id: cliente.id, codigoOficial, it });
       atualizados++;
     }
 
+    // Classificatório: a planilha é a classificação oficial do ERP, então
+    // troca o que estiver gravado quando o relatório é tão ou mais novo que
+    // o que definiu o atual (mesma regra da importação do relatório de
+    // faturamento, routes/pedidosOficiais.js). Antes só preenchia quem não
+    // tinha nenhum - em 10/2026, 22 clientes estavam com faixa parada desde
+    // 2023-2025 por isso. Sem data do relatório, mantém o comportamento antigo.
+    // Matriz, PIC e valor de acordo: só da planilha tão ou mais nova que a
+    // última Classificatório gravada pro cliente (data da foto em
+    // cliente_classificatorio_erp, que só esta importação grava) - antes uma
+    // planilha antiga reimportada voltava os três. A data da faixa
+    // (classificatorio_atualizado_em) não serve aqui: o relatório oficial
+    // diário também a avança, e aí o PIC não seria mais atualizado.
+    const planilhaMaisNova = `($1::date IS NULL OR NOT EXISTS (SELECT 1 FROM cliente_classificatorio_erp e
+                               WHERE e.cliente_id = c.id AND e.data_relatorio > $1::date))`;
+    const trocaFaixa = `u.tipo IS NOT NULL AND $1::date IS NOT NULL
+              AND (c.classificatorio_atualizado_em IS NULL OR c.classificatorio_atualizado_em <= $1::date)`;
+    for (const rodada of rodadas) {
+      await client.query(
+        `/* classificatorio:atualizar */
+         UPDATE clientes c SET
+           codigo_oficial = COALESCE(c.codigo_oficial, u.codigo),
+           matriz_grupo = CASE WHEN ${planilhaMaisNova} THEN COALESCE(u.matriz, c.matriz_grupo) ELSE c.matriz_grupo END,
+           classificatorio_pic = CASE WHEN ${planilhaMaisNova} THEN u.pic ELSE c.classificatorio_pic END,
+           classificatorio_vl_acordo = CASE WHEN ${planilhaMaisNova} THEN COALESCE(u.vl_acordo, c.classificatorio_vl_acordo) ELSE c.classificatorio_vl_acordo END,
+           classificatorio_tipo = CASE WHEN ${trocaFaixa} THEN u.tipo ELSE COALESCE(c.classificatorio_tipo, u.tipo) END,
+           classificatorio_desconto = CASE WHEN ${trocaFaixa} THEN u.desconto ELSE COALESCE(c.classificatorio_desconto, u.desconto) END,
+           classificatorio_atualizado_em = CASE WHEN ${trocaFaixa} THEN $1::date ELSE c.classificatorio_atualizado_em END
+         FROM UNNEST($2::int[], $3::text[], $4::text[], $5::boolean[], $6::numeric[], $7::text[], $8::numeric[])
+           AS u(id, codigo, matriz, pic, vl_acordo, tipo, desconto)
+         WHERE c.id = u.id`,
+        [dataRelatorio, rodada.map(r => r.id), rodada.map(r => r.codigoOficial), rodada.map(r => r.it.matrizGrupo || null), rodada.map(r => !!r.it.pic),
+          rodada.map(r => r.it.vlAcordo ?? null), rodada.map(r => r.it.classificatorioTipo || null),
+          rodada.map(r => (r.it.classificatorioTipo ? descontoPelaPolitica(r.it.classificatorioTipo, r.it.classificatorioDesconto ?? null) : null))]
+      );
+      if (dataRelatorio) {
+        // Foto financeira oficial - um relatório mais antigo não sobrescreve um mais novo.
+        await client.query(
+          `/* classificatorio:foto */
+           INSERT INTO cliente_classificatorio_erp
+             (cliente_id, data_relatorio, apurado_ate, fat_ano_anterior, fat_acumulado, fat_12m_cliente, fat_12m_matriz,
+              diferenca, gestor, situacao, cidade, uf, cliente_desde, ultima_compra, atualizado_em)
+           SELECT u.cliente_id, $1::date, $2::date, u.fat_ano_anterior, u.fat_acumulado, u.fat_12m_cliente, u.fat_12m_matriz,
+                  u.diferenca, u.gestor, u.situacao, u.cidade, u.uf, u.cliente_desde, u.ultima_compra, now()
+           FROM UNNEST($3::int[], $4::numeric[], $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::text[], $10::text[],
+                       $11::text[], $12::text[], $13::date[], $14::date[])
+             AS u(cliente_id, fat_ano_anterior, fat_acumulado, fat_12m_cliente, fat_12m_matriz, diferenca, gestor, situacao, cidade, uf, cliente_desde, ultima_compra)
+           ON CONFLICT (cliente_id) DO UPDATE SET
+             data_relatorio = EXCLUDED.data_relatorio, apurado_ate = EXCLUDED.apurado_ate,
+             fat_ano_anterior = EXCLUDED.fat_ano_anterior, fat_acumulado = EXCLUDED.fat_acumulado,
+             fat_12m_cliente = EXCLUDED.fat_12m_cliente, fat_12m_matriz = EXCLUDED.fat_12m_matriz,
+             diferenca = EXCLUDED.diferenca, gestor = EXCLUDED.gestor, situacao = EXCLUDED.situacao,
+             cidade = EXCLUDED.cidade, uf = EXCLUDED.uf, cliente_desde = EXCLUDED.cliente_desde,
+             ultima_compra = EXCLUDED.ultima_compra, atualizado_em = now()
+           WHERE cliente_classificatorio_erp.data_relatorio <= EXCLUDED.data_relatorio`,
+          [dataRelatorio, apuradoAte, rodada.map(r => r.id),
+            rodada.map(r => numeroOuNull(r.it.fatAnoAnterior)), rodada.map(r => numeroOuNull(r.it.fatAcumulado)),
+            rodada.map(r => numeroOuNull(r.it.fat12mCliente)), rodada.map(r => numeroOuNull(r.it.fat12mMatriz)), rodada.map(r => numeroOuNull(r.it.diferenca)),
+            rodada.map(r => textoOuNull(r.it.gestor)), rodada.map(r => textoOuNull(r.it.situacao)), rodada.map(r => textoOuNull(r.it.cidade)), rodada.map(r => textoOuNull(r.it.uf)),
+            rodada.map(r => dataIsoOuNull(r.it.clienteDesde)), rodada.map(r => dataIsoOuNull(r.it.ultimaCompra))]
+        );
+      }
+    }
+
     await client.query('COMMIT');
-    res.json({ atualizados, naoEncontrados, total: itens.length });
+    await avisarImportacao('classificatorio', quantos(atualizados, 'cliente', 'clientes'));
+    return { status: 200, json: { atualizados, naoEncontrados, total: itens.length } };
   } catch (e) {
     if (client) {
       try { await client.query('ROLLBACK'); } catch (rollbackErr) { console.error('Erro no rollback:', rollbackErr); }
     }
     console.error(e);
-    res.status(500).json({ erro: 'Erro ao importar classificatório.' });
+    return { status: 500, json: { erro: 'Erro ao importar classificatório.' } };
   } finally {
     if (client) client.release();
   }
-});
+}
 
 // Import do "Objetivo Trimestral" oficial do ERP (ver plano "Meta
 // trimestral oficial") - só admin. Recebe { periodoInicio, periodoFim,
@@ -603,17 +1014,24 @@ router.post('/classificatorio/objetivos-trimestrais/importar', async (req, res) 
     let pulosRede = 0;
     const naoReconhecidos = [];
 
+    // classificatórios de cada matriz numa consulta só (antes uma por linha)
+    const matrizes = [...new Set(itens.map(it => String(it.matriz || '').trim()).filter(Boolean))];
+    const tiposResult = await pool.query(
+      `/* objetivos:matrizes */
+       SELECT COALESCE(matriz_grupo, nome) AS matriz, array_agg(DISTINCT classificatorio_tipo) AS tipos
+       FROM clientes WHERE COALESCE(matriz_grupo, nome) = ANY($1::text[]) GROUP BY 1`,
+      [matrizes]
+    );
+    const tiposDaMatriz = new Map(tiposResult.rows.map(r => [r.matriz, r.tipos || []]));
+
     for (const it of itens) {
       const matriz = String(it.matriz || '').trim();
       const objetivo = Number(it.objetivo);
       if (!matriz || !Number.isFinite(objetivo)) continue;
 
-      const r = await pool.query(
-        `SELECT DISTINCT classificatorio_tipo FROM clientes WHERE COALESCE(matriz_grupo, nome) = $1`,
-        [matriz]
-      );
-      if (r.rows.length === 0) { naoReconhecidos.push(matriz); continue; }
-      if (r.rows.some(row => row.classificatorio_tipo === 'Rede')) { pulosRede++; continue; }
+      const tipos = tiposDaMatriz.get(matriz);
+      if (!tipos) { naoReconhecidos.push(matriz); continue; }
+      if (tipos.includes('Rede')) { pulosRede++; continue; }
 
       objetivos[matriz] = objetivo;
       importados++;
@@ -626,6 +1044,7 @@ router.post('/classificatorio/objetivos-trimestrais/importar', async (req, res) 
     );
 
     console.log(`Objetivos trimestrais (${periodoInicio} a ${periodoFim}) importados por ${req.usuario?.email}: ${importados} objetivo(s), ${pulosRede} Rede pulado(s), ${naoReconhecidos.length} não reconhecido(s).`);
+    await avisarImportacao('objetivos-trimestrais', quantos(importados, 'objetivo', 'objetivos'));
     res.json({ importados, pulosRede, naoReconhecidos, total: itens.length });
   } catch (e) {
     console.error(e);
@@ -635,7 +1054,13 @@ router.post('/classificatorio/objetivos-trimestrais/importar', async (req, res) 
 
 module.exports = router;
 module.exports.calcularStatusClassificatorio = calcularStatusClassificatorio;
+module.exports.fracaoDoAnoPeloDia = fracaoDoAnoPeloDia;
+module.exports.degrausDaFaixa = degrausDaFaixa;
 module.exports.calcularRitmoTrimestral = calcularRitmoTrimestral;
 module.exports.FAIXAS = FAIXAS;
 module.exports.faixaDoTipo = faixaDoTipo;
 module.exports.SQL_FATURAMENTO_CLASSIFICATORIO_POR_CLIENTE = SQL_FATURAMENTO_CLASSIFICATORIO_POR_CLIENTE;
+module.exports.interpretarDiferencaErp = interpretarDiferencaErp;
+module.exports.aplicarLeituraErp = aplicarLeituraErp;
+module.exports.diaDoBanco = diaDoBanco;
+module.exports.importarClassificatorioErp = importarClassificatorioErp;
