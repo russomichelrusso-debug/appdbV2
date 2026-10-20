@@ -30,6 +30,8 @@ db.js                   # pool de conexão pg + runMigrations() (executa schema.
 schema.sql               # schema completo do banco (idempotente)
 auth-utils.js             # verificação de ID token do Google + geração de token de sessão opaco
 clientMatcher.js           # casa nome de cliente da planilha oficial com cliente já cadastrado
+importadores.js            # leitura das planilhas importadas (relatório oficial, Classificatório, previsão) e reconhecimento do tipo - usado pelo index.html (<script src>) E pelo servidor (importação por e-mail)
+scripts/gmail-importacao/   # script do Google (Apps Script) que roda no Gmail e manda os relatórios pro servidor
 middleware/auth.js          # requireAuth: valida "Authorization: Bearer <token>" contra a tabela sessoes
 routes/
   auth.js                     # login via Google, /me, logout, CRUD de usuários
@@ -41,6 +43,9 @@ routes/
   pedidosOficiais.js               # importação e consulta da planilha oficial Carteira/Faturamento
   levantamentos.js                  # levantamentos de estoque em campo
   relatorios.js                      # histórico/rotatividade/recuperar (comprasDoCliente), Já compraram, sugestões, curva ABC, Dashboard
+  importacaoEmail.js                  # importação automática dos relatórios que chegam por e-mail (script do Gmail → aqui)
+  novidades.js                        # avisos de importação: lista, "vistas", push no celular (lógica em lib/novidades.js)
+  recompra.js                         # Recompra da semana: ritmo de compra do cliente, "Já falei" (cálculo em lib/ritmoCompra.js)
   produtosPromocionais.js             # SKUs promocionais (P/P1/P2 + código base)
   radarCnpj.js                        # ficha de CNPJ (radar-cnpj.com + BrasilAPI de reserva)
   previsaoEstoque.js                  # previsão de estoque (relatório ESCE007)
@@ -48,11 +53,12 @@ routes/
   fichasTecnicas.js                     # balão de ficha técnica (specs resumidas)
   codigosProduto.js                      # EAN-13/DUN-14 por SKU (scanner de código de barras)
   assistente.js                           # assistente de IA (Gemini) — interpreta pergunta falada, nunca inventa dado
+  segundaTela.js                          # tablet como tela do cliente: salas em memória, pareamento por QR, long-poll
   lib/                                     # regras compartilhadas: skuNormalizacao (código promocional → base),
                                            # agrupamentoProduto (variações → "o produto"), politicaComercial,
                                            # cnpjBrasilApi, preenchimentoCnpj
 test/                    # suite de testes (node test/run_tests.js), banco simulado em test/mock-db.js
-index.html, curva-abc.html, calculadora-materiais.html, ficha-cnpj.html, catalogo-embutido.js, manifest.json, icon-*.png  # PWA estático servido pelo GitHub Pages
+index.html, curva-abc.html, calculadora-materiais.html, ficha-cnpj.html, tela-cliente.html, catalogo-embutido.js, manifest.json, icon-*.png  # PWA estático servido pelo GitHub Pages
 .github/workflows/keep-alive.yml  # ping em /health a cada 10 min pra evitar o Render dormir (free tier)
 ```
 
@@ -64,13 +70,17 @@ Variáveis de ambiente:
 |---|---|---|
 | `DATABASE_URL` | Sim (produção) | String de conexão do PostgreSQL (Supabase, connection pooler). Sem ela, a conexão roda sem SSL (uso local). |
 | `DB_SSL_INSECURE` | Não | `true` desativa a validação do certificado SSL do banco (`rejectUnauthorized: false`). Use só como contorno temporário. |
+| `PG_POOL_MAX` | Não | Máximo de conexões do pool do Postgres (padrão `10`). Cada consulta tem limite de 60 s (`statement_timeout`) e quem espera conexão livre desiste em 20 s (`db.js`). |
 | `PORT` | Não | Porta HTTP do servidor. Padrão `10000`. |
 | `PREENCHIMENTO_CNPJ_DESLIGADO` | Não | `1` desliga o preenchimento automático das fichas de CNPJ que faltam (ver rota `/api/cnpj-preenchimento/status`). |
+| `GEOCODIFICACAO_DESLIGADA` | Não | `1` desliga a posição aproximada das lojas pelo endereço da ficha (ver rota `/api/geocodificacao/status`). |
 | `GOOGLE_CLIENT_ID` | Não | Client ID do Google usado no login (há um valor fixo no código como padrão). |
 | `ADMIN_EMAIL` | Não | Se definida, só esse e-mail pode virar o **primeiro** usuário (admin) num banco sem usuários. Sem ela, quem logar primeiro vira admin. |
 | `ALLOWED_ORIGINS` | Não | Origens liberadas no CORS, separadas por vírgula (ex.: `https://usuario.github.io`). Sem ela, a API aceita qualquer origem. |
 | `GEMINI_API_KEY` | Sim (para `/api/assistente`) | Chave da API Gemini usada pelo assistente com IA. |
 | `GEMINI_MODEL` | Não | Modelo Gemini usado. Padrão `gemini-2.0-flash`. |
+| `IMPORTACAO_EMAIL_CHAVE` | Não (para a importação por e-mail) | Chave secreta (≥ 32 caracteres, `openssl rand -hex 32`) que o script do Gmail manda no cabeçalho `X-Chave-Importacao`. Sem ela, `POST /api/importacao-email/arquivo` fica fechado. Ver `docs/IMPORTACAO-EMAIL.md`. |
+| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | Não (para avisos no celular) | Chave Web Push dos avisos de importação (gerar com `npx web-push generate-vapid-keys`; `VAPID_SUBJECT` = `mailto:` ou URL https). Sem elas, as novidades aparecem só no app. Trocar a chave invalida as inscrições: cada vendedor ativa de novo. |
 
 ## Rodando localmente
 
@@ -103,10 +113,10 @@ Não é usuário/senha. O fluxo:
 - `/api/clientes` — cadastro, importação e mesclagem de clientes
 - `/api/produtos` — catálogo de referência de produtos e sincronização
 - `/api/catalogo-precos` — catálogo completo de preços por canal x estado (fonte automática, alimentada pelo upload de planilha no Admin)
-- `/api/pedidos` — pedidos manuais/do app (POST `/`) e export por período (GET `/exportar`)
+- `/api/pedidos` — pedidos manuais/do app (POST `/`) e export por período (GET `/exportar`). `GET /salvos` lista os pedidos que o próprio vendedor fechou no app nos últimos 120 dias (itens, cliente e `contexto` — estado, canal, classificatório, prazo, descontos e preços editados de quando foi montado); `PATCH /:id` altera um pedido do app já gravado (troca os itens e o contexto, marca `atualizado_em`, mantém id/cliente/data; só o autor ou admin, só `origem = 'app'`). É o que o app usa pra reabrir um pedido no orçamento ("🧾 Pedidos" no card do cliente, link no orçamento ou abrindo o CSV do pedido) e "Atualizar pedido" em vez de fechar outro
 - `/api/pedidos-oficiais` — pedidos oficiais por cliente e importação da planilha oficial Carteira/Faturamento
 - `/api/levantamentos` — levantamentos de estoque em campo, incluindo rascunho automático (`POST`/`GET`/`DELETE /api/levantamentos/rascunho`, um por usuário) pra não perder levantamento não salvo em caso de queda de conexão ou fechamento acidental do app. O `POST` aceita `localizacao: { latitude, longitude, precisao_m }` (GPS do celular no momento de salvar): fica gravada no levantamento e, se a precisão for de até 100 m, vira a localização do cliente (só substitui uma leitura igual ou mais precisa, ou com mais de 180 dias)
-- `/api/clientes/sync` — lista enxuta (`id`, `nome`, `documento`) de todos os clientes, usada pra manter uma cópia local no aparelho (`localStorage`) e o app continuar funcionando na aba de Levantamento mesmo se a busca de cliente no servidor falhar
+- `/api/clientes/sync` — lista enxuta (`id`, `nome`, `documento`) de todos os clientes, usada pra manter uma cópia local no aparelho (`localStorage`) e o app continuar funcionando na aba de Levantamento mesmo se a busca de cliente no servidor falhar. Leva também o que o card do cliente usa sem internet: regime tributário, pedidos bloqueados, nome do arquivo CSV e o destino do botão "Waze" (`latitude`/`longitude` gravadas pelo levantamento e `endereco` da ficha de CNPJ, com o tipo do logradouro)
 - `/api/previsao-estoque` — previsão de estoque (relatório ESCE007)
 - `/api/configuracoes` — configurações chave/valor
 - `/api/fichas-tecnicas` — fichas técnicas de produtos
@@ -115,16 +125,24 @@ Não é usuário/senha. O fluxo:
 - `/api/clientes/:id/ficha-cnpj` (+ `POST .../atualizar`) e `/api/radar-cnpj/:cnpj` — ficha cadastral da Receita Federal. Consulta o radar-cnpj.com e, se ele recusar, atingir limite, cair ou não achar o CNPJ, usa a BrasilAPI de reserva, convertida pro mesmo formato (`routes/lib/cnpjBrasilApi.js`); a ficha fica em cache por 30 dias em `cliente_cnpj_ficha`
 - `/api/clientes/:id/ficha-cnpj/existe` — só diz se o cliente já tem ficha guardada (lê o banco, nunca consulta a Receita); usado pelo botão "Ficha cadastral" da barra do cliente, que abre `ficha-cnpj.html?cliente=ID&nome=…&doc=…` direto na ficha
 - `/api/cnpj-preenchimento/status` — progresso do preenchimento automático das fichas que faltam (`routes/lib/preenchimentoCnpj.js`): o servidor completa sozinho, das 01h às 06h de Brasília, no máximo 40 consultas por noite, uma a cada 15 s, só clientes com CNPJ e sem ficha nenhuma; CNPJ não encontrado é tentado até 3 vezes (tabela `cnpj_preenchimento_falhas`); se as duas origens estiverem fora do ar ou no limite, para a noite e retoma na seguinte. Estado do dia em `configuracoes` (`cnpj_preenchimento_auto`)
+- `/api/geocodificacao/status` — posição das lojas pro "Clientes perto de mim" (`routes/lib/geocodificacao.js`): quantos têm GPS (gravado ao salvar levantamento), quantos têm posição aproximada pelo endereço da ficha de CNPJ e quantos faltam. O servidor consulta sozinho o Nominatim (OpenStreetMap) das 01h às 06h de Brasília, no máximo 150 por noite, uma a cada 2 s, só clientes sem GPS com ficha que tem rua e município; endereço não encontrado é tentado até 3 noites; ficha com endereço novo é consultada de novo. Resultado em `cliente_geocodificacao`, que vai no `/api/clientes/sync` (`latitude_aprox`/`longitude_aprox`/`localizacao_nivel`). Estado do dia em `configuracoes` (`geocodificacao_auto`).
 - `/api/clientes/:id/comprados-recentes` — SKUs que o cliente comprou nos últimos 12 meses (faturado oficial + pedidos do app, código promocional unido ao base), com a quantidade da compra mais recente; o Levantamento mostra os que não foram contados ("Comprados e não contados") e avisa ao salvar
 - `/api/clientes/:id/historico`, `/rotatividade`, `/recuperar`, `/consumo-estimado/:produtoId` — o que o cliente comprou, via `comprasDoCliente` (faturado oficial + pedidos do app; ver "Fontes de dados"). `recuperar` só responde pra cliente com levantamento (produto comprado e zerado/nunca contado na leitura mais recente)
 - `/api/clientes/:id/sugestoes-recompra` — produtos (variações agrupadas) que o cliente não compra há mais de 1 ano
+- `POST /api/importacao-email/arquivo` (sem login, com a chave `IMPORTACAO_EMAIL_CHAVE` no cabeçalho `X-Chave-Importacao`, conferida antes de ler o corpo) e `GET /api/importacao-email/status` (com login) — o script do Gmail (`scripts/gmail-importacao/Codigo.gs`) manda os anexos do relatório oficial, Classificatório, itens em falta e Lista de Preços SUL SUDESTE; o servidor reconhece pela planilha (`importadores.js`) e grava pelas mesmas funções das rotas de importação manual. Mesmo arquivo (hash) não entra duas vezes; recusado = 422. `POST /api/importacao-email/mensagem` (mesma chave, conferida na rota) recebe e-mails sem planilha (assunto + texto): **Pedido Bloqueado** grava em `pedidos_bloqueados` (selo no histórico do cliente e no card do cliente, que some quando o pedido aparece faturado ou após 30 dias — `routes/lib/pedidosBloqueados.js`) e **Pedido de Venda à Vista** entra em `pedidos_pendentes_pagamento` antes do relatório da madrugada; os dois geram aviso (push) por pedido, leitura do texto em `routes/lib/emailCortag.js`. Instalação em `docs/IMPORTACAO-EMAIL.md`
+- `/api/novidades` (+ `POST /vistas`, `/push/inscrever`, `/push/cancelar`, `/push/teste`) — avisos de importação: relatório oficial, catálogo de preços, previsão de estoque, Classificatório e objetivos trimestrais viram uma novidade (`routes/lib/novidades.js`). Faixa "🔔 N novidades" abaixo das abas e push no celular (Web Push, `sw.js`) só em dia útil, 7h–20h de Brasília (fora disso, sai no próximo dia útil às 7h); o mesmo tipo reimportado em até 30 min atualiza a mesma novidade e troca o aviso no celular sem tocar de novo
+- `/api/inadimplencia` (+ `POST /api/inadimplencia/importar`, só admin) — "💰 Inadimplência" (aba Clientes) e faixa no card do cliente: títulos vencidos e não pagos do Relatório de Inadimplência do ERP (e-mail sem dia fixo, anexo `20.xlsx`, ou Painel), por cliente, maior valor primeiro. Foto do último relatório em `titulos_inadimplentes` (sumiu = pago; período mais antigo é ignorado), dados do relatório em `configuracoes.inadimplencia_relatorio`; a tela sempre mostra "posição de DD/MM". Só alerta, não trava pedido
+- `/api/reativacao` (+ `POST /api/reativacao/importar`, `POST /api/reativacao/:id/adiar`) — "💤 Para reativar" (aba Clientes): clientes há 3+ meses sem compra pelo Relatório de Clientes Sem Compra do ERP (todo dia 2, pela importação por e-mail ou pelo Painel; foto em `clientes_sem_compra`, dados do relatório em `configuracoes.clientes_sem_compra_relatorio`) — 🟡 3–5 meses, 🔴 6–12, 💤 mais de 12 (com código do ERP, fora do relatório, última compra antes do período). Meses recontados pelo mês de hoje e pela compra mais nova que o app conhece. `adiar` = "Já falei" (30 dias) ou "Não reativar" (até comprar de novo), tabela `reativacao_adiamentos`
+- `POST /api/reativacao/contas-salesforce` (só admin) — relatório "Todas Contas - Representante" do Salesforce (Painel, planilha ou CSV; `routes/contasSalesforce.js`): foto em `contas_salesforce` (proprietário, situação, última compra com qualquer vendedor). Conta ativa de outro vendedor (`de_outro_vendedor`) sai das oportunidades e vem no `/api/clientes/sync` como `outro_vendedor`; conta inativa fora do app vira cliente e entra no Para reativar (`base` = Base Rodrigo/Telemarketing, telefone, e-mail). `GET /api/reativacao` devolve também `recuperados` (placar, tabela `reativacao_alvos`).
+- `/api/recompra` (+ `POST /api/recompra/:id/adiar`) — Recompra da semana (topo da aba Clientes): clientes com a próxima compra atrasada ou prevista pros próximos 7 dias, pelo ritmo dos últimos 12 meses (mediana dos intervalos, mín. 3 compras; compras a até 7 dias uma da outra = uma só), com os produtos pro "Montar proposta" (`routes/lib/ritmoCompra.js`). `adiar` = "Já falei": sai da lista por 7 dias (tabela `recompra_adiamentos`)
+- `/api/segunda-tela` — tablet como tela do cliente (`tela-cliente.html`): `POST /salas` (tablet cria a sala e recebe o código de 4 dígitos do QR, válido 5 min), `POST /entrar {codigo}` (celular da MESMA conta entra; o código vale uma vez), `PUT /salas/:id/estado` (celular manda a foto inteira do orçamento), `GET /salas/:id?papel=tablet&esperar=1&versao=N&pareada=0|1` (tablet espera até 25 s pela próxima versão — long-poll) e `DELETE /salas/:id`. Salas só na memória do servidor (reinício/deploy desconecta; o tablet mostra um QR novo), no máximo 4 por conta. No modo `leitor` (celular como leitor do levantamento no tablet) o celular manda `POST /salas/:id/eventos` (leituras, desfazer, quantidade digitada; id gerado no celular, repetido é ignorado) e a espera do tablet leva `seq=N` e devolve os eventos depois dele
 - `/api/produtos/:codigo/clientes` — "Já compraram" (faturado oficial + app, por cliente, com a última data de faturamento e NF) e "Levantamento" (última contagem por cliente) da aba Produtos
 - `/api/dashboard/resumo` — dados do Dashboard (`curva-abc.html`): entrada de pedidos mensal + lista dos pedidos do mês (`entradaPedidosMes`), vendas semanal/trimestral, top clientes, clientes ativos por canal, contas sem compra
 - `/api/produtos-abc-geral`, `/api/clientes/:id/produtos-abc` — Curva ABC geral e por cliente (faturado oficial)
 - `/api/clientes/:id/classificatorio/status`, `/grupo`, `/api/clientes/classificatorio/alertas` — classificatório (faixas pelos 12 meses móveis de faturado)
 - `/api/clientes/:id/levantamentos`, `/api/pedidos/exportar` — levantamentos do cliente e export de pedidos
 
-`GET /health` retorna `{ status: 'ok' }` para checagem de disponibilidade (usado pelo keep-alive).
+`GET /health` retorna `{ status: 'ok' }` para checagem de disponibilidade (usado pelo keep-alive). `GET /health/banco` faz também um `SELECT 1` (até 5 s) e responde 503 com o banco fora — usado pelo script do Gmail pra não contar tentativa durante queda do banco; o `/health` continua sem tocar no banco.
 
 ## Fontes de dados — o que cada tela soma
 
@@ -134,6 +152,7 @@ Não é usuário/senha. O fluxo:
 | `pedidos` / `pedido_itens` | Pedidos fechados pelo vendedor no app (só desde 05/2026, uma fração do total) | `data_pedido` |
 
 - **O que o cliente comprou** (Histórico, Rotatividade, Recuperar, consumo estimado, "Já compraram", comprados-recentes, sugestões): **faturado oficial + app**. Código promocional (P/P1/P2) conta como o produto base; pedido do app ou de PDF só conta se não houver faturado oficial do mesmo cliente + produto entre 7 dias antes e 45 depois (senão é a mesma compra, faturada dias depois), e pedido com `origem = 'faturamento'` (cópias de uma importação antiga) nunca conta — `routes/lib/comprasApp.js`. Função `comprasDoCliente` em `routes/relatorios.js`. Nunca usar só `pedidos`/`pedido_itens` — a maior parte das compras vem do ERP.
+- **Recompra da semana**: compra = **entrada do pedido** (carteira + faturado pela data de implantação, sem a série de 7 dígitos) + pedidos do app (mesma regra de não contar em dobro) — o cliente sai da lista assim que pede, sem esperar faturar.
 - **Entrada de Pedidos** (Dashboard: valor, qtde. de pedidos e de clientes, ticket médio): mesma regra do painel oficial — mês pela **data de implantação**, **carteira + faturado**, **sem a série de pedidos de 7 dígitos** (10xxxxx–13xxxxx, itens avulsos fora do catálogo). Conciliado com o Salesforce em 09/2026.
 - **Faturamento** (classificatório, Curva ABC, top clientes, vendas semanal/trimestral): só `status = 'faturado'`, pela `data_faturamento`.
 - **Datas sem hora** (`DATE` e `date_trunc`) chegam no JSON como meia-noite UTC — no navegador, `new Date()` joga pro dia/mês anterior. Exibir sempre com `formatDateBr` (`index.html`) ou `partesDoPeriodo` (`curva-abc.html`).
@@ -173,6 +192,10 @@ Cada pedido faturado (aba Pedidos do cliente) com nota fiscal tem o botão **Ras
 - **Mensagens**: `<div class="ap-msg success">` / `<div class="ap-msg error">`; toast com `showToast(msg)` ou `showToast(msg, 'erro')` (vermelho, fica 5s). Nada de `alert()`/`prompt()`/`confirm()` nativos — use `askConfirm(msg, rotulo, { perigo })` e `askText(msg, valorInicial, rotulo)`.
 - **Ícones de lista**: `ICON_TRASH`, `ICON_EDIT`, `ICON_ATIVO`/`ICON_INATIVO` (SVG em `currentColor`), não emoji.
 - **Fonte**: tamanhos inteiros (11, 12, 13, 14, 15…); títulos `h2` 18px, `h3` de modal 17px.
+- **Área de toque**: botão que se toca com o dedo tem no mínimo 44×44 px de área (−/+, ✕, lápis, leitor de código). Desenho menor ganha a área por um `::after` invisível de 44 px (padrão do bloco "Toque, navegação e progresso" do `index.html`).
+- **Navegação**: as 4 abas ficam no rodapé (`.tabbar`, altura em `--navH`); a barra do orçamento fica logo acima delas. Elemento novo preso embaixo (`position: fixed`/`sticky` com `bottom`) soma `var(--navH)`; preso em cima fica em `top: 58px` (só o cabeçalho).
+- **Um botão principal por tela**: só a ação principal é cheia (verde em Finalizar pedido, vermelho nas outras); as demais ações do mesmo grupo vão com contorno (como Compartilhar orçamento).
+- **Produto em campanha** (card da busca do Pedido, Lista de preços e item do Levantamento): `.emCampanha` (borda de 2 px) + `htmlFitaCampanha` no topo (verde; `.bf` preta com amarelo, `--black-friday`, quando a campanha é de Black Friday); tocar na fita abre `#campanhaItemModal` com as faixas e condições. Quais campanhas = `campanhasDoItem` (`<motor-campanhas>`).
 - As páginas separadas (`curva-abc.html`, `ficha-cnpj.html`, `calculadora-materiais.html`) repetem os mesmos tokens de status no próprio `:root`.
 
 ## Frontend — carregamento do catálogo de preços
@@ -184,11 +207,13 @@ O carregamento de EAN/DUN-14 (`loadCodigosProduto()`) roda **depois** que o cat�
 ## Importação de pedidos oficiais (Carteira / Faturamento)
 
 - `POST /api/pedidos-oficiais/importar` — recebe `{ itens: [...], classificacoes: [...] }`.
-  O frontend (`index.html`, `parseRelatorioOficialXlsx`) lê as abas "Carteira" e "Faturamento" da planilha .xlsx oficial direto no navegador e monta esse payload — não existe preparo manual de arquivo. Grava em `pedidos_oficiais_itens` (chave `nr_pedido` + `codigo_sku`, nunca duplica, nunca "recua" de faturado pra carteira) e atualiza o classificatório do cliente (`clientes.classificatorio_tipo/desconto`), respeitando qual relatório é mais recente.
+  O frontend (`index.html`, `parseRelatorioOficialXlsx`) lê as abas "Carteira" e "Faturamento" da planilha .xlsx oficial direto no navegador e monta esse payload — não existe preparo manual de arquivo. Grava em `pedidos_oficiais_itens` (chave `nr_pedido` + `codigo_sku` + `nota_chave` — a nota fiscal na linha faturada, `''` no saldo em carteira —, nunca duplica, nunca "recua" de faturado pra carteira) e atualiza o classificatório do cliente (`clientes.classificatorio_tipo/desconto`), respeitando qual relatório é mais recente.
   - Qualquer usuário autenticado pode importar.
   - Os nomes de coluna esperados na planilha (`Cliente`, `Cod.Cliente`, `Nr.Pedido`, `Item`, `Nota Fiscal`, `Transportadora`, `Situação`, `Classificatório` etc., com variações aceitas) estão centralizados em `COLUNAS_RELATORIO_OFICIAL` no `index.html` — se uma coluna essencial não for encontrada, o import falha com erro explícito em vez de gravar dado errado.
   - Datas: `Implantação` (Carteira) / `Dt.Implant` (Faturamento) → `data_implantacao`; `Dt.Emissão` → `data_faturamento` (só nas linhas faturadas). Valor: `Vlr.Faturado` no faturado, `Vl.Pendente` na carteira. `Descrição` → `descricao`: dá nome, nas telas, ao produto que já saiu da tabela de preços (o nome do catálogo tem prioridade).
-  - A importação **só acrescenta e atualiza, nunca apaga**: um pedido de carteira cancelado no ERP continua gravado como carteira até a limpeza de "carteira antiga" (Painel → Avançado). Um mês cujo relatório nunca foi importado fica vazio em todos os relatórios. Reimportar corrige datas e valores (a data de implantação do relatório novo substitui a gravada).
+  - **Produto faturado só em parte**: o faturado (uma linha por nota fiscal) e o saldo que continua na aba Carteira ficam em linhas separadas. A linha de carteira só sai quando o relatório traz o produto no Faturamento e não mais na Carteira, ou quando dá o pedido como "Atendido Total" (aí sai todo o saldo dele em carteira — item cancelado no ERP). Histórico/Rotatividade/Comprados recentes somam as notas do mesmo pedido como uma compra só.
+  - **Saldo abaixo do mínimo** (R$ 300; R$ 600 no Norte/Nordeste, pela UF da ficha de CNPJ — `GET /api/pedidos-oficiais/:clienteId` devolve `saldo_minimo`): o card do pedido parcial avisa que o saldo pode ser cancelado, quanto falta e qual item o cliente pode aumentar (com 1 código no saldo, só ele; com 2 ou mais, qualquer um), deixando de fora o que a planilha de Previsão de estoque dá como sem previsão de chegada. O saldo também tem o prazo de 90 dias da implantação ("até DD/MM"); passado ele, o card avisa que já deve ter sido cancelado.
+  - Fora isso, a importação **só acrescenta e atualiza**: um pedido de carteira cancelado no ERP que nunca volta num relatório continua gravado como carteira até a limpeza de "carteira antiga" (Painel → Avançado). Um mês cujo relatório nunca foi importado fica vazio em todos os relatórios. Reimportar corrige datas e valores (a data de implantação do relatório novo substitui a gravada).
   - **Planilha salva num Excel em inglês**: o ERP gera data "05/11/25" e valor "1207,296"; aberta e salva num Excel configurado em inglês, a data com dia ≤ 12 vira data com dia/mês trocados, a de dia > 12 fica como texto, e o valor vira número sem vírgula (até 10.000× maior) ou texto. A importação lê data em texto dd/mm/aa, **destroca** as datas numéricas de uma coluna que tem esse texto, e **recusa o arquivo** quando a coluna de valor mistura número e texto com vírgula (não tem como saber o valor certo) — a mensagem pede para exportar de novo sem passar pelo Excel. `Nr.Pedido` só numérico perde os zeros à esquerda ("00597502" = "597502").
 - `GET /api/pedidos-oficiais/status` — última data de atualização e totais (carteira/faturado).
 - `GET /api/pedidos-oficiais/:clienteId` e `/:clienteId/resumo` — consulta por cliente.

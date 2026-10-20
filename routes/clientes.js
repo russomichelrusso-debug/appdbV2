@@ -1,7 +1,14 @@
 const express = require('express');
+const { limparNomeCliente } = require('../clientMatcher');
 const router = express.Router();
 const { pool, registrarImportacao } = require('../db');
 const { validarIdInteiro } = require('../middleware/validarId');
+const { sqlBloqueioAtivo } = require('./lib/pedidosBloqueados');
+const { sqlAvisoCancelamentoAtivo, sqlCamposAviso } = require('./lib/cancelamentoSaldo');
+const { sqlChaveEndereco } = require('./lib/geocodificacao');
+const { clientesDeOutroVendedor } = require('./lib/contasSalesforce');
+const { normalizarTelefoneBr, normalizarEmails } = require('./lib/contatosCliente');
+const { ordenarClientesPorBusca } = require('./lib/buscaCliente');
 
 router.param('id', validarIdInteiro);
 
@@ -20,16 +27,21 @@ function formatarDocumento(v) {
 // Busca clientes por nome ou documento - usado pelo app pra autocompletar
 // "qual cliente é esse" ao salvar um levantamento ou pedido.
 router.get('/', async (req, res) => {
-  const busca = (req.query.busca || '').trim();
+  const busca = String(req.query.busca || '').trim(); // ?busca=a&busca=b chega como lista
   try {
-    const result = busca
-      ? await pool.query(
-          `SELECT id, nome, documento, contato, classificatorio_tipo, classificatorio_desconto, codigo_oficial FROM clientes
-           WHERE nome ILIKE $1 OR documento ILIKE $1
-           ORDER BY nome LIMIT 20`,
-          [`%${busca}%`]
-        )
-      : await pool.query('SELECT id, nome, documento, contato, classificatorio_tipo, classificatorio_desconto, codigo_oficial FROM clientes ORDER BY nome LIMIT 50');
+    if (busca) {
+      // A carteira inteira (centenas de clientes) e a ordem pela busca em memória:
+      // sem acento, palavras em qualquer ordem, CNPJ com ou sem pontuação, código
+      // do ERP, nome fantasia e cidade da ficha de CNPJ (routes/lib/buscaCliente.js).
+      const todos = await pool.query(
+        `/* clientes:busca */ SELECT c.id, c.nome, c.documento, c.contato, c.classificatorio_tipo, c.classificatorio_desconto, c.codigo_oficial,
+                c.nome_arquivo, c.nome_arquivo_em, c.whatsapp_comprador, c.whatsapp_comprador_nome, c.whatsapp_comprador_em,
+                f.nome_fantasia, f.municipio, f.uf
+         FROM clientes c LEFT JOIN cliente_cnpj_ficha f ON f.cliente_id = c.id`
+      );
+      return res.json(ordenarClientesPorBusca(todos.rows, busca.slice(0, 100), 20));
+    }
+    const result = await pool.query('SELECT id, nome, documento, contato, classificatorio_tipo, classificatorio_desconto, codigo_oficial, nome_arquivo, nome_arquivo_em, whatsapp_comprador, whatsapp_comprador_nome, whatsapp_comprador_em FROM clientes ORDER BY nome LIMIT 50');
     res.json(result.rows);
   } catch (e) {
     console.error(e);
@@ -42,9 +54,63 @@ router.get('/', async (req, res) => {
 // dar pra escolher o cliente de um levantamento/pedido mesmo sem internet no
 // momento. Roda sozinha em segundo plano (ver carregarCatalogoEExtras no
 // front); por isso só os campos que a busca offline precisa, nada mais.
+// regime_tributario ('simples' | 'mei' | 'normal' | null sem ficha) vem da
+// ficha de CNPJ e ajusta o recado de ICMS-ST do orçamento, que é gerado offline.
+// nome_arquivo/nome_arquivo_em: nome escolhido pro CSV do cliente (ver
+// PUT /:id/nome-arquivo), pra valer em todos os aparelhos e sem internet.
+// whatsapp_comprador(_nome/_em): WhatsApp do comprador (PUT /:id/whatsapp),
+// destino direto do texto do orçamento; telefone_ficha (da ficha de CNPJ) é
+// só sugestão na hora de escolher o número.
+// latitude/longitude (posição da loja gravada ao salvar o levantamento) e
+// endereco (da ficha de CNPJ, null sem ficha) são o destino do botão "Waze"
+// no card do cliente - na rua, sem internet, o app abre a rota com eles. O
+// tipo do logradouro ("AVENIDA") só existe em dados_brutos: a coluna
+// logradouro guarda o nome sem ele, e "COLOMBO, MARINGA" o Waze não acha.
+// latitude_aprox/longitude_aprox/localizacao_nivel: posição aproximada pelo
+// endereço da ficha (routes/lib/geocodificacao.js), só enquanto a ficha tiver
+// o mesmo endereço consultado - "Clientes perto de mim" usa quando não há GPS.
 router.get('/sync', async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, nome, documento, codigo_oficial FROM clientes ORDER BY nome');
+    const outros = await clientesDeOutroVendedor();
+    const result = await pool.query(
+      `SELECT c.id, c.nome, c.documento, c.codigo_oficial, c.nome_arquivo, c.nome_arquivo_em,
+              c.classificatorio_tipo, c.classificatorio_desconto, -- preço da oferta pro comprador (aba Produtos), sem internet
+              c.whatsapp_comprador, c.whatsapp_comprador_nome, c.whatsapp_comprador_em, f.telefone AS telefone_ficha,
+              c.telefone_comercial, c.email_comercial, c.email_nfe, c.contatos_em, f.email AS email_ficha, -- "Contatos" do card
+              CASE
+                WHEN f.dados_brutos->'mei'->>'optante' = 'true' THEN 'mei'
+                WHEN f.dados_brutos->'simples'->>'optante' = 'true' THEN 'simples'
+                WHEN f.dados_brutos->'simples'->>'optante' = 'false' THEN 'normal'
+              END AS regime_tributario,
+              c.latitude, c.longitude,
+              f.nome_fantasia, -- a busca sem internet também acha pelo nome fantasia
+              -- na lista de devedores contumazes da Receita (ficha de CNPJ): o dia da
+              -- conferência, ou 'sim' sem ele; null = não consta/não conferido
+              CASE WHEN f.dados_brutos->'devedorContumaz'->>'consta' = 'true'
+                THEN coalesce(f.dados_brutos->'devedorContumaz'->>'conferidoEm', 'sim') END AS devedor_contumaz,
+              CASE WHEN f.cliente_id IS NOT NULL THEN json_build_object(
+                'tipo', f.dados_brutos->'endereco'->>'tipoLogradouro', 'logradouro', f.logradouro,
+                'numero', f.numero, 'municipio', f.municipio, 'uf', f.uf
+              ) END AS endereco,
+              g.latitude AS latitude_aprox, g.longitude AS longitude_aprox, g.nivel AS localizacao_nivel,
+              -- pedidos bloqueados ainda valendo (selo no card do cliente, sem internet)
+              (SELECT json_agg(json_build_object('nr_pedido', pb.nr_pedido, 'motivo', pb.motivo, 'recebido_em', pb.recebido_em) ORDER BY pb.recebido_em DESC)
+               FROM pedidos_bloqueados pb
+               WHERE c.codigo_oficial IS NOT NULL AND pb.cliente_codigo_oficial = c.codigo_oficial AND ${sqlBloqueioAtivo('pb')}) AS bloqueados,
+              -- saldo em carteira com aviso de cancelamento (faixa no card do cliente, sem internet)
+              (SELECT json_agg(json_build_object(${sqlCamposAviso('acs')}) ORDER BY acs.data_aviso DESC, acs.nr_pedido)
+               FROM avisos_cancelamento_saldo acs
+               WHERE c.codigo_oficial IS NOT NULL AND acs.cliente_codigo_oficial = c.codigo_oficial AND ${sqlAvisoCancelamentoAtivo('acs')}) AS cancelamentos
+       FROM clientes c
+       LEFT JOIN cliente_cnpj_ficha f ON f.cliente_id = c.id
+       LEFT JOIN cliente_geocodificacao g ON g.cliente_id = c.id AND g.latitude IS NOT NULL AND g.endereco = ${sqlChaveEndereco('f')}
+       ORDER BY c.nome`
+    );
+    // conta ativa de outro vendedor (Salesforce): fica na busca, sai de Perto de mim/Rota
+    for (const c of result.rows) {
+      const dono = outros.get(String(c.id));
+      if (dono) c.outro_vendedor = dono;
+    }
     res.json({ clientes: result.rows, atualizadoEm: new Date().toISOString() });
   } catch (e) {
     console.error(e);
@@ -81,7 +147,8 @@ router.get('/:id', async (req, res) => {
 // Cria um cliente novo, ou devolve o já existente se o documento (CNPJ/CPF)
 // já estiver cadastrado - evita duplicar o mesmo cliente em visitas diferentes.
 router.post('/', async (req, res) => {
-  const { nome, documento, contato } = req.body;
+  const { documento, contato } = req.body;
+  const nome = limparNomeCliente(req.body.nome); // sem "\" de exportação de planilha
   if (!nome) return res.status(400).json({ erro: 'Nome é obrigatório.' });
   const documentoFormatado = documento ? formatarDocumento(documento) : null;
   try {
@@ -127,7 +194,7 @@ router.post('/import', async (req, res) => {
   // second time" se o mesmo CNPJ/CPF aparecer duas vezes no mesmo lote.
   const porDocumento = new Map();
   for (const c of validos) porDocumento.set(formatarDocumento(c.cnpj), c);
-  const unicos = Array.from(porDocumento.entries()).map(([documento, c]) => ({ nome: c.nome, documento }));
+  const unicos = Array.from(porDocumento.entries()).map(([documento, c]) => ({ nome: limparNomeCliente(c.nome), documento }));
 
   const nomes = unicos.map(c => c.nome);
   const documentos = unicos.map(c => c.documento);
@@ -179,6 +246,91 @@ router.patch('/:id/documento', async (req, res) => {
     if (e.code === '23505') return res.status(400).json({ erro: 'Esse CNPJ já pertence a outro cliente cadastrado — use mesclar em vez de corrigir.' });
     console.error(e);
     res.status(500).json({ erro: 'Erro ao corrigir documento.' });
+  }
+});
+
+// Nome do arquivo CSV do cliente (orçamento e cópia do pedido no Drive),
+// escolhido na janela "Salvar orçamento em CSV" com "Usar sempre esse nome pra
+// este cliente". Vale pra todos os aparelhos (vem no /sync). Qualquer usuário
+// logado: é só o nome do arquivo, não mexe em preço nem histórico. Vazio volta
+// pra 1ª palavra do nome do cliente (NULL). Só letras e números, que é o que o
+// app reconhece ao abrir o CSV de volta (pedidoPeloNomeDoArquivo).
+router.put('/:id/nome-arquivo', async (req, res) => {
+  const nomeArquivo = String(req.body.nome_arquivo ?? '').trim();
+  if (!/^[A-Za-z0-9]{0,40}$/.test(nomeArquivo)) {
+    return res.status(400).json({ erro: 'O nome do arquivo aceita só letras e números (até 40).' });
+  }
+  try {
+    const result = await pool.query(
+      'UPDATE clientes SET nome_arquivo = $1, nome_arquivo_em = now() WHERE id = $2 RETURNING id, nome, nome_arquivo, nome_arquivo_em',
+      [nomeArquivo || null, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ erro: 'Cliente não encontrado.' });
+    const c = result.rows[0];
+    console.log(`Nome do arquivo: ${c.nome} (id ${c.id}) → "${c.nome_arquivo || '(1ª palavra)'}", por ${req.usuario?.email}.`);
+    res.json({ id: c.id, nome_arquivo: c.nome_arquivo, nome_arquivo_em: c.nome_arquivo_em });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ erro: 'Erro ao salvar o nome do arquivo.' });
+  }
+});
+
+// WhatsApp do comprador da loja, escolhido no card do cliente (digitado ou dos
+// contatos do celular): com ele, o texto do orçamento abre direto na conversa.
+// Vale pra todos os aparelhos (vem no /sync). Qualquer usuário logado, como o
+// nome do arquivo: não mexe em preço nem histórico. Número vazio apaga os dois
+// campos. O app manda o número já com o 55; aqui só confere o formato
+// (55 + DDD + 8 ou 9 dígitos).
+router.put('/:id/whatsapp', async (req, res) => {
+  const bruto = String(req.body.numero ?? '').trim();
+  const numero = bruto.replace(/\D/g, '');
+  const nome = String(req.body.nome ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100); // nome completo (Salesforce)
+  if (bruto && !/^55[1-9]{2}\d{8,9}$/.test(numero)) {
+    return res.status(400).json({ erro: 'Número de WhatsApp inválido — use DDD + número (ex: 43 99999-8888).' });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE clientes SET whatsapp_comprador = $1, whatsapp_comprador_nome = $2, whatsapp_comprador_em = now()
+       WHERE id = $3 RETURNING id, nome, whatsapp_comprador, whatsapp_comprador_nome, whatsapp_comprador_em`,
+      [numero || null, numero && nome ? nome : null, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ erro: 'Cliente não encontrado.' });
+    const c = result.rows[0];
+    console.log(`WhatsApp do comprador: ${c.nome} (id ${c.id}) ${c.whatsapp_comprador ? 'definido' : 'apagado'}, por ${req.usuario?.email}.`);
+    res.json({ id: c.id, whatsapp_comprador: c.whatsapp_comprador, whatsapp_comprador_nome: c.whatsapp_comprador_nome, whatsapp_comprador_em: c.whatsapp_comprador_em });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ erro: 'Erro ao salvar o WhatsApp do comprador.' });
+  }
+});
+
+// Contatos comerciais do cliente pro Salesforce (janela "Contatos" do card,
+// mostrados na Ficha cadastral): telefone comercial, e-mail comercial e e-mail
+// NF/XML. Qualquer usuário logado, como o WhatsApp do comprador. Campo vazio
+// apaga; fora do formato responde 400 (o app confere antes).
+router.put('/:id/contatos', async (req, res) => {
+  const corpo = req.body || {};
+  const valor = (k) => String(corpo[k] ?? '').trim();
+  const tel = valor('telefone_comercial'), email = valor('email_comercial'), nfe = valor('email_nfe');
+  const telefone = tel ? normalizarTelefoneBr(tel) : '';
+  const emailComercial = email ? normalizarEmails(email, 1) : '';
+  const emailNfe = nfe ? normalizarEmails(nfe, 3) : '';
+  if (telefone === null) return res.status(400).json({ erro: 'Telefone comercial inválido — use DDD + número (ex: 44 3025-1180).' });
+  if (emailComercial === null) return res.status(400).json({ erro: 'E-mail comercial inválido.' });
+  if (emailNfe === null) return res.status(400).json({ erro: 'E-mail NF/XML inválido (até 3, separados por ;).' });
+  try {
+    const result = await pool.query(
+      `/* clientes:contatos */ UPDATE clientes SET telefone_comercial = $1, email_comercial = $2, email_nfe = $3, contatos_em = now()
+       WHERE id = $4 RETURNING id, nome, telefone_comercial, email_comercial, email_nfe, contatos_em`,
+      [telefone || null, emailComercial || null, emailNfe || null, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ erro: 'Cliente não encontrado.' });
+    const c = result.rows[0];
+    console.log(`Contatos do cliente: ${c.nome} (id ${c.id}) atualizados por ${req.usuario?.email}.`);
+    res.json({ id: c.id, telefone_comercial: c.telefone_comercial, email_comercial: c.email_comercial, email_nfe: c.email_nfe, contatos_em: c.contatos_em });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ erro: 'Erro ao salvar os contatos do cliente.' });
   }
 });
 

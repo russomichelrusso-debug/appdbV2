@@ -3,8 +3,76 @@ const router = express.Router();
 const { pool } = require('../db');
 const { acharOuCriarCliente } = require('../clientMatcher');
 const { validarIdInteiro } = require('../middleware/validarId');
+const { sqlDiaDoPedido } = require('./lib/comprasApp');
+const { acharOuCriarProdutoPorSku, ErroPermanente, mensagemParaApp } = require('./lib/produtoPorSku');
 
 router.param('id', validarIdInteiro);
+
+// Hora em que o vendedor fechou (ou alterou) o pedido do app. Sem internet, o
+// pedido fica na fila do aparelho e só chega aqui quando a rede volta - às vezes
+// no dia seguinte; gravar now() punha a compra no dia do envio (Histórico,
+// Recompra, Rotatividade). O app manda a hora do toque e, carimbada em cada
+// envio (inclusive o da fila, ver apiFetch), a hora do envio (enviado_em) - as
+// duas pelo relógio do celular. A diferença entre elas é quanto o pedido
+// esperou; descontada do now() do servidor, o relógio errado do celular (data
+// manual, bateria zerada) não entra: pedido enviado na hora fica com now().
+// Vale só hora completa com fuso (Z ou ±hh:mm), até 30 dias de espera. Sem o
+// enviado_em ou fora disso: null = now().
+const FILA_MAX_DIAS = 30;
+const HORA_COM_FUSO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/i;
+function horaDoPedidoDoApp(valor, enviadoEm, agora = new Date()) {
+  if (typeof valor !== 'string' || typeof enviadoEm !== 'string' || !HORA_COM_FUSO.test(valor) || !HORA_COM_FUSO.test(enviadoEm)) return null;
+  const espera = new Date(enviadoEm).getTime() - new Date(valor).getTime();
+  if (!Number.isFinite(espera) || espera < -60000 || espera > FILA_MAX_DIAS * 86400000) return null;
+  const t = agora.getTime() - Math.max(espera, 0);
+  // meia-noite UTC exata é lida como "só a data" (sqlDiaDoPedido); 1 ms a menos
+  // mantém a hora de verdade no dia de Brasília
+  return new Date(t % 86400000 === 0 ? t - 1 : t).toISOString();
+}
+
+// Versão do pedido do app = hora do toque em Finalizar/Atualizar, JÁ no relógio
+// do servidor (horaDoPedidoDoApp: só a espera, medida no mesmo aparelho) - o
+// relógio de cada aparelho não entra, então a alteração feita no tablet com a
+// hora certa não perde pra do celular adiantado (achado do revisor-cortag).
+// Serve pra comparar versões do mesmo pedido: a mais velha que chegar depois
+// (fila atrasada, outro aparelho) não sobrescreve a mais nova.
+const versaoDoApp = (toque, enviadoEm) => horaDoPedidoDoApp(toque, enviadoEm);
+const versaoMaisVelha = (nova, gravada) => !!(nova && gravada && new Date(nova).getTime() <= new Date(gravada).getTime());
+
+// O que fazer com uma versão do app que chega pra um pedido já gravado:
+// - 'igual': mesmos itens e mesmo contexto = reenvio da mesma versão (resposta perdida com sinal
+//   fraco). É sucesso, sem regravar. Os itens são comparados ANTES da versão: a
+//   versão carrega a demora daquele envio, e o reenvio que chega mais rápido que
+//   o 1º saía "mais velho" e voltava como versão antiga - aviso falso, e a lista
+//   do aparelho ficava com os itens de antes (achado do revisor-cortag). A versão
+//   gravada só sobe (GREATEST): A -> B -> A com o B atrasado na fila não volta.
+//   Só o contexto mudou (prazo/canal sem mudar preço) não é reenvio: aplica.
+// - 'antiga': mais velha que a gravada, ou com a hora mandada mas não confiável
+//   (relógio do aparelho mudou no meio, mais de 30 dias na fila) quando já há
+//   uma gravada - sem saber a hora, não passa por cima de uma alteração mais
+//   nova. App antigo, que não manda hora nenhuma, aplica como antes.
+// - 'aplicar': troca os itens e o contexto.
+const jsonCanonico = (v) => (v == null ? 'null'
+  : Array.isArray(v) ? `[${v.map(jsonCanonico).join(',')}]`
+  : typeof v === 'object' ? `{${Object.keys(v).sort().filter(k => v[k] !== undefined).map(k => `${JSON.stringify(k)}:${jsonCanonico(v[k])}`).join(',')}}`
+  : JSON.stringify(v));
+function mesmoContexto(gravado, contexto) {
+  const novo = contextoParaGravar(contexto);
+  const antigo = typeof gravado === 'string' ? JSON.parse(gravado) : gravado; // jsonb chega como objeto
+  return jsonCanonico(antigo) === jsonCanonico(novo == null ? null : JSON.parse(novo));
+}
+async function compararComGravado(client, pedido, itens, contexto, versao, horaMandada) {
+  if (!itensValidos(itens)) return 'igual'; // não troca por itens inválidos (devolve o gravado)
+  if (mesmoContexto(pedido.contexto, contexto) && mesmosItens(await itensDoPedido(client, pedido.id), itens)) {
+    if (versao) await client.query('/* versao-app */ UPDATE pedidos SET versao_app = GREATEST(versao_app, $1::timestamptz) WHERE id = $2', [versao, pedido.id]);
+    return 'igual';
+  }
+  if (pedido.versao_app && !versao && horaMandada) {
+    console.warn(`Pedido #${pedido.id}: alteração sem hora confiável (enviado_em/alterado_em) não aplicada sobre a versão gravada.`);
+    return 'antiga';
+  }
+  return versaoMaisVelha(versao, pedido.versao_app) ? 'antiga' : 'aplicar';
+}
 
 async function acharOuCriarVendedor(client, nomeVendedor) {
   if (!nomeVendedor) return null;
@@ -19,24 +87,15 @@ async function acharOuCriarVendedor(client, nomeVendedor) {
   const depois = await client.query('SELECT id FROM vendedores WHERE nome = $1', [nomeVendedor]);
   return depois.rows[0].id;
 }
-// Acha o produto pelo código. Se não existir e vier uma descrição (caso do
-// PDF oficial, que já traz o nome do item), cria na hora em vez de recusar -
-// diferente do "Finalizar pedido" manual, que exige sincronizar o catálogo
-// antes (lá o código vem só de digitação/scanner, sem descrição junto).
-async function acharOuCriarProdutoPorSku(client, codigo_sku, descricaoSeNovo) {
-  const result = await client.query('SELECT id FROM produtos WHERE codigo_sku = $1', [codigo_sku]);
-  if (result.rows.length > 0) return result.rows[0].id;
-  if (!descricaoSeNovo) {
-    throw new Error(`Produto com código ${codigo_sku} não encontrado - rode /api/produtos/sync primeiro.`);
-  }
-  const criado = await client.query(
-    'INSERT INTO produtos (codigo_sku, nome) VALUES ($1, $2) ON CONFLICT (codigo_sku) DO NOTHING RETURNING id',
-    [codigo_sku, descricaoSeNovo]
-  );
-  if (criado.rows.length > 0) return criado.rows[0].id;
-  // corrida: outro pedido criou o mesmo produto entre o SELECT e o INSERT.
-  const depois = await client.query('SELECT id FROM produtos WHERE codigo_sku = $1', [codigo_sku]);
-  return depois.rows[0].id;
+// "Como o orçamento estava montado" (estado, canal, descontos, preços
+// editados - ver contextoDoOrcamento no index.html), guardado junto do pedido
+// do app pra ele reabrir com os mesmos preços. Só objeto simples e pequeno;
+// qualquer outra coisa vira NULL em vez de recusar o pedido.
+const CONTEXTO_MAX_BYTES = 20000;
+function contextoParaGravar(contexto) {
+  if (!contexto || typeof contexto !== 'object' || Array.isArray(contexto)) return null;
+  const json = JSON.stringify(contexto);
+  return json.length <= CONTEXTO_MAX_BYTES ? json : null;
 }
 
 // Finaliza/grava um pedido. Corpo esperado:
@@ -48,20 +107,71 @@ async function acharOuCriarProdutoPorSku(client, codigo_sku, descricaoSeNovo) {
 //   data_pedido?: "2026-08-01",   // data original do documento, se souber (senão usa agora)
 //   pdf_modificado_em?: "...",    // data de modificação do ARQUIVO PDF (metadado), pra saber qual versão é mais nova
 //   origem?: "app" | "pdf",       // de onde veio esse registro
+//   contexto?: { uf, canal, ... }, // como o orçamento estava montado (só pedido do app, pra reabrir e editar)
+//   id_envio?: "uuid",            // gerado no toque em "Finalizar": o reenvio da fila offline não duplica
 //   itens: [{ codigo_sku, quantidade, preco_unitario, descricao? }, ...]
 // }
+const ID_ENVIO = /^[A-Za-z0-9-]{16,64}$/;
+async function pedidoDoMesmoEnvio(client, idEnvio, usuarioId, travar = false) {
+  const r = await client.query(`SELECT id, cliente_id, data_pedido, usuario_id, versao_app, contexto FROM pedidos WHERE id_envio = $1${travar ? ' FOR UPDATE' : ''}`, [idEnvio]);
+  const p = r.rows[0];
+  // de outro usuário (não acontece com UUID): não devolve o pedido dele
+  return p && p.usuario_id === usuarioId ? p : (p ? false : null);
+}
 router.post('/', async (req, res) => {
-  const { cliente, vendedor_nome, observacao, itens, numero_cotacao, data_pedido, pdf_modificado_em, origem } = req.body;
-  if (!cliente || !cliente.nome) return res.status(400).json({ erro: 'Informe os dados do cliente (nome).' });
-  if (!Array.isArray(itens) || itens.length === 0) return res.status(400).json({ erro: 'Informe ao menos um item.' });
+  const { cliente, vendedor_nome, observacao, itens, numero_cotacao, data_pedido, pdf_modificado_em, origem, contexto } = req.body;
+  const idEnvio = typeof req.body.id_envio === 'string' && ID_ENVIO.test(req.body.id_envio) ? req.body.id_envio : null;
+  // erro do próprio envio (não muda reenviando): 422 - a fila offline do app tira
+  // como "recusado" (400 ela reenvia pra sempre, é o que o servidor responde a
+  // falha passageira do banco)
+  if (!cliente || !cliente.nome) return res.status(422).json({ erro: 'Informe os dados do cliente (nome).' });
+  if (!itensValidos(itens)) return res.status(422).json({ erro: 'Informe ao menos um item, com código, quantidade maior que zero e preço.' });
+  if (origem != null && origem !== 'app' && origem !== 'pdf') return res.status(422).json({ erro: 'Origem do pedido inválida.' });
   if (pdf_modificado_em && new Date(pdf_modificado_em) > new Date()) {
-    return res.status(400).json({ erro: 'pdf_modificado_em não pode ser uma data futura.' });
+    return res.status(422).json({ erro: 'pdf_modificado_em não pode ser uma data futura.' });
   }
 
   let client;
   try {
     client = await pool.connect();
     await client.query('BEGIN');
+
+    // Reenvio do mesmo pedido (resposta perdida com sinal fraco -> fila offline
+    // -> reenvio): devolve o que já foi gravado, sem criar outro
+    // O mesmo id_envio também é a ALTERAÇÃO do pedido feito sem internet (o
+    // vendedor tocou em "Atualizar pedido" antes de o 1º envio sair): se os itens
+    // mudaram e a versão é mais nova, troca os itens do mesmo pedido.
+    if (idEnvio) {
+      // um envio de cada vez por id_envio: a alteração tocada enquanto o 1º envio
+      // ainda grava espera ele terminar e cai na troca de itens (sem a trava, o
+      // INSERT dela batia no índice único e os itens novos se perdiam)
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [idEnvio]);
+      const mesmo = await pedidoDoMesmoEnvio(client, idEnvio, req.usuario.id, true);
+      if (mesmo === false) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ erro: 'Identificador de envio já usado.' });
+      }
+      if (mesmo) {
+        const versao = versaoDoApp(req.body.alterado_em || data_pedido, req.body.enviado_em);
+        const resposta = { pedido_id: mesmo.id, cliente_id: mesmo.cliente_id, data_pedido: mesmo.data_pedido, mesmo_envio: true };
+        const decisao = await compararComGravado(client, mesmo, itens, contexto, versao, !!req.body.enviado_em);
+        if (decisao !== 'aplicar') {
+          await client.query(decisao === 'igual' ? 'COMMIT' : 'ROLLBACK');
+          return res.status(200).json(decisao === 'antiga' ? { ...resposta, versao_antiga: true } : resposta);
+        }
+        await trocarItensDoPedido(client, mesmo.id, itens);
+        const vendedorId = await acharOuCriarVendedor(client, vendedor_nome);
+        await client.query(
+          `UPDATE pedidos SET contexto = $1::jsonb, atualizado_em = COALESCE($2::timestamptz, now()),
+                              vendedor_id = COALESCE($3, vendedor_id), versao_app = COALESCE($4::timestamptz, versao_app)
+           WHERE id = $5`,
+          [contextoParaGravar(contexto), horaDoPedidoDoApp(req.body.alterado_em, req.body.enviado_em), vendedorId, versao, mesmo.id]
+        );
+        await client.query('COMMIT');
+        console.log(`Pedido #${mesmo.id} ALTERADO pelo mesmo envio (alterado antes de o 1º envio chegar), ${itens.length} item(ns).`);
+        return res.status(200).json({ ...resposta, atualizado: true });
+      }
+    }
 
     // Duplicidade da cotação, checada DENTRO da transação com FOR UPDATE
     // (antes era antes do BEGIN: duas atualizações simultâneas da mesma
@@ -104,6 +214,8 @@ router.post('/', async (req, res) => {
     const clienteId = await acharOuCriarCliente(client, cliente);
     const vendedorId = await acharOuCriarVendedor(client, vendedor_nome);
     const criarProdutosDesconhecidos = origem === 'pdf';
+    const origemFinal = origem || 'app';
+    const dataPedidoGravar = origemFinal === 'app' ? horaDoPedidoDoApp(data_pedido, req.body.enviado_em) : (data_pedido || null);
 
     let pedidoId, dataPedidoFinal, atualizado = false;
     if (pedidoParaAtualizar) {
@@ -115,7 +227,7 @@ router.post('/', async (req, res) => {
                             data_pedido = COALESCE($4::timestamptz, data_pedido),
                             pdf_modificado_em = $5
          WHERE id = $6 RETURNING id, data_pedido`,
-        [clienteId, vendedorId, observacao || null, data_pedido || null, pdf_modificado_em || null, pedidoParaAtualizar]
+        [clienteId, vendedorId, observacao || null, dataPedidoGravar, pdf_modificado_em || null, pedidoParaAtualizar]
       );
       pedidoId = upd.rows[0].id;
       dataPedidoFinal = upd.rows[0].data_pedido;
@@ -123,17 +235,20 @@ router.post('/', async (req, res) => {
       atualizado = true;
     } else {
       const pedidoResult = await client.query(
-        `INSERT INTO pedidos (cliente_id, vendedor_id, observacao, numero_cotacao, origem, data_pedido, pdf_modificado_em, usuario_id)
-         VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), $7, $8)
+        `INSERT INTO pedidos (cliente_id, vendedor_id, observacao, numero_cotacao, origem, data_pedido, pdf_modificado_em, usuario_id, contexto, id_envio, versao_app)
+         VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), $7, $8, $9::jsonb, $10, $11::timestamptz)
          RETURNING id, data_pedido`,
-        [clienteId, vendedorId, observacao || null, numero_cotacao || null, origem || 'app', data_pedido || null, pdf_modificado_em || null, req.usuario.id]
+        [clienteId, vendedorId, observacao || null, numero_cotacao || null, origemFinal, dataPedidoGravar, pdf_modificado_em || null, req.usuario.id, contextoParaGravar(contexto), idEnvio,
+          origemFinal === 'app' ? versaoDoApp(req.body.alterado_em || data_pedido, req.body.enviado_em) : null]
       );
       pedidoId = pedidoResult.rows[0].id;
       dataPedidoFinal = pedidoResult.rows[0].data_pedido;
     }
 
     for (const item of itens) {
-      const produtoId = await acharOuCriarProdutoPorSku(client, item.codigo_sku, criarProdutosDesconhecidos ? item.descricao : null);
+      // trim como em trocarItensDoPedido: " 60863" passava no itensValidos, não
+      // achava o produto e o pedido voltava 400 pra sempre na fila offline
+      const produtoId = await acharOuCriarProdutoPorSku(client, item.codigo_sku.trim(), criarProdutosDesconhecidos ? item.descricao : null);
       await client.query(
         'INSERT INTO pedido_itens (pedido_id, produto_id, quantidade, preco_unitario) VALUES ($1, $2, $3, $4)',
         [pedidoId, produtoId, item.quantidade, item.preco_unitario]
@@ -151,12 +266,167 @@ router.post('/', async (req, res) => {
       // corrida rara: dois envios da mesma cotação quase ao mesmo tempo
       return res.status(200).json({ ja_existia: true, erro_corrida: true });
     }
+    if (e.code === '23505' && e.constraint === 'idx_pedidos_id_envio') {
+      // o mesmo envio duas vezes ao mesmo tempo (duas abas esvaziando a fila):
+      // o outro gravou - devolve ele. Hoje a trava por id_envio não deixa chegar
+      // aqui; se chegar com itens diferentes (alteração), 503 faz a fila mandar de
+      // novo e cair na troca de itens - 200 aqui perdia a alteração
+      let mesmo, iguais = true;
+      try {
+        mesmo = await pedidoDoMesmoEnvio(pool, idEnvio, req.usuario.id);
+        if (mesmo && itensValidos(itens)) iguais = mesmosItens(await itensDoPedido(pool, mesmo.id), itens);
+      } catch (e2) {
+        // não deu pra confirmar agora: 503 deixa o pedido na fila do app e o
+        // próximo envio acha o já gravado (409 o tirava da fila como recusado)
+        console.error(e2);
+        return res.status(503).json({ erro: 'Tente de novo em instantes.' });
+      }
+      if (mesmo && !iguais) return res.status(503).json({ erro: 'Tente de novo em instantes.' });
+      if (mesmo) return res.status(200).json({ pedido_id: mesmo.id, cliente_id: mesmo.cliente_id, data_pedido: mesmo.data_pedido, mesmo_envio: true });
+      return res.status(409).json({ erro: 'Identificador de envio já usado.' });
+    }
+    // produto que não existe nem no catálogo, código inválido: não adianta reenviar
+    if (e instanceof ErroPermanente) return res.status(422).json({ erro: e.message });
     console.error(e);
-    // e.code só existe em erro vindo direto do driver do Postgres (ex: violação
-    // de constraint) - esse detalhe não vai pro cliente. Erro lançado por nós
-    // mesmos (ex: "Produto com código X não encontrado") não tem .code e é uma
-    // mensagem pensada pra quem está usando o app ler.
-    res.status(400).json({ erro: !e.code && e.message ? e.message : 'Erro ao gravar pedido.' });
+    // só a mensagem que nós mesmos lançamos vai pro app (ver mensagemParaApp)
+    res.status(400).json({ erro: mensagemParaApp(e, 'Erro ao gravar pedido.') });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// Pedidos que o próprio vendedor fechou no app nos últimos DIAS_PEDIDOS_SALVOS
+// dias, com os itens - lista do "🧾 Pedidos" (reabrir pra editar quando o
+// cliente quer mudar alguma coisa, em vez de fechar outro pedido) e base pra
+// reconhecer um CSV de pedido aberto de volta no app (mesmos códigos e
+// quantidades = mesmo pedido). Só origem 'app': cotação em PDF tem a versão
+// dela no próprio PDF. Os dados do cliente vêm junto pro app selecionar o
+// cliente com canal/classificatório ao reabrir.
+const DIAS_PEDIDOS_SALVOS = 120;
+const LIMITE_PEDIDOS_SALVOS = 150;
+router.get('/salvos', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ped.id, ped.data_pedido, ped.atualizado_em, ped.contexto, ped.id_envio,
+              c.id AS cliente_id, c.nome AS cliente_nome, c.documento AS cliente_documento,
+              c.classificatorio_tipo, c.classificatorio_desconto, c.codigo_oficial,
+              json_agg(json_build_object('codigo_sku', pr.codigo_sku, 'quantidade', pi.quantidade,
+                                         'preco_unitario', pi.preco_unitario) ORDER BY pi.id) AS itens
+       FROM pedidos ped
+       JOIN clientes c ON c.id = ped.cliente_id
+       JOIN pedido_itens pi ON pi.pedido_id = ped.id
+       JOIN produtos pr ON pr.id = pi.produto_id
+       WHERE ped.origem = 'app' AND ped.usuario_id = $1
+         AND COALESCE(ped.atualizado_em, ped.data_pedido) >= now() - make_interval(days => $2)
+       GROUP BY ped.id, c.id
+       ORDER BY COALESCE(ped.atualizado_em, ped.data_pedido) DESC
+       LIMIT $3`,
+      [req.usuario.id, DIAS_PEDIDOS_SALVOS, LIMITE_PEDIDOS_SALVOS]
+    );
+    res.json({ dias: DIAS_PEDIDOS_SALVOS, pedidos: result.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ erro: 'Erro ao buscar os pedidos salvos.' });
+  }
+});
+
+// Itens de um pedido vindos do app: código, quantidade > 0 e preço >= 0.
+// Itens do pedido (código, quantidade, preço) - pra saber se uma versão mudou algo
+async function itensDoPedido(client, pedidoId) {
+  const r = await client.query(
+    `/* itens-do-pedido */ SELECT pr.codigo_sku, pi.quantidade, pi.preco_unitario
+     FROM pedido_itens pi JOIN produtos pr ON pr.id = pi.produto_id WHERE pi.pedido_id = $1`, [pedidoId]);
+  return r.rows;
+}
+function mesmosItens(a, b) {
+  const chave = (lista) => lista.map(it => `${String(it.codigo_sku).trim()}|${Number(it.quantidade)}|${Number(it.preco_unitario).toFixed(2)}`).sort().join(';');
+  return chave(a) === chave(b);
+}
+// Troca os itens do pedido. Acha todos os produtos ANTES de apagar os antigos:
+// código que não existe recusa a troca já aqui, com o pedido intacto.
+async function trocarItensDoPedido(client, pedidoId, itens) {
+  const produtoIds = [];
+  for (const item of itens) produtoIds.push(await acharOuCriarProdutoPorSku(client, item.codigo_sku.trim(), null));
+  await client.query('DELETE FROM pedido_itens WHERE pedido_id = $1', [pedidoId]);
+  for (let i = 0; i < itens.length; i++) {
+    await client.query(
+      'INSERT INTO pedido_itens (pedido_id, produto_id, quantidade, preco_unitario) VALUES ($1, $2, $3, $4)',
+      [pedidoId, produtoIds[i], Number(itens[i].quantidade), Number(itens[i].preco_unitario)]
+    );
+  }
+}
+
+function itensValidos(itens) {
+  return Array.isArray(itens) && itens.length > 0 && itens.every(it => it
+    && typeof it.codigo_sku === 'string' && it.codigo_sku.trim() !== ''
+    && Number.isFinite(Number(it.quantidade)) && Number(it.quantidade) > 0
+    && Number.isFinite(Number(it.preco_unitario)) && Number(it.preco_unitario) >= 0);
+}
+
+// Atualiza um pedido do app já gravado (reaberto pra editar): troca os itens
+// e o contexto, marca atualizado_em e mantém o mesmo id, cliente e data do
+// pedido - um registro só por pedido, em vez de um novo a cada mudança do
+// cliente. Só o autor (ou um admin) e só pedido com origem 'app'. Corpo:
+// { itens: [{ codigo_sku, quantidade, preco_unitario }], contexto?, vendedor_nome?, observacao? }
+router.patch('/:id', async (req, res) => {
+  const { itens, contexto, vendedor_nome, observacao, alterado_em, enviado_em } = req.body || {};
+  if (!itensValidos(itens)) return res.status(422).json({ erro: 'Informe ao menos um item, com código, quantidade maior que zero e preço.' });
+
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    // FOR UPDATE: duas atualizações do mesmo pedido ao mesmo tempo (ex.: a
+    // fila offline reenviando) não regravam os itens em paralelo.
+    const atualResult = await client.query(
+      'SELECT id, cliente_id, origem, usuario_id, data_pedido, atualizado_em, versao_app, contexto FROM pedidos WHERE id = $1 FOR UPDATE',
+      [req.params.id]
+    );
+    const atual = atualResult.rows[0];
+    if (!atual) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ erro: 'Pedido não encontrado — pode ter sido excluído.' });
+    }
+    if (atual.origem !== 'app') {
+      await client.query('ROLLBACK');
+      return res.status(422).json({ erro: 'Só pedido fechado no app pode ser editado por aqui.' });
+    }
+    if (atual.usuario_id !== req.usuario.id && !req.usuario.is_admin) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ erro: 'Esse pedido foi gravado por outro usuário — só ele ou um administrador pode alterá-lo.' });
+    }
+
+    // alteração mais velha que a gravada (fila offline atrasada, outro aparelho):
+    // não apaga a mais nova
+    // (e o reenvio da mesma alteração, com a resposta perdida, é sucesso sem regravar)
+    const versao = versaoDoApp(alterado_em, enviado_em);
+    const decisao = await compararComGravado(client, atual, itens, contexto, versao, !!(alterado_em || enviado_em));
+    if (decisao !== 'aplicar') {
+      await client.query(decisao === 'igual' ? 'COMMIT' : 'ROLLBACK');
+      return res.json({ pedido_id: atual.id, cliente_id: atual.cliente_id, data_pedido: atual.data_pedido, atualizado_em: atual.atualizado_em,
+        ...(decisao === 'igual' ? { atualizado: true } : { atualizado: false, versao_antiga: true }) });
+    }
+    await trocarItensDoPedido(client, atual.id, itens);
+    const vendedorId = await acharOuCriarVendedor(client, vendedor_nome);
+    const upd = await client.query(
+      `UPDATE pedidos SET contexto = $1::jsonb, atualizado_em = COALESCE($5::timestamptz, now()),
+                          vendedor_id = COALESCE($2, vendedor_id), observacao = COALESCE($3, observacao),
+                          versao_app = COALESCE($6::timestamptz, versao_app)
+       WHERE id = $4 RETURNING id, cliente_id, data_pedido, atualizado_em`,
+      [contextoParaGravar(contexto), vendedorId, observacao || null, atual.id, horaDoPedidoDoApp(alterado_em, enviado_em), versao]
+    );
+
+    await client.query('COMMIT');
+    const pedido = upd.rows[0];
+    console.log(`Pedido #${pedido.id} EDITADO no app (cliente ${pedido.cliente_id}, ${itens.length} item(ns)).`);
+    res.json({ pedido_id: pedido.id, cliente_id: pedido.cliente_id, data_pedido: pedido.data_pedido, atualizado_em: pedido.atualizado_em, atualizado: true });
+  } catch (e) {
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch (rollbackErr) { console.error('Erro no rollback:', rollbackErr); }
+    }
+    if (e instanceof ErroPermanente) return res.status(422).json({ erro: e.message });
+    console.error(e);
+    res.status(400).json({ erro: mensagemParaApp(e, 'Erro ao atualizar pedido.') });
   } finally {
     if (client) client.release();
   }
@@ -181,8 +451,9 @@ router.get('/duplicados', async (req, res) => {
   if (!req.usuario?.is_admin) return res.status(403).json({ erro: 'Só administrador pode ver pedidos duplicados.' });
   try {
     const result = await pool.query(`
+      /* pedidos:duplicados */
       SELECT ped.id AS pedido_id, ped.cliente_id, c.nome AS cliente_nome,
-             ped.data_pedido, ped.origem, ped.numero_cotacao,
+             ped.data_pedido, ${sqlDiaDoPedido()}::text AS dia, ped.origem, ped.numero_cotacao,
              json_agg(json_build_object('codigo_sku', pr.codigo_sku, 'produto', pr.nome, 'quantidade', pi.quantidade) ORDER BY pr.nome) AS itens
       FROM pedidos ped
       JOIN clientes c ON c.id = ped.cliente_id
@@ -197,12 +468,12 @@ router.get('/duplicados', async (req, res) => {
           JOIN pedido_itens pi3 ON pi3.pedido_id = p3.id
           WHERE p3.id <> p2.id
             AND p3.cliente_id = p2.cliente_id
-            AND DATE(p3.data_pedido) = DATE(p2.data_pedido)
+            AND ${sqlDiaDoPedido('p3')} = ${sqlDiaDoPedido('p2')}
             AND pi3.produto_id = pi2.produto_id
         )
       )
       GROUP BY ped.id, ped.cliente_id, c.nome, ped.data_pedido, ped.origem, ped.numero_cotacao
-      ORDER BY ped.cliente_id, ped.data_pedido DESC
+      ORDER BY ped.cliente_id, dia DESC, ped.data_pedido DESC
     `);
     res.json(result.rows);
   } catch (e) {
@@ -240,3 +511,4 @@ router.delete('/:id', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.horaDoPedidoDoApp = horaDoPedidoDoApp;

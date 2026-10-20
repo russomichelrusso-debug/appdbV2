@@ -6,12 +6,42 @@ const path = require('path');
 const mockDb = require('./mock-db');
 const { generateToken, hashToken } = require('../auth-utils');
 const dbPath = path.resolve(__dirname, '../db.js');
+// /health/banco guarda a resposta por 15 s (server.js); no teste, 300 ms
+process.env.HEALTH_BANCO_CACHE_MS = '300';
+// tela do cliente no tablet (routes/segundaTela.js): espera de 25 s vira 400 ms no teste
+process.env.SEGUNDA_TELA_ESPERA_MS = '400';
 const originalResolve = Module._resolveFilename;
 Module._resolveFilename = function (request, ...args) {
   const resolved = originalResolve.call(this, request, ...args);
   return resolved;
 };
 require.cache[dbPath] = { id: dbPath, filename: dbPath, loaded: true, exports: mockDb };
+
+// web-push falso (routes/lib/novidades.js): registra o que seria enviado, sem
+// sair pra internet. Endpoint com "morta" responde 410 (inscrição expirada).
+const webPushEnviados = [];
+const webPushPath = require.resolve('web-push');
+require.cache[webPushPath] = { id: webPushPath, filename: webPushPath, loaded: true, exports: {
+  setVapidDetails: () => {},
+  sendNotification: async (sub, payload, opts) => {
+    if (sub.endpoint.includes('morta')) { const e = new Error('gone'); e.statusCode = 410; throw e; }
+    webPushEnviados.push({ endpoint: sub.endpoint, payload: JSON.parse(payload), opts });
+    return {};
+  },
+} };
+process.env.VAPID_PUBLIC_KEY = 'BChaveDeTeste_123';
+process.env.VAPID_PRIVATE_KEY = 'privada-de-teste';
+process.env.VAPID_SUBJECT = 'https://exemplo.test';
+process.env.IMPORTACAO_EMAIL_CHAVE = 'chave-de-teste-da-importacao-por-email-123456';
+
+// Login Google falso (routes/auth.js destrutura verificarGoogleIdToken ao carregar):
+// com googleFalso definido, o "id_token" vira a conta { sub, email, nome } dele.
+let googleFalso = null;
+{
+  const authUtils = require('../auth-utils');
+  const verificarDeVerdade = authUtils.verificarGoogleIdToken;
+  authUtils.verificarGoogleIdToken = async (idToken, clientId) => (googleFalso ? googleFalso(idToken) : verificarDeVerdade(idToken, clientId));
+}
 
 process.env.PORT = '4123';
 // não liga o preenchimento automático de fichas de CNPJ (timer) durante o teste
@@ -33,7 +63,7 @@ function req(method, urlPath, body, headers = {}) {
       res.on('end', () => {
         let json = null;
         try { json = JSON.parse(chunks); } catch (e) {}
-        resolve({ status: res.statusCode, body: json });
+        resolve({ status: res.statusCode, body: json, headers: res.headers });
       });
     });
     r.on('error', reject);
@@ -55,6 +85,95 @@ async function main() {
   // 1) health check sem chave de API - deve funcionar (rota pública)
   let res = await req('GET', '/health');
   assert(res.status === 200 && res.body.status === 'ok', 'health check responde OK');
+
+  // 1a) "\" no nome do cliente (o "/" escapado de exportação, "MATS. P\/ CONSTR.") não
+  // cria cliente duplicado: sai na leitura da planilha, na busca e na gravação
+  {
+    const { limparNomeCliente, acharOuCriarCliente } = require('../clientMatcher');
+    const XLSXt = require('@e965/xlsx');
+    const Imp = require('../importadores');
+    const wb = XLSXt.utils.book_new();
+    XLSXt.utils.book_append_sheet(wb, XLSXt.utils.aoa_to_sheet([
+      ['Carteira'], [], // o relatório tem 2 linhas de título antes do cabeçalho
+      ['Nr.Pedido', 'Cod.Cliente', 'Cliente', 'Item', 'Quantidade', 'Valor', 'Implantação'],
+      ['676001', '777', 'CASA DOS MATS. P\\/ CONSTR. LTDA', '60863', 1, 10, '01/10/2026'],
+    ]), 'Carteira');
+    const lido = Imp.lerRelatorioOficial(XLSXt, XLSXt.write(wb, { type: 'array', bookType: 'xlsx' }));
+    mockDb.__seed({ clientes: [{ id: 9701, nome: 'CASA DOS MATS. P/ CONSTR. LTDA' }] });
+    const achado = await acharOuCriarCliente(mockDb.pool, { nome: 'CASA DOS MATS. P\\/ CONSTR. LTDA' });
+    const nomeLido = (lido.itens || [])[0] && lido.itens[0].cliente_nome;
+    assert(limparNomeCliente('A \\/ B /\\ C') === 'A / B / C' && achado === 9701 && nomeLido === 'CASA DOS MATS. P/ CONSTR. LTDA',
+      `nome com "\\" de exportação não duplica cliente: ${JSON.stringify([achado, nomeLido])}`);
+  }
+
+  // 1b) /health/banco: servidor no ar E banco respondendo (o script do Gmail usa antes de
+  // mandar arquivo); banco com erro = 503 genérico, sem a mensagem do banco
+  // A resposta fica guardada (300 ms no teste, 15 s de verdade) e chamadas ao mesmo
+  // tempo esperam a mesma consulta: rota pública em loop não ocupa o banco.
+  {
+    const queryOriginal = mockDb.pool.query;
+    let consultas = 0;
+    mockDb.pool.query = async (sql, params) => {
+      if (sql.includes('health:banco')) { consultas++; await new Promise(r => setTimeout(r, 50)); }
+      return queryOriginal(sql, params);
+    };
+    let juntas;
+    try {
+      juntas = await Promise.all([1, 2, 3, 4, 5].map(() => req('GET', '/health/banco')));
+      res = await req('GET', '/health/banco');
+    } finally { mockDb.pool.query = queryOriginal; }
+    assert(juntas.every(r => r.status === 200 && r.body.banco === 'ok') && res.status === 200 && consultas === 1,
+      `health do banco responde OK; 6 chamadas = 1 consulta ao banco: ${JSON.stringify([res.body, consultas])}`);
+  }
+  await new Promise(r => setTimeout(r, 350)); // passa a validade da resposta guardada
+  {
+    const queryOriginal = mockDb.pool.query;
+    mockDb.pool.query = async (sql, params) => {
+      if (sql.includes('health:banco')) throw new Error('connection terminated SEGREDO');
+      return queryOriginal(sql, params);
+    };
+    try { res = await req('GET', '/health/banco'); } finally { mockDb.pool.query = queryOriginal; }
+    // erro lançado na hora (sem promise) também não trava: passada a validade, consulta de novo
+    await new Promise(r => setTimeout(r, 350));
+    mockDb.pool.query = (sql, params) => { if (sql.includes('health:banco')) throw new Error('síncrono'); return queryOriginal(sql, params); };
+    let rSinc;
+    try { rSinc = await req('GET', '/health/banco'); } finally { mockDb.pool.query = queryOriginal; }
+    await new Promise(r => setTimeout(r, 350));
+    const rVolta = await req('GET', '/health/banco');
+    assert(rSinc.status === 503 && rVolta.status === 200, `health do banco: erro síncrono não deixa a consulta presa: ${JSON.stringify([rSinc.status, rVolta.status])}`);
+    const r2 = await req('GET', '/health');
+    assert(res.status === 503 && !JSON.stringify(res.body).includes('SEGREDO') && r2.status === 200,
+      `health do banco: banco fora = 503 sem detalhe, e o /health continua 200: ${JSON.stringify(res.body)}`);
+  }
+
+  // 1c) CORS: todo método que as rotas usam está liberado na checagem prévia do navegador
+  // (o app publicado roda em outro domínio). Faltava PUT e o nome do arquivo do cliente
+  // nunca chegava ao servidor (achado da 4ª rodada do revisor-cortag).
+  {
+    const fs = require('fs');
+    const metodos = new Set();
+    for (const f of fs.readdirSync(path.join(__dirname, '../routes')).filter(f => f.endsWith('.js'))) {
+      for (const m of fs.readFileSync(path.join(__dirname, '../routes', f), 'utf8').matchAll(/router\.(get|post|put|patch|delete)\(/g)) metodos.add(m[1].toUpperCase());
+    }
+    const pre = await req('OPTIONS', '/api/clientes/1/nome-arquivo', null, { Origin: 'https://example.com', 'Access-Control-Request-Method': 'PUT' });
+    const liberados = String(pre.headers['access-control-allow-methods'] || '').split(/\s*,\s*/);
+    const faltando = [...metodos].filter(m => !liberados.includes(m));
+    assert(pre.status === 204 && metodos.has('PUT') && faltando.length === 0,
+      `CORS libera todos os métodos usados pelas rotas: ${JSON.stringify({ liberados, faltando })}`);
+    assert(pre.headers['x-content-type-options'] === 'nosniff', 'API manda X-Content-Type-Options: nosniff');
+  }
+
+  // Mensagem de erro que vai pro app: só a que nós lançamos (new Error), nunca a
+  // de erro de programação (TypeError) nem a do Postgres (tem .code)
+  {
+    const { mensagemParaApp } = require('../routes/lib/produtoPorSku');
+    const padrao = 'Erro ao gravar pedido.';
+    const nosso = mensagemParaApp(new Error('Produto com código X não encontrado no catálogo.'), padrao);
+    let tipo; try { null.x; } catch (e) { tipo = mensagemParaApp(e, padrao); }
+    const banco = mensagemParaApp(Object.assign(new Error('duplicate key value violates unique constraint "x"'), { code: '23505' }), padrao);
+    assert(nosso.startsWith('Produto com código') && tipo === padrao && banco === padrao,
+      `mensagemParaApp só repassa o erro lançado pelo app: ${JSON.stringify({ nosso, tipo, banco })}`);
+  }
 
   // 2) endpoint protegido sem token -> 401
   res = await req('GET', '/api/clientes');
@@ -79,6 +198,28 @@ async function main() {
     [hashToken(authToken), criado.rows[0].id, '90']
   );
 
+  // 2c) rota de payload grande (25 MB): sem token, responde 401 sem ler o corpo
+  // (antes o parse de até 25 MB rodava antes do login). O corpo anuncia 20 MB e só
+  // 1 KB é mandado: se o servidor esperasse o corpo, não haveria resposta.
+  {
+    const semToken = await new Promise((resolve) => {
+      const r = http.request({ hostname: 'localhost', port: 4123, path: '/api/fichas-tecnicas/importar', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': 20 * 1024 * 1024 } }, (resp) => {
+        let b = ''; resp.on('data', c => b += c); resp.on('end', () => { clearTimeout(t); resolve({ status: resp.statusCode, body: b }); });
+      });
+      const t = setTimeout(() => { r.destroy(); resolve({ status: 'sem resposta' }); }, 2000);
+      r.on('error', () => {});
+      r.write('{"fichas":{"x":"' + 'a'.repeat(1024));
+    });
+    assert(semToken.status === 401, `payload grande sem token: 401 antes de ler o corpo: ${JSON.stringify(semToken)}`);
+    // com token: corpo acima de 1 MB continua passando (parser de 25 MB) e o login é conferido 1 vez só
+    const antesLog = mockDb.__queryLog.length;
+    const grande = await req('POST', '/api/fichas-tecnicas/importar', { fichas: {}, enchimento: 'a'.repeat(2 * 1024 * 1024) });
+    const consultasSessao = mockDb.__queryLog.slice(antesLog).filter(q => /FROM sessoes s/i.test(q.sql)).length;
+    assert(grande.status === 400 && /Nenhuma ficha/.test(grande.body.erro) && consultasSessao === 1,
+      `payload grande com token: corpo de 2 MB lido e sessão conferida 1 vez: ${JSON.stringify([grande.status, grande.body, consultasSessao])}`);
+  }
+
   // 3) criar cliente
   res = await req('POST', '/api/clientes', { nome: 'João Silva Materiais', documento: '12345678000199', contato: '11999998888' });
   assert(res.status === 201 && res.body.id, 'cria cliente novo');
@@ -99,6 +240,9 @@ async function main() {
     clientes: [{
       id: 9010, nome: 'CLIENTE COM CODIGO OFICIAL', documento: '99988877000922', codigo_oficial: 'COD9010',
       classificatorio_tipo: null, classificatorio_desconto: null, matriz_grupo: null,
+    }, {
+      id: 9011, nome: 'CLIENTE HOME CENTER', documento: '99988877000923', codigo_oficial: 'COD9011',
+      classificatorio_tipo: 'Home Center Master', classificatorio_desconto: 12, matriz_grupo: null,
     }],
   });
   res = await req('GET', '/api/clientes?busca=CLIENTE%20COM%20CODIGO');
@@ -106,12 +250,201 @@ async function main() {
     res.status === 200 && res.body.length === 1 && res.body[0].codigo_oficial === 'COD9010',
     `busca de cliente devolve codigo_oficial pro seletor mostrar entre parênteses: ${JSON.stringify(res.body[0])}`
   );
+  // 5c) busca sem acento, palavras em qualquer ordem, CNPJ sem pontuação, código
+  // do ERP, nome fantasia e cidade da ficha de CNPJ (routes/lib/buscaCliente.js)
+  mockDb.__seed({
+    clientes: [
+      { id: 9020, nome: 'DEPOSITO SAO JOSE LTDA', documento: '11.222.333/0001-44', codigo_oficial: '21650', matriz_grupo: null },
+      { id: 9021, nome: 'DEPOSITO CENTRAL', documento: null, codigo_oficial: '5569', matriz_grupo: null },
+    ],
+    fichasCnpj: { 9020: { cliente_id: 9020, nome_fantasia: 'CASA DO CONSTRUTOR', municipio: 'MARINGA', uf: 'PR' } },
+  });
+  {
+    const ids = async (q) => ((await req('GET', '/api/clientes?busca=' + encodeURIComponent(q))).body || []).map(c => c.id).join(',');
+    const r = {
+      acento: await ids('joao silva'), ordem: await ids('silva joão'), cnpj: await ids('11222333000144'),
+      codigo: await ids('21650'), fantasia: await ids('casa construtor'), cidade: await ids('deposito maringa'),
+      erro: await ids('depozito sao jose'), nada: await ids('xyzw'),
+    };
+    assert(r.acento === String(clienteId) && r.ordem === String(clienteId) && r.cnpj === '9020' && r.codigo === '9020'
+      && r.fantasia === '9020' && r.cidade === '9020' && r.erro === '9020' && r.nada === '',
+      `busca de cliente: sem acento, qualquer ordem, CNPJ sem pontuação, código do ERP, nome fantasia, cidade e erro de digitação: ${JSON.stringify(r)}`);
+  }
+  {
+    // nome fantasia vale como a razão social: digitado inteiro vai pro topo
+    // (antes pesava +1 por palavra e perdia pra razão social parecida) e
+    // sigla/palavras juntas ("wa", "jr") acham "W. A."/"J. R." do cadastro
+    const { ordenarClientesPorBusca } = require('../routes/lib/buscaCliente');
+    const L = [
+      { id: 1, nome: 'CASA FORTE DAS TINTAS E VERNIZES LTDA' },
+      { id: 2, nome: 'THEODORA ASTERIA MOREIRA & CIA.LTDA.EPP', nome_fantasia: 'CASA DAS TINTAS' },
+      { id: 3, nome: 'W. A. MATS. CONSTR. LTDA', nome_fantasia: 'W A MATERIAIS PARA CONSTRUCAO' },
+      { id: 4, nome: 'J. R. FERRAGENS LTDA ME', nome_fantasia: 'A REBIMBELA' },
+      { id: 5, nome: 'IRACEMA PERISSATO E CIA LTDA', nome_fantasia: 'LOJA BOM JESUS' },
+    ];
+    const ids = (q) => ordenarClientesPorBusca(L, q).map(c => c.id).join(',');
+    const r = { exato: ids('casa das tintas'), comeco: ids('loja bom'), sigla: ids('wa materiais'), sigla2: ids('jr ferragens'), erro: ids('rebinbela') };
+    assert(r.exato.startsWith('2') && r.comeco === '5' && r.sigla === '3' && r.sigla2 === '4' && r.erro === '4',
+      `busca de cliente pelo nome fantasia e por sigla: ${JSON.stringify(r)}`);
+  }
+  {
+    // a busca sem internet (index.html) usa cópia igual do motor do servidor
+    const fsC = require('fs');
+    const trecho = (txt) => {
+      const i = txt.indexOf('// <motor-busca-cliente>'), f = txt.indexOf('// </motor-busca-cliente>');
+      return i >= 0 && f > i ? txt.slice(i, f).split(/\r?\n/).map(l => l.trim()).filter(Boolean).join('\n') : null;
+    };
+    const doServidor = trecho(fsC.readFileSync(path.join(__dirname, '..', 'routes', 'lib', 'buscaCliente.js'), 'utf8'));
+    const doApp = trecho(fsC.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8'));
+    assert(doServidor && doServidor === doApp, 'busca de cliente: o trecho <motor-busca-cliente> do index.html é igual ao de routes/lib/buscaCliente.js');
+  }
   res = await req('GET', '/api/clientes/sync');
   const sincronizado = res.body.clientes.find(c => c.id === 9010);
   assert(
     res.status === 200 && sincronizado && sincronizado.codigo_oficial === 'COD9010',
     'lista offline (/sync) também traz codigo_oficial, pra funcionar sem internet'
   );
+  {
+    const hc = res.body.clientes.find(c => c.id === 9011);
+    assert(hc && hc.classificatorio_tipo === 'Home Center Master' && Number(hc.classificatorio_desconto) === 12,
+      `lista offline (/sync) traz classificatório e % do ERP (preço da oferta pro comprador): ${JSON.stringify(hc)}`);
+  }
+  assert(sincronizado.regime_tributario === null, 'cliente sem ficha de CNPJ vai pro /sync com regime desconhecido (null)');
+
+  // 5b2) nome do arquivo CSV escolhido pro cliente - grava no servidor pra
+  // valer em todos os aparelhos e volta no /sync (usado offline)
+  res = await req('PUT', '/api/clientes/9010/nome-arquivo', { nome_arquivo: 'ClienteCodigo9010' });
+  assert(res.status === 200 && res.body.nome_arquivo === 'ClienteCodigo9010' && res.body.nome_arquivo_em,
+    `grava o nome do arquivo do cliente: ${JSON.stringify(res.body)}`);
+  res = await req('GET', '/api/clientes/sync');
+  const comNomeArquivo = res.body.clientes.find(c => c.id === 9010);
+  assert(comNomeArquivo.nome_arquivo === 'ClienteCodigo9010' && comNomeArquivo.nome_arquivo_em,
+    '/sync traz o nome do arquivo escolhido e quando foi trocado');
+  res = await req('PUT', '/api/clientes/9010/nome-arquivo', { nome_arquivo: 'Deposito São José' });
+  assert(res.status === 400, 'nome do arquivo com espaço/acento é recusado (só letras e números)');
+  res = await req('PUT', '/api/clientes/9010/nome-arquivo', { nome_arquivo: '' });
+  assert(res.status === 200 && res.body.nome_arquivo === null, 'nome vazio volta pra 1ª palavra do cliente (NULL)');
+  res = await req('PUT', '/api/clientes/99999/nome-arquivo', { nome_arquivo: 'Xyz' });
+  assert(res.status === 404, 'cliente inexistente: 404');
+
+  // 5b3) WhatsApp do comprador - destino direto do texto do orçamento, vale
+  // em todos os aparelhos e volta no /sync (usado offline)
+  res = await req('PUT', '/api/clientes/9010/whatsapp', { numero: '5543999998888', nome: '  João\n Compras ' });
+  assert(res.status === 200 && res.body.whatsapp_comprador === '5543999998888' && res.body.whatsapp_comprador_nome === 'João Compras' && res.body.whatsapp_comprador_em,
+    `grava o WhatsApp do comprador (nome sem quebra de linha): ${JSON.stringify(res.body)}`);
+  res = await req('GET', '/api/clientes/sync');
+  const comWhats = res.body.clientes.find(c => c.id === 9010);
+  assert(comWhats.whatsapp_comprador === '5543999998888' && comWhats.whatsapp_comprador_nome === 'João Compras' && comWhats.whatsapp_comprador_em
+    && 'telefone_ficha' in comWhats, '/sync traz o WhatsApp do comprador, quando foi trocado e o telefone da ficha');
+  for (const ruim of ['43999998888', '550099998888', '55439999988881', 'abc']) {
+    res = await req('PUT', '/api/clientes/9010/whatsapp', { numero: ruim });
+    assert(res.status === 400, `número fora do formato 55+DDD+número é recusado: ${ruim}`);
+  }
+  res = await req('PUT', '/api/clientes/9010/whatsapp', { numero: '', nome: 'Sobra' });
+  assert(res.status === 200 && res.body.whatsapp_comprador === null && res.body.whatsapp_comprador_nome === null,
+    'número vazio apaga o WhatsApp e o nome do comprador');
+  res = await req('PUT', '/api/clientes/99999/whatsapp', { numero: '5543999998888' });
+  assert(res.status === 404, 'WhatsApp de cliente inexistente: 404');
+  res = await req('PUT', '/api/clientes/9010/whatsapp', { numero: '5544998124471', nome: 'Marcos Antônio Pereira de Souza Albuquerque Neto Filho da Silva' });
+  assert(res.status === 200 && res.body.whatsapp_comprador_nome === 'Marcos Antônio Pereira de Souza Albuquerque Neto Filho da Silva',
+    `nome completo do comprador passa de 60 letras: ${JSON.stringify(res.body)}`);
+
+  // 5b4) Contatos comerciais (pro Salesforce): telefone comercial (fixo vale),
+  // e-mail comercial e e-mail NF/XML (até 3); vazio apaga; voltam no /sync
+  {
+    const { normalizarTelefoneBr, normalizarEmails } = require('../routes/lib/contatosCliente');
+    assert(normalizarTelefoneBr('(44) 3025-1180') === '554430251180' && normalizarTelefoneBr('+55 44 99812-4471') === '5544998124471'
+      && normalizarTelefoneBr('044 3025 1180') === '554430251180' && normalizarTelefoneBr('3025-1180') === null && normalizarTelefoneBr('44 89812-4471') === null,
+      'contatos: telefone com DDD (fixo ou celular) vira 55+DDD+número');
+    assert(normalizarEmails(' NFE@Loja.com.br ; xml@loja.com.br,nfe@loja.com.br ', 3) === 'nfe@loja.com.br; xml@loja.com.br'
+      && normalizarEmails('a@b.com c@d.com', 1) === null && normalizarEmails('sem-arroba.com', 3) === null,
+      'contatos: e-mails em minúsculas, sem repetir, separados por "; "');
+    res = await req('PUT', '/api/clientes/9010/contatos', { telefone_comercial: '(44) 3025-1180', email_comercial: 'Compras@Loja.com.br', email_nfe: 'nfe@loja.com.br; xml@loja.com.br' });
+    assert(res.status === 200 && res.body.telefone_comercial === '554430251180' && res.body.email_comercial === 'compras@loja.com.br'
+      && res.body.email_nfe === 'nfe@loja.com.br; xml@loja.com.br' && res.body.contatos_em, `grava os contatos do cliente: ${JSON.stringify(res.body)}`);
+    res = await req('GET', '/api/clientes/sync');
+    const comContatos = res.body.clientes.find(c => c.id === 9010);
+    assert(comContatos.telefone_comercial === '554430251180' && comContatos.email_nfe === 'nfe@loja.com.br; xml@loja.com.br' && comContatos.contatos_em
+      && 'email_ficha' in comContatos, '/sync traz os contatos do cliente e o e-mail da ficha (sugestão)');
+    for (const ruim of [{ telefone_comercial: '3025-1180' }, { email_comercial: 'a@b.com; c@d.com' }, { email_nfe: 'x@y.com; nada' }]) {
+      res = await req('PUT', '/api/clientes/9010/contatos', ruim);
+      assert(res.status === 400, `contato fora do formato é recusado: ${JSON.stringify(ruim)}`);
+    }
+    res = await req('PUT', '/api/clientes/9010/contatos', { telefone_comercial: '', email_comercial: '', email_nfe: '' });
+    assert(res.status === 200 && res.body.telefone_comercial === null && res.body.email_comercial === null && res.body.email_nfe === null, 'campos vazios apagam os contatos');
+    res = await req('PUT', '/api/clientes/99999/contatos', { telefone_comercial: '4430251180' });
+    assert(res.status === 404, 'contatos de cliente inexistente: 404');
+  }
+
+  // 5c) regime tributário da ficha de CNPJ no /sync - o recado de ICMS-ST do
+  // orçamento (gerado offline) muda o texto pra Simples/MEI x regime normal
+  mockDb.__seed({
+    clientes: [
+      { id: 9011, nome: 'REGIME SIMPLES', documento: '11122233000144', codigo_oficial: null },
+      { id: 9012, nome: 'REGIME NORMAL', documento: '11122233000225', codigo_oficial: null },
+      { id: 9013, nome: 'REGIME MEI', documento: '11122233000306', codigo_oficial: null },
+    ],
+    fichasCnpj: {
+      9011: { dados_brutos: { simples: { optante: true, dataOpcao: '2007-07-01', dataExclusao: null }, mei: { optante: false } } },
+      9012: { dados_brutos: { simples: { optante: false, dataOpcao: '2008-09-01', dataExclusao: '2010-12-31' }, mei: { optante: false } } },
+      9013: { dados_brutos: { simples: { optante: true }, mei: { optante: true } } },
+    },
+  });
+  res = await req('GET', '/api/clientes/sync');
+  const regimeDe = (id) => (res.body.clientes.find(c => c.id === id) || {}).regime_tributario;
+  assert(
+    regimeDe(9011) === 'simples' && regimeDe(9012) === 'normal' && regimeDe(9013) === 'mei',
+    `/sync traz o regime da ficha (simples/normal/mei): ${regimeDe(9011)}/${regimeDe(9012)}/${regimeDe(9013)}`
+  );
+
+  // 5d) destino do botão "Waze" no card do cliente: endereço da ficha (com o
+  // tipo do logradouro, que só existe em dados_brutos) e a posição da loja
+  // gravada pelo levantamento - vão no /sync pra funcionar sem internet
+  mockDb.__seed({
+    clientes: [
+      { id: 9014, nome: 'COM FICHA E GPS', documento: '11122233000487', codigo_oficial: null, latitude: -23.4205, longitude: -51.9331 },
+      { id: 9015, nome: 'SEM FICHA', documento: null, codigo_oficial: null },
+    ],
+    fichasCnpj: {
+      9014: {
+        logradouro: 'COLOMBO', numero: '7266', bairro: 'ZONA 07', municipio: 'MARINGA', uf: 'PR',
+        dados_brutos: { endereco: { tipoLogradouro: 'AVENIDA', logradouro: 'COLOMBO' } },
+      },
+    },
+  });
+  res = await req('GET', '/api/clientes/sync');
+  const comDestino = res.body.clientes.find(c => c.id === 9014);
+  const semDestino = res.body.clientes.find(c => c.id === 9015);
+  assert(
+    comDestino && comDestino.endereco && comDestino.endereco.tipo === 'AVENIDA' && comDestino.endereco.logradouro === 'COLOMBO'
+      && comDestino.endereco.municipio === 'MARINGA' && Number(comDestino.latitude) === -23.4205 && Number(comDestino.longitude) === -51.9331,
+    `/sync traz endereço da ficha (com o tipo do logradouro) e a posição da loja: ${JSON.stringify(comDestino)}`
+  );
+  assert(semDestino && semDestino.endereco === null && semDestino.latitude === null,
+    `cliente sem ficha nem GPS vai pro /sync sem destino: ${JSON.stringify(semDestino)}`);
+
+  // 5e) posição aproximada pelo endereço da ficha (routes/lib/geocodificacao.js)
+  // no /sync - só enquanto a ficha tiver o mesmo endereço que foi consultado
+  mockDb.__seed({
+    clientes: [
+      { id: 9016, nome: 'POSICAO PELO ENDERECO', documento: '11122233000568', codigo_oficial: null },
+      { id: 9017, nome: 'ENDERECO MUDOU', documento: '11122233000649', codigo_oficial: null },
+    ],
+    fichasCnpj: {
+      9016: { logradouro: 'BRASIL', numero: '100', municipio: 'MARINGA', uf: 'PR', dados_brutos: { endereco: { tipoLogradouro: 'AVENIDA' } } },
+      9017: { logradouro: 'XV DE NOVEMBRO', numero: '5', municipio: 'CURITIBA', uf: 'PR', dados_brutos: {} },
+    },
+    geocodificacao: {
+      9016: { endereco: 'AVENIDA|BRASIL|100|MARINGA|PR', latitude: -23.42, longitude: -51.93, nivel: 'rua', tentativas: 0 },
+      9017: { endereco: '|XV DE NOVEMBRO|9|CURITIBA|PR', latitude: -25.43, longitude: -49.27, nivel: 'rua', tentativas: 0 },
+    },
+  });
+  res = await req('GET', '/api/clientes/sync');
+  const aprox = res.body.clientes.find(c => c.id === 9016);
+  const mudou = res.body.clientes.find(c => c.id === 9017);
+  assert(aprox && Number(aprox.latitude_aprox) === -23.42 && Number(aprox.longitude_aprox) === -51.93 && aprox.localizacao_nivel === 'rua'
+    && aprox.latitude === null && mudou && mudou.latitude_aprox === null,
+    `/sync traz a posição pelo endereço só com o endereço igual ao consultado: ${JSON.stringify({ aprox, mudou })}`);
 
   // 6) sincronizar produtos (simulando o precos.json)
   res = await req('POST', '/api/produtos/sync', { produtos: [
@@ -135,16 +468,79 @@ async function main() {
   res = await req('POST', '/api/pedidos', {
     cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' },
     vendedor_nome: 'Michel Russo',
-    itens: [ { codigo_sku: '60863', quantidade: 60, preco_unitario: 28.59 } ],
+    // código com espaço em volta (passa no itensValidos): acha o produto pelo código limpo
+    itens: [ { codigo_sku: ' 60863 ', quantidade: 60, preco_unitario: 28.59 } ],
   });
-  assert(res.status === 201, 'grava segundo pedido');
+  assert(res.status === 201, `grava segundo pedido (código com espaço em volta): ${JSON.stringify(res.body)}`);
 
   // 9) pedido com produto que não existe -> deve falhar com erro claro
   res = await req('POST', '/api/pedidos', {
     cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' },
     itens: [ { codigo_sku: 'CODIGO-INEXISTENTE', quantidade: 1, preco_unitario: 10 } ],
   });
-  assert(res.status === 400 && res.body.erro.includes('não encontrado'), 'rejeita pedido com produto inexistente, com mensagem clara');
+  // 400, não 422: o produto pode chegar depois (sincronização, Lista de Preços nova) e a fila tenta de novo
+  assert(res.status === 400 && res.body.erro.includes('não encontrado'), 'rejeita pedido com produto inexistente, com mensagem clara (400: a fila offline tenta de novo)');
+  // produto promocional criado no Painel (só em configuracoes): entra no pedido, criado na hora
+  mockDb.__setConfiguracao('produtos_promocionais', [{ c: 'P960863', n: 'CORTADOR PROMOCIONAL', familia: 'CORTE' }]);
+  res = await req('POST', '/api/pedidos', {
+    cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' },
+    itens: [ { codigo_sku: 'P960863', quantidade: 2, preco_unitario: 10 } ],
+  });
+  assert(res.status === 201 && mockDb.__getProdutos().some(p => p.codigo_sku === 'P960863' && p.nome === 'CORTADOR PROMOCIONAL'),
+    `pedido com produto promocional do Painel ainda não sincronizado cria o produto: ${JSON.stringify(res.body)}`);
+
+  // 9b) produto novo da Lista de Preços (está em catalogo_precos, ainda não em
+  // produtos - o /api/produtos/sync só roda quando um admin abre o Painel): o
+  // pedido e o levantamento criam o produto a partir do catálogo em vez de
+  // recusar (antes: 400 "não encontrado", e a fila offline reenviava pra sempre)
+  {
+    const tamanhosAntes = [mockDb.__getPedidos(), mockDb.__getPedidoItens(), mockDb.__getLevantamentos(), mockDb.__getLevantamentoItens(), mockDb.__getProdutos()].map(l => [l, l.length]);
+    const linhaCat = (c, nome, familia) => ({ codigo_sku: c, nome, emb: 1, ipi: 0, familia, preco_fixo: false, canais_fx: [], precos: {}, precos_sem_imposto: {} });
+    mockDb.__seed({ catalogoPrecos: [linhaCat('NOVO77', 'ESPATULA NOVA 77', '05 - ESPATULAS'), linhaCat('NOVO78', '  ', null)] });
+    res = await req('POST', '/api/pedidos', {
+      cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' },
+      itens: [{ codigo_sku: 'NOVO77', quantidade: 2, preco_unitario: 15 }],
+    });
+    const p77 = mockDb.__getProdutos().find(p => p.codigo_sku === 'NOVO77');
+    assert(res.status === 201 && p77 && p77.nome === 'ESPATULA NOVA 77' && p77.categoria === '05 - ESPATULAS'
+      && mockDb.__getPedidoItens().some(i => i.pedido_id === res.body.pedido_id && i.produto_id === p77.id),
+      `pedido com produto novo da Lista de Preços cria o produto a partir do catálogo: ${JSON.stringify([res.body, p77])}`);
+    res = await req('POST', '/api/levantamentos', {
+      cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' },
+      itens: [{ codigo_sku: 'NOVO78', quantidade_contada: 0 }],
+    });
+    const p78 = mockDb.__getProdutos().find(p => p.codigo_sku === 'NOVO78');
+    assert(res.status === 201 && p78 && p78.nome === 'NOVO78',
+      `levantamento com produto novo da Lista de Preços cria o produto (sem nome, fica o código): ${JSON.stringify([res.body, p78])}`);
+    {
+      const lev = mockDb.__getLevantamentos().find(l => l.id === res.body.levantamento_id);
+      assert(lev && lev.usuario_id != null, `levantamento grava o usuário logado (dono da visita): ${JSON.stringify(lev)}`);
+    }
+    res = await req('POST', '/api/levantamentos', { cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' }, itens: [{ codigo_sku: 'NAO-EXISTE-1', quantidade_contada: 1 }] });
+    const rLevSemItens = await req('POST', '/api/levantamentos', { cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' }, itens: [] });
+    assert(res.status === 400 && res.body.erro.includes('não encontrado') && rLevSemItens.status === 422,
+      `levantamento com produto que não existe nem no catálogo: 400 (a fila tenta de novo); sem itens: 422 (recusado): ${JSON.stringify([res.body, rLevSemItens.body])}`);
+    // itens inválidos e origem desconhecida: 422 (antes quantidade 0/negativa entrava no histórico)
+    const pedidosAntes = mockDb.__getPedidos().length;
+    const rQtd0 = await req('POST', '/api/pedidos', { cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' }, itens: [{ codigo_sku: '60863', quantidade: 0, preco_unitario: 10 }] });
+    const rQtdNeg = await req('POST', '/api/pedidos', { cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' }, itens: [{ codigo_sku: '60863', quantidade: -3, preco_unitario: 10 }] });
+    const rOrigem = await req('POST', '/api/pedidos', { cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' }, origem: 'faturamento', itens: [{ codigo_sku: '60863', quantidade: 1, preco_unitario: 10 }] });
+    const rSemCliente = await req('POST', '/api/pedidos', { itens: [{ codigo_sku: '60863', quantidade: 1, preco_unitario: 10 }] });
+    assert([rQtd0, rQtdNeg, rOrigem, rSemCliente].every(r => r.status === 422 && r.body.erro) && mockDb.__getPedidos().length === pedidosAntes,
+      `pedido com quantidade 0/negativa, origem desconhecida ou sem cliente: 422 sem gravar: ${JSON.stringify([rQtd0.status, rQtdNeg.status, rOrigem.status, rSemCliente.status])}`);
+    // PDF: código que não está nem no catálogo é criado com a descrição, só no formato aceito
+    const rPdfRuim = await req('POST', '/api/pedidos', { cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' }, origem: 'pdf',
+      itens: [{ codigo_sku: 'AB CD<script>', quantidade: 1, preco_unitario: 10, descricao: 'COISA' }] });
+    const rPdfOk = await req('POST', '/api/pedidos', { cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' }, origem: 'pdf',
+      itens: [{ codigo_sku: 'PDF-901', quantidade: 1, preco_unitario: 10, descricao: 'ITEM DO PDF' }] });
+    assert(rPdfRuim.status === 422 && !mockDb.__getProdutos().some(p => p.codigo_sku === 'AB CD<script>')
+      && rPdfOk.status === 201 && mockDb.__getProdutos().some(p => p.codigo_sku === 'PDF-901' && p.nome === 'ITEM DO PDF'),
+      `pedido de PDF: código novo fora do formato aceito é recusado (422); no formato, criado com a descrição: ${JSON.stringify([rPdfRuim.body, rPdfOk.body])}`);
+    // não sujar o histórico do cliente usado nos testes seguintes (o mock não desfaz
+    // a transação: o pedido/levantamento recusado no meio também fica)
+    for (const [lista, n] of tamanhosAntes) lista.splice(n, Infinity);
+    mockDb.__getCatalogoPrecos().splice(0, Infinity);
+  }
 
   // 10) historico do cliente - deve mostrar 60863 com total 100 (40+60) e 2 pedidos
   res = await req('GET', `/api/clientes/${clienteId}/historico`);
@@ -159,6 +555,31 @@ async function main() {
     itens: [ { codigo_sku: '60863', quantidade_contada: 12 } ],
   });
   assert(res.status === 201 && res.body.levantamento_id, 'grava levantamento com itens');
+  {
+    // cliente_id que não existe mais (cliente mesclado/apagado, cópia velha na fila
+    // offline): acha pelo nome em vez de bater na FK e voltar 400 pra sempre
+    const rSumiu = await req('POST', '/api/levantamentos', {
+      cliente: { cliente_id: 987654, nome: 'João Silva Materiais' },
+      itens: [ { codigo_sku: '60863', quantidade_contada: 1 } ],
+    });
+    assert(rSumiu.status === 201 && rSumiu.body.cliente_id === clienteId,
+      `levantamento com cliente_id que não existe mais cai no cliente pelo nome: ${JSON.stringify(rSumiu.body)}`);
+    // não sujar a contagem de levantamentos do cliente nos testes seguintes
+    mockDb.__getLevantamentos().pop();
+    mockDb.__getLevantamentoItens().pop();
+    // filiais com o mesmo nome (ou nome que não existe): sem saber qual, recusa (422)
+    // em vez de gravar na filial errada ou criar cliente sem CNPJ
+    const nClientes = mockDb.__getClientes().length;
+    mockDb.__getClientes().push({ id: 990001, nome: 'FILIAL IGUAL LTDA', documento: '11111111000101' },
+      { id: 990002, nome: 'FILIAL IGUAL LTDA', documento: '11111111000202' });
+    const rFilial = await req('POST', '/api/levantamentos', {
+      cliente: { cliente_id: 987654, nome: 'Filial Igual Ltda.' }, itens: [ { codigo_sku: '60863', quantidade_contada: 1 } ] });
+    const rNinguem = await req('POST', '/api/levantamentos', {
+      cliente: { cliente_id: 987654, nome: 'Loja Que Não Existe' }, itens: [ { codigo_sku: '60863', quantidade_contada: 1 } ] });
+    assert(rFilial.status === 422 && rNinguem.status === 422 && mockDb.__getClientes().length === nClientes + 2,
+      `cliente_id sumido com nome de 2 filiais ou de ninguém: 422, sem criar cliente: ${JSON.stringify([rFilial.status, rNinguem.status, rNinguem.body])}`);
+    mockDb.__getClientes().splice(nClientes, Infinity);
+  }
 
   // 12) historico de levantamentos do cliente
   res = await req('GET', `/api/clientes/${clienteId}/levantamentos`);
@@ -170,6 +591,62 @@ async function main() {
   res = await req('GET', `/api/levantamentos/${levantamentoIdSalvo}/itens`);
   assert(res.status === 200 && res.body.length === 1 && res.body[0].codigo_sku === '60863' && Number(res.body[0].quantidade_contada) === 12, 'itens de um levantamento salvo podem ser recuperados do servidor');
   assert(typeof res.body[0].quantidade_contada === 'string', 'quantidade_contada vem como string (NUMERIC do Postgres) - front precisa converter com Number(), nunca somar direto');
+
+  // 12b2) "Abrir levantamento" em qualquer aparelho: lista da equipe (30 dias)
+  // com cliente e vendedor; a quantidade de pedido do item vai pro servidor
+  {
+    const rPed = await req('POST', '/api/levantamentos', {
+      cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' },
+      vendedor_nome: 'Outro Vendedor',
+      itens: [{ codigo_sku: '60863', quantidade_contada: 3, quantidade_pedido: 6 }, { codigo_sku: '60863', quantidade_contada: 1, quantidade_pedido: 'x' }],
+    });
+    const rItens = await req('GET', `/api/levantamentos/${rPed.body.levantamento_id}/itens`);
+    assert(rPed.status === 201 && rItens.body.length === 2 && Number(rItens.body[0].quantidade_pedido) === 6 && Number(rItens.body[1].quantidade_pedido) === 0,
+      `levantamento grava a quantidade de pedido do item (valor estranho vira 0): ${JSON.stringify(rItens.body)}`);
+    // salvo de novo no mesmo dia (mesmo cliente e vendedor): só a última versão aparece
+    const rPed2 = await req('POST', '/api/levantamentos', {
+      cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' }, vendedor_nome: 'Outro Vendedor',
+      itens: [{ codigo_sku: '60863', quantidade_contada: 4 }],
+    });
+    const rRec = await req('GET', '/api/levantamentos/recentes');
+    const consulta = mockDb.__queryLog.filter(q => q.sql.includes('levantamentos:recentes')).pop();
+    assert(rRec.status === 200 && rRec.body.length >= 2 && rRec.body[0].id === rPed2.body.levantamento_id
+      && !rRec.body.some(l => l.id === rPed.body.levantamento_id)
+      && rRec.body[0].cliente_nome === 'João Silva Materiais' && rRec.body[0].vendedor === 'Outro Vendedor'
+      && rRec.body.some(l => l.vendedor === 'Michel Russo') && consulta && consulta.params[0] === 30,
+      `levantamentos recentes: equipe inteira, 30 dias, mais novo primeiro, com cliente e vendedor, só a última versão do dia: ${JSON.stringify(rRec.body)}`);
+  }
+
+  // 12c) levantamento com id_envio (gerado no toque em salvar): com sinal fraco o
+  // servidor gravava, a resposta se perdia e o reenvio da fila gravava outro. O
+  // reenvio com o mesmo id devolve o já gravado (200), sem gravar de novo.
+  {
+    mockDb.__seed({ clientes: [{ id: 9701, nome: 'LOJA LEVANTAMENTO DUPLO', documento: '97010000000197' }] });
+    const corpo = { cliente: { cliente_id: 9701, nome: 'LOJA LEVANTAMENTO DUPLO' }, itens: [{ codigo_sku: '60863', quantidade_contada: 4 }], id_envio: 'lev-envio-0001-abcdef' };
+    const r1 = await req('POST', '/api/levantamentos', corpo);
+    const r2 = await req('POST', '/api/levantamentos', corpo);
+    const daLoja = () => mockDb.__getLevantamentos().filter(l => l.cliente_id === 9701);
+    const itensDaLoja = () => mockDb.__getLevantamentoItens().filter(i => daLoja().some(l => l.id === i.levantamento_id));
+    assert(r1.status === 201 && r2.status === 200 && r2.body.levantamento_id === r1.body.levantamento_id && r2.body.mesmo_envio === true
+      && daLoja().length === 1 && itensDaLoja().length === 1,
+      `levantamento: reenvio com o mesmo id_envio devolve o já gravado, sem gravar outro: ${JSON.stringify([r1.body, r2.body])}`);
+    // dois envios ao mesmo tempo (a busca não achou e o INSERT bateu no índice único): devolve o gravado
+    const connectOriginal = mockDb.pool.connect;
+    let escondeu = 0;
+    mockDb.pool.connect = async () => {
+      const c = await connectOriginal();
+      return { ...c, query: async (sql, params) => (sql.includes('levantamento:mesmo-envio') ? (escondeu++, { rows: [] }) : c.query(sql, params)) };
+    };
+    let r3;
+    try { r3 = await req('POST', '/api/levantamentos', corpo); } finally { mockDb.pool.connect = connectOriginal; }
+    const r4 = await req('POST', '/api/levantamentos', { ...corpo, id_envio: 'lev-envio-0002-abcdef' });
+    assert(escondeu === 1 && r3.status === 200 && r3.body.levantamento_id === r1.body.levantamento_id && r4.status === 201 && daLoja().length === 2,
+      `levantamento: corrida no índice único devolve o já gravado; outro id_envio grava outro: ${JSON.stringify([r3.body, r4.status])}`);
+    const html = require('fs').readFileSync(path.join(__dirname, '../index.html'), 'utf8');
+    const salvar = html.slice(html.indexOf('async function saveLevantamento()'), html.indexOf('function openLevOpenModal()'));
+    assert(/id_envio: novoIdEnvio\(\)/.test(salvar) && salvar.indexOf('id_envio') < salvar.indexOf('apiCriarLevantamento(payload)'),
+      'app: o levantamento leva um id_envio gerado no toque em salvar (vai junto pela fila offline)');
+  }
 
   // 13) classificatório: calcula sobre os ÚLTIMOS 12 MESES (régua móvel da
   // Política Comercial rev. 06 - ver routes/clientesClassificatorio.js) -
@@ -191,9 +668,9 @@ async function main() {
   });
   res = await req('GET', '/api/clientes/9001/classificatorio/status');
   assert(
-    res.status === 200 && res.body.faturamento12m === 500000 && res.body.faturamentoFaixa === 500000
-      && res.body.periodoReferencia?.janela === 'ultimos_12_meses' && !res.body.proximaRevisao,
-    'classificatório soma os últimos 12 meses (conta a venda de 200 dias, ignora a de 400 dias)'
+    res.status === 200 && res.body.faturamento12m === 500000 && res.body.faturamentoFaixa === res.body.faturamentoAnoCorrente
+      && res.body.regraFaixa === 'ano_fiscal' && res.body.periodoReferencia?.janela === 'ano_fiscal' && !res.body.proximaRevisao,
+    'classificatório soma os últimos 12 meses (conta a venda de 200 dias, ignora a de 400 dias); a faixa compara o acumulado do ano'
   );
   const esperadoAnoCorrente = dataPC2 >= `${anoFechado + 1}-01-01` ? 500000 : 0;
   assert(
@@ -240,31 +717,39 @@ async function main() {
     `gráfico trimestral mostra a janela móvel recente (tem a venda de 200 dias, não a de 400 dias): ${somaTrimestres}`
   );
 
-  // 14b) Política Comercial rev. 06: a faixa é decidida pelos últimos 12
-  // meses - sobe assim que bater o teto (apuração mensal) e ficar abaixo do
-  // mínimo da própria faixa é risco de queda, sem depender do ritmo
-  // trimestral. Faixas de todos os canais. Teste direto na função pura.
-  const { calcularStatusClassificatorio } = require('../routes/clientesClassificatorio');
-  let s = calcularStatusClassificatorio({ tipo: 'Varejo Premium', faturamento12m: 55000, faturamentoAnoCorrente: 1000, atrasadoNoRitmo: false });
+  // 14b) Faixa pelo ANO FISCAL jan-dez (regra do usuário, 10/2026): em 01/01
+  // só desce, pelo ano fechado; subir é pedido ao gerente quando o acumulado
+  // do ano bate a faixa. Abaixo do mínimo só é risco atrás do ritmo pro ano.
+  // Faixas de todos os canais. Teste direto na função pura.
+  const { calcularStatusClassificatorio, fracaoDoAnoPeloDia, degrausDaFaixa } = require('../routes/clientesClassificatorio');
+  const deg = degrausDaFaixa('Varejo Premium');
+  assert(deg.map(d => `${d.tipo}:${d.min}${d.atual ? '*' : ''}`).join(',') === 'Varejo Exclusive:0,Varejo Premium:30000*,Varejo Master:50000',
+    'degraus da régua do card: as faixas do canal em ordem, com a atual marcada');
+  assert(degrausDaFaixa('Locação').length === 0, 'tipo sem faixa não tem régua');
+  let s = calcularStatusClassificatorio({ tipo: 'Varejo Premium', faturamento12m: 55000, faturamentoAnoCorrente: 26482, atrasadoNoRitmo: false, fracaoDoAno: 0.8 });
   assert(
-    s.jaQualificaProximaFaixa === true && s.faltaPraProximaFaixa == null && s.faturamentoFaixa === 55000,
-    'sobe de faixa quando os últimos 12 meses batem o teto (independe do acumulado do ano)'
+    s.jaQualificaProximaFaixa !== true && s.faltaPraManter === 3518 && s.faltaPraProximaFaixa === 23518 && s.faturamentoFaixa === 26482 && s.emRiscoDeQueda === false,
+    'caso REAL DEPOSITO: 12 meses acima do teto não sobe; vale o acumulado do ano (3.518 pra manter Premium, 23.518 pro Master, no ritmo)'
   );
-  s = calcularStatusClassificatorio({ tipo: 'Varejo Master', faturamento12m: 60000, faturamentoAnoCorrente: 10000, atrasadoNoRitmo: true });
-  assert(s.emRiscoDeQueda === false, 'últimos 12 meses acima do mínimo da faixa não é risco de queda');
-  s = calcularStatusClassificatorio({ tipo: 'Varejo Master', faturamento12m: 40000, faturamentoAnoCorrente: 90000, atrasadoNoRitmo: false });
-  assert(
-    s.emRiscoDeQueda === true && s.faltaPraManter === 10000 && s.faixaAnterior === 'Varejo Premium',
-    'últimos 12 meses abaixo do mínimo (40 mil < 50 mil) é risco de queda: faltam R$10.000'
-  );
-  s = calcularStatusClassificatorio({ tipo: 'Atacado Premium', faturamento12m: 800000 });
+  s = calcularStatusClassificatorio({ tipo: 'Varejo Premium', faturamento12m: 40000, faturamentoAnoCorrente: 51000, fracaoDoAno: 0.5 });
+  assert(s.jaQualificaProximaFaixa === true && s.proximaFaixa === 'Varejo Master', 'acumulado do ano bateu o teto: já dá pra pedir a subida');
+  s = calcularStatusClassificatorio({ tipo: 'Varejo Master', faturamento12m: 60000, faturamentoAnoCorrente: 30000, fracaoDoAno: 0.5 });
+  assert(s.emRiscoDeQueda === false && s.faltaPraManter === 20000 && s.faixaAnterior === 'Varejo Premium', 'abaixo do mínimo no ritmo do ano (30 mil na metade, mínimo 50 mil): falta pra manter, sem risco');
+  s = calcularStatusClassificatorio({ tipo: 'Varejo Master', faturamento12m: 60000, faturamentoAnoCorrente: 30000, fracaoDoAno: 0.8 });
+  assert(s.emRiscoDeQueda === true && s.faltaPraManter === 20000, 'atrás do ritmo pro mínimo (30 mil com 80% do ano) é risco de queda');
+  s = calcularStatusClassificatorio({ tipo: 'Varejo Master', faturamentoAnoCorrente: 0, fracaoDoAno: 10 / 365 });
+  assert(s.emRiscoDeQueda === false && s.faltaPraManter === 50000, 'janeiro sem nota no ano: falta pra manter, mas ainda não é risco (1º trimestre)');
+  s = calcularStatusClassificatorio({ tipo: 'Varejo Master', faturamentoAnoCorrente: 40000 });
+  assert(s.emRiscoDeQueda === true && s.faltaPraManter === 10000, 'sem fração do ano conta como ano inteiro');
+  s = calcularStatusClassificatorio({ tipo: 'Atacado Premium', faturamentoAnoCorrente: 800000 });
   assert(s.faltaPraProximaFaixa === 200000 && s.proximaFaixa === 'Atacado Master', 'Atacado Premium com 800 mil: faltam 200 mil pra Master (1 milhão)');
-  s = calcularStatusClassificatorio({ tipo: 'E-Commerce Exclusive', faturamento12m: 150000 });
+  s = calcularStatusClassificatorio({ tipo: 'E-Commerce Exclusive', faturamentoAnoCorrente: 150000 });
   assert(s.faltaPraProximaFaixa === 50000 && s.proximaFaixa === 'E-commerce Premium', 'E-commerce Exclusive com 150 mil: faltam 50 mil pra Premium (nome do ERP com outra grafia resolve a faixa)');
-  s = calcularStatusClassificatorio({ tipo: 'Home Center Premium', faturamento12m: 100000 });
-  assert(s.emRiscoDeQueda === true && s.faltaPraManter === 20000, 'Home Center Premium abaixo de 120 mil é risco de queda');
-  s = calcularStatusClassificatorio({ tipo: 'Locação', faturamento12m: 5000 });
+  s = calcularStatusClassificatorio({ tipo: 'Home Center Premium', faturamentoAnoCorrente: 100000 });
+  assert(s.emRiscoDeQueda === true && s.faltaPraManter === 20000, 'Home Center Premium abaixo de 120 mil no fim do ano é risco de queda');
+  s = calcularStatusClassificatorio({ tipo: 'Locação', faturamentoAnoCorrente: 5000 });
   assert(s.classificado === true && s.semFaixaDefinida === true, 'Locação (Institucional) é fixo, sem faixa');
+  assert(fracaoDoAnoPeloDia(183, 2026) === 183 / 365 && fracaoDoAnoPeloDia(366, 2028) === 1 && fracaoDoAnoPeloDia(null, 2026) === null, 'fracaoDoAnoPeloDia: dia do ano / dias do ano (bissexto), sem dia = null');
   s = calcularStatusClassificatorio({ tipo: 'Varejo Master', pic: true, vlAcordo: 80000, faturamento12m: 90000, faturamentoAnoCorrente: 30000, atrasadoNoRitmo: true });
   assert(s.faltaPraMeta === 50000 && s.emRiscoDeQueda === true && s.faturamentoFaixa === 30000, 'meta individual (PIC) continua contra o acumulado do ano, com risco pelo ritmo');
 
@@ -411,8 +896,9 @@ async function main() {
   // planilha com um cliente normal (objetivo importado e calculado), um
   // cliente Rede (pulado - RDA/Rede fora de escopo por enquanto) e uma
   // linha com nome não reconhecido (aparece no resumo de erro).
+  // período que ainda não acabou (objetivo de trimestre já encerrado vai à parte, abaixo)
   const periodoObjInicio = `${anoFechado + 1}-01-01`;
-  const periodoObjFim = `${anoFechado + 1}-03-31`;
+  const periodoObjFim = `${anoFechado + 2}-03-31`;
   mockDb.__seed({
     clientes: [{
       id: 9008, nome: 'CLIENTE OBJETIVO TESTE', documento: '99988877000788', codigo_oficial: 'COD9008',
@@ -442,6 +928,19 @@ async function main() {
     `faltaPObjetivo calcula objetivo (8.000) menos entrada no período (5.000) = 3.000: ${JSON.stringify({ objetivoTrimestral: res.body.objetivoTrimestral, entradaTrimestral: res.body.entradaTrimestral, faltaPObjetivo: res.body.faltaPObjetivo })}`
   );
 
+  // Objetivo de um trimestre que já acabou (os do trimestre novo não foram
+  // importados): não aparece como "objetivo do trimestre", só como resultado.
+  res = await req('POST', '/api/clientes/classificatorio/objetivos-trimestrais/importar', {
+    periodoInicio: '2020-01-01', periodoFim: '2020-03-31',
+    itens: [{ matriz: 'CLIENTE OBJETIVO TESTE', objetivo: 8000 }],
+  });
+  res = await req('GET', '/api/clientes/9008/classificatorio/status');
+  assert(
+    res.status === 200 && res.body.faltaPObjetivo == null && res.body.objetivoTrimestral == null
+      && res.body.objetivoEncerrado?.periodoFim === '2020-03-31' && res.body.objetivoEncerrado?.objetivo === 8000,
+    `objetivo de trimestre encerrado vai em objetivoEncerrado, sem "faltam": ${JSON.stringify({ falta: res.body.faltaPObjetivo, enc: res.body.objetivoEncerrado })}`
+  );
+
   // cliente Rede (9005) não recebeu objetivo (foi pulado no import) -
   // faltaPObjetivo deve ficar ausente/null, convivendo sem quebrar a rota.
   res = await req('GET', '/api/clientes/9005/classificatorio/status');
@@ -449,6 +948,166 @@ async function main() {
     res.status === 200 && res.body.faltaPObjetivo == null,
     'cliente Rede pulado no import não recebe objetivo trimestral (faltaPObjetivo ausente)'
   );
+
+  // 15c) Planilha Classificatório do ERP com data (nome do arquivo): troca a
+  // faixa parada do cliente (antes só preenchia quem não tinha nenhuma - 22
+  // clientes ficaram com a faixa errada por isso) e grava a foto financeira
+  // oficial, que a rota de status devolve em `erp` pro card da aba Clientes.
+  mockDb.__seed({
+    clientes: [{
+      id: 9060, nome: 'CLIENTE PLANILHA ERP', documento: '11222333000181', codigo_oficial: 'COD9060',
+      classificatorio_tipo: 'Varejo Exclusive', classificatorio_desconto: 15, classificatorio_atualizado_em: '2024-07-24',
+      classificatorio_pic: false, classificatorio_vl_acordo: null, matriz_grupo: null,
+    }],
+  });
+  const linhaPlanilhaErp = {
+    codigoOficial: 'COD9060', cnpj: '11.222.333/0001-81', matrizGrupo: 'ROTTA MATERIAIS DE CONSTRUCAO LTDA',
+    classificatorioTipo: 'Varejo Premium', classificatorioDesconto: 17, pic: false, vlAcordo: null,
+    fatAnoAnterior: 35832.56, fatAcumulado: 26856.48, fat12mCliente: 15677.37, fat12mMatriz: 39122.52, diferenca: 10877.47,
+    gestor: 'VILMAR HEDLER JUNIOR', situacao: 'Ativo', cidade: 'Mambore', uf: 'PR', clienteDesde: '2009-07-01', ultimaCompra: '2026-07-27',
+  };
+  res = await req('POST', '/api/clientes/classificatorio/importar', { dataRelatorio: '2026-10-02', apuradoAte: '2026-08-31', itens: [linhaPlanilhaErp] });
+  assert(res.status === 200 && res.body.atualizados === 1, `import da planilha Classificatório com data: ${JSON.stringify(res.body)}`);
+  res = await req('GET', '/api/clientes/9060/classificatorio/status');
+  const erp = res.body.erp || {};
+  assert(
+    res.status === 200 && res.body.tipo === 'Varejo Premium' && res.body.matrizGrupo === 'ROTTA MATERIAIS DE CONSTRUCAO LTDA',
+    `planilha mais nova troca a faixa parada (Exclusive de 2024 -> Premium): ${res.body.tipo}`
+  );
+  assert(
+    erp.dataRelatorio === '2026-10-02' && erp.apuradoAte === '2026-08-31' && erp.fat12mCliente === 15677.37
+      && erp.fat12mMatriz === 39122.52 && erp.fatAnoAnterior === 35832.56 && erp.fatAcumulado === 26856.48
+      && erp.ultimaCompra === '2026-07-27' && erp.clienteDesde === '2009-07-01' && erp.cidade === 'Mambore' && erp.gestor === 'VILMAR HEDLER JUNIOR'
+      && erp.leituraDiferenca?.situacao === 'subir' && erp.leituraDiferenca.falta === 10877.47 && erp.leituraDiferenca.proximaFaixa === 'Varejo Master'
+      && erp.fat12mOutrasEmpresas === 23445.15,
+    `status devolve a foto oficial da planilha (números iguais aos dela): ${JSON.stringify(erp)}`
+  );
+  // "Ult.Compra" da planilha para na apuração do ERP (31/08): faturado depois
+  // dela, que o app já importou, vai em ultimaCompraApp pro card mostrar
+  mockDb.__getPedidosOficiaisItens().push({ nr_pedido: 'PERP60', codigo_sku: '60863', cliente_codigo_oficial: 'COD9060', quantidade: 1, valor: 100, data_faturamento: '2026-09-16', data_implantacao: '2026-09-10', status: 'faturado' });
+  res = await req('GET', '/api/clientes/9060/classificatorio/status');
+  assert(
+    res.status === 200 && res.body.erp?.ultimaCompra === '2026-07-27' && res.body.erp?.ultimaCompraApp === '2026-09-16',
+    `última compra faturada depois da apuração do ERP vem junto da da planilha: ${JSON.stringify({ erp: res.body.erp?.ultimaCompra, app: res.body.erp?.ultimaCompraApp })}`
+  );
+  mockDb.__getPedidosOficiaisItens().pop();
+
+  // "Sem comprar há 60+ dias" conta pelo último PEDIDO: nota de 100 dias atrás
+  // entra no alerta; pedido implantado há 3 dias (em carteira, sem nota) tira
+  const diaAtras = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+  const itens9060 = mockDb.__getPedidosOficiaisItens();
+  itens9060.push({ nr_pedido: 'PSC60', codigo_sku: '60863', cliente_codigo_oficial: 'COD9060', quantidade: 1, valor: 100, data_faturamento: diaAtras(100), data_implantacao: diaAtras(105), status: 'faturado', nota_fiscal: 'NSC60' });
+  res = await req('GET', '/api/clientes/classificatorio/alertas');
+  const sem9060 = (res.body.semComprarRecente || []).find(c => c.id === 9060);
+  assert(sem9060 && sem9060.diasSemComprar >= 99 && sem9060.diasSemComprar <= 101,
+    `nota de 100 dias atrás e nenhum pedido depois: entra em "sem comprar há 60+ dias": ${JSON.stringify(sem9060 && sem9060.diasSemComprar)}`);
+  itens9060.push({ nr_pedido: 'PSC61', codigo_sku: '60863', cliente_codigo_oficial: 'COD9060', quantidade: 1, valor: 100, data_faturamento: null, data_implantacao: diaAtras(3), status: 'carteira' });
+  res = await req('GET', '/api/clientes/classificatorio/alertas');
+  assert(!(res.body.semComprarRecente || []).some(c => c.id === 9060),
+    'pedido em carteira implantado há 3 dias tira o cliente de "sem comprar há 60+ dias"');
+  res = await req('GET', '/api/clientes/9060/classificatorio/status');
+  assert(res.body.ultimoPedido === diaAtras(3), `status devolve o último pedido como AAAA-MM-DD: ${res.body.ultimoPedido}`);
+  itens9060.splice(itens9060.findIndex(it => it.nr_pedido === 'PSC60'), 2);
+
+  // relatório mais antigo não desfaz nem a faixa nem a foto - nem matriz, PIC e valor de acordo
+  res = await req('POST', '/api/clientes/classificatorio/importar', {
+    dataRelatorio: '2026-09-01', apuradoAte: '2026-07-31',
+    itens: [{ ...linhaPlanilhaErp, classificatorioTipo: 'Varejo Exclusive', classificatorioDesconto: 15, fat12mCliente: 1, pic: true, vlAcordo: 99999, matrizGrupo: 'MATRIZ ANTIGA' }],
+  });
+  res = await req('GET', '/api/clientes/9060/classificatorio/status');
+  const c9060 = mockDb.__getClientes().find(c => c.id === 9060);
+  assert(
+    res.body.tipo === 'Varejo Premium' && res.body.erp?.fat12mCliente === 15677.37 && res.body.erp?.dataRelatorio === '2026-10-02',
+    'planilha Classificatório mais antiga não volta a faixa nem a foto financeira'
+  );
+  assert(c9060.classificatorio_pic === false && c9060.classificatorio_vl_acordo == null && c9060.matriz_grupo === 'ROTTA MATERIAIS DE CONSTRUCAO LTDA',
+    `planilha Classificatório mais antiga não volta PIC, valor de acordo nem matriz: ${JSON.stringify(c9060)}`);
+  // a do mesmo dia (ou mais nova) troca
+  res = await req('POST', '/api/clientes/classificatorio/importar', {
+    dataRelatorio: '2026-10-02', apuradoAte: '2026-08-31', itens: [{ ...linhaPlanilhaErp, pic: true, vlAcordo: 5000 }],
+  });
+  assert(c9060.classificatorio_pic === true && Number(c9060.classificatorio_vl_acordo) === 5000,
+    `planilha Classificatório do mesmo dia troca PIC e valor de acordo: ${JSON.stringify(c9060)}`);
+  await req('POST', '/api/clientes/classificatorio/importar', { dataRelatorio: '2026-10-02', apuradoAte: '2026-08-31', itens: [linhaPlanilhaErp] });
+  c9060.classificatorio_vl_acordo = null;
+  // sem data (formato antigo do import): não troca faixa existente nem grava foto
+  mockDb.__seed({
+    clientes: [{ id: 9061, nome: 'CLIENTE SEM DATA', documento: '11222333000262', codigo_oficial: 'COD9061', classificatorio_tipo: 'Varejo Master', classificatorio_desconto: 20, classificatorio_pic: false }],
+  });
+  res = await req('POST', '/api/clientes/classificatorio/importar', { itens: [{ ...linhaPlanilhaErp, codigoOficial: 'COD9061', cnpj: null, classificatorioTipo: 'Varejo Exclusive' }] });
+  res = await req('GET', '/api/clientes/9061/classificatorio/status');
+  assert(res.body.tipo === 'Varejo Master' && res.body.erp == null, 'import sem data do relatório mantém a faixa e não grava foto');
+
+  // Alertas: o 9060 não tem venda no app (ao vivo = R$0, abaixo do mínimo
+  // do Premium), mas a matriz dele no ERP tem R$ 23.445 de outras empresas
+  // fora do app - o ERP diz que faltam R$ 10.877 pra SUBIR, não que vai cair.
+  // O 9061 (sem foto do ERP) continua pela conta ao vivo.
+  res = await req('GET', '/api/clientes/classificatorio/alertas');
+  const emRisco = (res.body.riscoDeQueda || []).map(c => c.id);
+  assert(
+    res.status === 200 && !emRisco.includes(9060) && emRisco.includes(9061),
+    `alertas: matriz com empresas fora do app usa o veredito do ERP (9060 fora do risco), sem foto continua ao vivo (9061 em risco): ${JSON.stringify(emRisco)}`
+  );
+  const { aplicarLeituraErp } = require('../routes/clientesClassificatorio');
+  let sErp = aplicarLeituraErp({ tipo: 'Varejo Premium', emRiscoDeQueda: true, faltaPraManter: 30000, faixaMin: 0, faixaMax: 30000 },
+    { situacao: 'subir', falta: 10877.47, proximaFaixa: 'Varejo Master' });
+  assert(
+    sErp.emRiscoDeQueda === false && sErp.faltaPraManter == null && sErp.faltaPraProximaFaixa === 10877.47
+      && sErp.proximaFaixa === 'Varejo Master' && sErp.faixaMax == null && sErp.fonteFaixa === 'erp',
+    'aplicarLeituraErp troca "vai cair" ao vivo por "falta pra subir" oficial e tira a barra'
+  );
+  sErp = aplicarLeituraErp({ tipo: 'Varejo Master', emRiscoDeQueda: false, faltaPraProximaFaixa: null },
+    { situacao: 'manter', falta: 4000, faixaAnterior: 'Varejo Premium' });
+  assert(sErp.emRiscoDeQueda === true && sErp.faltaPraManter === 4000 && sErp.faixaAnterior === 'Varejo Premium', 'aplicarLeituraErp: ERP abaixo do mínimo vira risco de queda');
+
+  // Conciliação ERP × app no status: apuração do ERP fechada há 30 dias.
+  // A = venda depois da apuração (app conta, ERP ainda não); B = venda que o
+  // ERP ainda conta e o app já tirou da janela de 12 meses; C = nos dois.
+  // ERP = B + C - 50 (devolução lançada só no ERP) -> "outras" = -50.
+  {
+    const iso = d => d.toISOString().slice(0, 10);
+    const diasAtras = n => { const d = new Date(); d.setUTCDate(d.getUTCDate() - n); return iso(d); };
+    const apurado = diasAtras(30);
+    const ap = new Date(apurado + 'T00:00:00Z');
+    const dataB = iso(new Date(Date.UTC(ap.getUTCFullYear() - 1, ap.getUTCMonth(), ap.getUTCDate() + 6)));
+    mockDb.__seed({
+      clientes: [{ id: 9062, nome: 'CLIENTE CONCILIACAO', documento: '11222333000343', codigo_oficial: 'COD9062',
+        classificatorio_tipo: 'Varejo Master', classificatorio_desconto: 20, classificatorio_pic: false, matriz_grupo: null }],
+      pedidosOficiaisItens: [
+        { nr_pedido: 'CA1', codigo_sku: '60863', cliente_codigo_oficial: 'COD9062', quantidade: 1, valor: 1000, data_faturamento: diasAtras(10), status: 'faturado' },
+        { nr_pedido: 'CB1', codigo_sku: '60863', cliente_codigo_oficial: 'COD9062', quantidade: 1, valor: 700, data_faturamento: dataB, status: 'faturado' },
+        { nr_pedido: 'CC1', codigo_sku: '60863', cliente_codigo_oficial: 'COD9062', quantidade: 1, valor: 5000, data_faturamento: diasAtras(100), status: 'faturado' },
+      ],
+    });
+    res = await req('POST', '/api/clientes/classificatorio/importar', {
+      dataRelatorio: diasAtras(0), apuradoAte: apurado,
+      itens: [{ codigoOficial: 'COD9062', classificatorioTipo: 'Varejo Master', classificatorioDesconto: 20, fat12mCliente: 5650, fat12mMatriz: 5650, fatAcumulado: null }],
+    });
+    res = await req('GET', '/api/clientes/9062/classificatorio/status');
+    const doze = res.body.erp?.conciliacao?.doze;
+    assert(
+      doze && doze.app === 6000 && doze.depoisApuracao === 1000 && doze.foraDaJanelaApp === 700 && doze.erp === 5650 && doze.outras === -50
+        && res.body.erp.conciliacao.periodoErp.fim === apurado,
+      `conciliação ERP × app: app 6.000 - 1.000 (depois da apuração) + 700 (ERP ainda conta) - 50 (outras) = ERP 5.650: ${JSON.stringify(res.body.erp?.conciliacao)}`
+    );
+  }
+
+  // Leitura da coluna "Diferenca" (conferida contra a planilha real de 02/10/2026)
+  const { interpretarDiferencaErp } = require('../routes/clientesClassificatorio');
+  let ld = interpretarDiferencaErp({ tipo: 'Varejo Premium', fat12mMatriz: 21438.53, diferenca: 8561.47 });
+  assert(ld.situacao === 'manter' && ld.falta === 8561.47 && ld.faixaAnterior === 'Varejo Exclusive', 'Premium abaixo de 30 mil: Diferenca = falta pra manter Premium');
+  ld = interpretarDiferencaErp({ tipo: 'Varejo Master', fat12mMatriz: 7339.93, diferenca: 42660.07 });
+  assert(ld.situacao === 'manter' && ld.falta === 42660.07, 'Master abaixo de 50 mil: Diferenca = falta pra manter Master');
+  ld = interpretarDiferencaErp({ tipo: 'Varejo Exclusive', fat12mMatriz: 5636.36, diferenca: 24363.63 });
+  assert(ld.situacao === 'subir' && ld.proximaFaixa === 'Varejo Premium', 'Exclusive: Diferenca = falta pra subir pra Premium');
+  ld = interpretarDiferencaErp({ tipo: 'Varejo Exclusive', fat12mMatriz: 30197.44, diferenca: null });
+  assert(ld.situacao === 'qualifica' && ld.proximaFaixa === 'Varejo Premium', 'Exclusive acima de 30 mil sem Diferenca: já qualifica pra Premium');
+  ld = interpretarDiferencaErp({ tipo: 'Varejo Master', fat12mMatriz: 80000, diferenca: null });
+  assert(ld.situacao === 'topo', 'Master acima de 50 mil: faixa máxima');
+  ld = interpretarDiferencaErp({ tipo: 'Varejo Premium', pic: true, vlAcordo: 30000, fat12mMatriz: 23774.73, diferenca: 6225.27 });
+  assert(ld.situacao === 'meta' && ld.falta === 6225.27 && ld.meta === 30000, 'PIC: Diferenca = falta pra meta do acordo');
+  assert(interpretarDiferencaErp({ tipo: 'Varejo Master', pic: true, vlAcordo: 90000, fat12mMatriz: 80237, diferenca: null }) === null, 'PIC sem Diferenca: não afirma nada');
+  assert(interpretarDiferencaErp({ tipo: 'Rede', fat12mMatriz: 6170157.91, diferenca: null }) === null, 'Rede não tem faixa');
 
   // 16) GET /api/dashboard/resumo: os cartões "Contas - 3 a 5/6 a 8 Meses Sem
   // Compra" precisam trazer a LISTA de clientes (não só a contagem), pra dar
@@ -477,6 +1136,20 @@ async function main() {
     `dashboard/resumo traz a lista de clientes de 3-5 meses sem comprar, com nome e dias: ${JSON.stringify(listaDe3a5)}`
   );
 
+  // 16a) "Hoje" é o dia de Brasília (o banco roda em UTC: das 21h à meia-noite
+  // CURRENT_DATE já é amanhã) - faturamento semanal/trimestral, top clientes do
+  // Dashboard e as janelas do classificatório (12 meses, ano, trimestre)
+  {
+    const inicioLog = mockDb.__queryLog.length;
+    await req('GET', '/api/dashboard/resumo');
+    await req('GET', '/api/clientes/9001/classificatorio/status');
+    await req('GET', '/api/clientes/classificatorio/alertas');
+    const sqls = mockDb.__queryLog.slice(inicioLog).map(q => q.sql);
+    const comHoje = sqls.filter(q => /date_trunc\('(week|quarter)', data_faturamento\)|GROUP BY c\.id, c\.nome|faturamento_12m|trimestre_atual_idx|date_trunc\('quarter', poi\.data_implantacao\)/.test(q));
+    assert(comHoje.length >= 6 && comHoje.every(q => q.includes("now() AT TIME ZONE 'America/Sao_Paulo'")) && !sqls.some(q => q.includes('CURRENT_DATE')),
+      `dashboard e classificatório contam "hoje" pelo dia de Brasília, não pelo CURRENT_DATE (UTC): ${sqls.filter(q => q.includes('CURRENT_DATE')).map(q => q.slice(0, 120)).join(' | ')}`);
+  }
+
   // 16b) GET /api/dashboard/resumo: "Valor Entrada de Pedidos" segue a regra
   // do painel oficial - mês pela data de implantação, carteira + faturado, e
   // sem a série de pedidos de 7 dígitos. Pedido implantado no mês passado e
@@ -497,6 +1170,41 @@ async function main() {
   assert(
     res.status === 200 && entradaMes && entradaMes.valor === 1500 && entradaMes.pedidos === 2 && entradaMes.clientes === 2,
     `entrada de pedidos do mês = implantados no mês (carteira + faturado), sem série de 7 dígitos: ${JSON.stringify(res.body.mensal)}`
+  );
+
+  // 16b2) A série mensal vem com os 12 meses, terminando no mês atual, e mês
+  // sem pedido vem zerado. Antes só vinham os meses com pedido e a tela pegava
+  // a última linha como "o mês": no dia 1º, sem pedido importado ainda, o
+  // Dashboard mostrava os números do mês passado como se fossem do atual.
+  const serieMensal = res.body.mensal || [];
+  const mesesEsperados = Array.from({ length: 12 }, (_, i) =>
+    new Date(Date.UTC(hojeUtc.getUTCFullYear(), hojeUtc.getUTCMonth() - 11 + i, 1)).toISOString().slice(0, 10));
+  assert(
+    JSON.stringify(serieMensal.map(m => String(m.periodo).slice(0, 10))) === JSON.stringify(mesesEsperados)
+      && serieMensal.some(m => Number(m.valor) === 0 && Number(m.pedidos) === 0),
+    `série mensal = 12 meses seguidos terminando no atual, mês sem pedido zerado: ${JSON.stringify(serieMensal)}`
+  );
+
+  // 16b3) A comparação do cartão é com o mês anterior só até o mesmo dia de
+  // hoje: pedido do dia 1º do mês passado entra; do último dia (depois de
+  // hoje, exceto no dia 28+) não.
+  const diaHoje = hojeUtc.getUTCDate();
+  const ultimoDiaMesAnterior = new Date(Date.UTC(hojeUtc.getUTCFullYear(), hojeUtc.getUTCMonth(), 0)).getUTCDate();
+  const ateEsperado = new Date(Date.UTC(hojeUtc.getUTCFullYear(), hojeUtc.getUTCMonth() - 1, Math.min(diaHoje, ultimoDiaMesAnterior))).toISOString().slice(0, 10);
+  const fimMesAnteriorISO = new Date(Date.UTC(hojeUtc.getUTCFullYear(), hojeUtc.getUTCMonth(), 0)).toISOString().slice(0, 10);
+  mockDb.__seed({
+    pedidosOficiaisItens: [
+      { nr_pedido: '690003', codigo_sku: '1', cliente_codigo_oficial: 'E5', quantidade: 1, valor: 300, data_implantacao: fimMesAnteriorISO, data_faturamento: null, status: 'carteira' },
+    ],
+  });
+  res = await req('GET', '/api/dashboard/resumo');
+  const mesmoPeriodo = res.body.entradaMesAnteriorAteHoje;
+  // 9000 = pedido 690001 do dia 1º do mês passado (16b); 300 = último dia do
+  // mês passado, que só entra quando hoje já é esse dia ou depois.
+  const esperadoMesmoPeriodo = 9000 + (fimMesAnteriorISO <= ateEsperado ? 300 : 0);
+  assert(
+    res.status === 200 && mesmoPeriodo && String(mesmoPeriodo.ate).slice(0, 10) === ateEsperado && Number(mesmoPeriodo.valor) === esperadoMesmoPeriodo,
+    `entrada do mês anterior até o mesmo dia de hoje (${ateEsperado}) = ${esperadoMesmoPeriodo}: ${JSON.stringify(mesmoPeriodo)}`
   );
 
   // 16c) ...e a lista que abre ao tocar no cartão traz esses mesmos pedidos,
@@ -612,6 +1320,418 @@ async function main() {
   res = await req('GET', '/api/clientes/999999/comprados-recentes');
   assert(res.status === 404, 'comprados-recentes de cliente inexistente responde 404');
 
+  // 18b1) Dia do pedido do app no fuso de Brasília (routes/lib/comprasApp.js
+  // sqlDiaDoPedido): pedido com hora real vai pro dia de Brasília; o de PDF/faturamento,
+  // gravado só com a data (meia-noite UTC), fica no dia gravado. Nenhuma rota corta
+  // data_pedido direto no fuso do banco (UTC).
+  {
+    const { sqlDiaDoPedido } = require('../routes/lib/comprasApp');
+    const expr = sqlDiaDoPedido('p3');
+    const fs = require('fs');
+    const cortesDiretos = ['relatorios.js', 'recompra.js', 'pedidos.js']
+      .filter(f => /data_pedido\)?::date(?!\s+(?:ELSE|END))|DATE\(\w+\.data_pedido\)/.test(fs.readFileSync(require('path').join(__dirname, '../routes', f), 'utf8')));
+    // "meia-noite"/"dia gravado" lidos em UTC explícito, não no fuso da sessão do banco
+    assert(/\(p3\.data_pedido AT TIME ZONE 'UTC'\)::time = '00:00:00' THEN \(p3\.data_pedido AT TIME ZONE 'UTC'\)::date ELSE \(p3\.data_pedido AT TIME ZONE 'America\/Sao_Paulo'\)::date/.test(expr)
+      && cortesDiretos.length === 0,
+      `dia do pedido do app no fuso de Brasília (só-data à meia-noite UTC fica como está); nenhuma rota corta data_pedido em UTC: ${JSON.stringify([expr, cortesDiretos])}`);
+
+    // Pelas rotas: pedido fechado às 22h30 de Brasília (01:30 UTC do dia D) é do
+    // dia D-1; o de PDF gravado só com a data D (meia-noite UTC) fica em D.
+    const D = diasAtrasISO(20), D1 = diasAtrasISO(21);
+    mockDb.__seed({
+      produtos: [{ id: 851, codigo_sku: '70011', nome: 'DESEMPENADEIRA FUSO', categoria: '20' }],
+      clientes: [{ id: 9121, nome: 'LOJA FUSO', documento: '11122233000306', codigo_oficial: null }],
+      pedidos: [
+        { id: 9781, cliente_id: 9121, origem: 'app', data_pedido: `${D}T01:30:00.123Z` },
+        { id: 9782, cliente_id: 9121, origem: 'pdf', data_pedido: `${D}T00:00:00.000Z` },
+        { id: 9784, cliente_id: 9121, origem: 'app', data_pedido: `${D1}T15:00:00.000Z` },
+      ],
+      pedidoItens: [
+        { id: 9791, pedido_id: 9781, produto_id: 851, quantidade: 2, preco_unitario: 10 },
+        { id: 9792, pedido_id: 9782, produto_id: 851, quantidade: 3, preco_unitario: 10 },
+        { id: 9794, pedido_id: 9784, produto_id: 851, quantidade: 4, preco_unitario: 10 },
+      ],
+    });
+    // duplicados: 9781 e 9784 são do mesmo dia em Brasília (D-1); o PDF de D,
+    // que no dia UTC cairia junto com 9781, fica de fora
+    res = await req('GET', '/api/pedidos/duplicados');
+    const dupFuso = (res.body || []).filter(p => p.cliente_id === 9121).map(p => `${p.pedido_id}@${p.dia}`).sort();
+    assert(res.status === 200 && JSON.stringify(dupFuso) === JSON.stringify([`9781@${D1}`, `9784@${D1}`]),
+      `duplicados agrupa pelo dia de Brasília (campo dia vem do servidor): ${JSON.stringify(dupFuso)}`);
+    // exportar: período pelo dia de Brasília, mais novo primeiro pelo dia (o PDF
+    // de D vem antes do pedido das 22h30 de D-1, mesmo gravado "antes" em UTC)
+    res = await req('GET', `/api/pedidos/exportar?inicio=${D1}&fim=${D}`);
+    const expFuso = (res.body || []).filter(r => r.codigo_sku === '70011').map(r => `${r.quantidade}@${r.dia}`);
+    const expSoD1 = await req('GET', `/api/pedidos/exportar?inicio=${D1}&fim=${D1}`);
+    assert(res.status === 200 && JSON.stringify(expFuso) === JSON.stringify([`3@${D}`, `2@${D1}`, `4@${D1}`])
+      && JSON.stringify((expSoD1.body || []).filter(r => r.codigo_sku === '70011').map(r => r.quantidade)) === '[2,4]',
+      `exportar filtra e ordena pelo dia de Brasília: ${JSON.stringify([expFuso, expSoD1.body])}`);
+    // comprados-recentes: última compra é a do PDF (D, 3 un.), 2 compras em dias diferentes
+    // (no dia UTC, 9781 cairia em D junto com o PDF e a última compra seria 5)
+    res = await req('GET', '/api/clientes/9121/comprados-recentes');
+    const cr = (res.body || [])[0];
+    assert(res.status === 200 && cr && cr.qtd_ultima_compra === 3 && cr.num_pedidos === 3,
+      `comprados-recentes usa o dia de Brasília do pedido do app: ${JSON.stringify(res.body)}`);
+  }
+
+  // 18b1b) Pedido fechado/alterado sem internet: o app manda a hora do toque e a
+  // hora do envio (carimbada em cada envio, inclusive o da fila); o servidor
+  // desconta essa espera do relógio dele - o relógio errado do celular não entra.
+  {
+    const { horaDoPedidoDoApp } = require('../routes/pedidos');
+    const agora = new Date('2026-10-05T15:00:00Z');
+    const casos = [
+      horaDoPedidoDoApp('2026-10-04T23:40:00.000Z', '2026-10-05T13:40:00.000Z', agora), // esperou 14h na fila
+      horaDoPedidoDoApp('2026-10-03T10:00:00.000Z', '2026-10-03T10:00:00.200Z', agora), // celular 2 dias atrasado, enviado na hora: agora
+      horaDoPedidoDoApp('2026-10-05T12:00:00-03:00', '2026-10-05T13:00:00-03:00', agora), // com offset
+      horaDoPedidoDoApp('2026-10-05T12:00', '2026-10-05T13:00', agora),                 // sem fuso: não
+      horaDoPedidoDoApp('2026-10-04T23:40:00.000Z', undefined, agora),                  // sem hora do envio: não
+      horaDoPedidoDoApp('2026-08-01T12:00:00.000Z', '2026-10-05T12:00:00.000Z', agora), // esperou mais de 30 dias: não
+      horaDoPedidoDoApp('2026-10-05T12:00:00.000Z', '2026-10-05T11:00:00.000Z', agora), // enviado "antes" do toque: não
+      horaDoPedidoDoApp('2026-10-04', '2026-10-05', agora), horaDoPedidoDoApp(12345, 'x', agora),
+      // cairia na meia-noite UTC exata ("só a data"): 1 ms antes
+      horaDoPedidoDoApp('2026-10-05T10:00:00.000Z', '2026-10-05T19:00:00.000Z', new Date('2026-10-06T09:00:00.000Z')),
+    ];
+    assert(JSON.stringify(casos) === JSON.stringify(['2026-10-05T01:00:00.000Z', '2026-10-05T14:59:59.800Z', '2026-10-05T14:00:00.000Z',
+      null, null, null, null, null, null, '2026-10-05T23:59:59.999Z']),
+      `horaDoPedidoDoApp desconta a espera do relógio do servidor: ${JSON.stringify(casos)}`);
+
+    const h = (ms) => new Date(Date.now() + ms).toISOString();
+    const item = [{ codigo_sku: '70011', quantidade: 1, preco_unitario: 10 }];
+    const postar = (extra) => req('POST', '/api/pedidos', { cliente: { cliente_id: 9121, nome: 'LOJA FUSO' }, itens: item, ...extra });
+    const r1 = await postar({ data_pedido: h(-26 * 3600000), enviado_em: h(0) });              // 26h na fila
+    const r2 = await postar({ data_pedido: h(-2 * 86400000), enviado_em: h(-2 * 86400000 + 100) }); // relógio 2 dias atrás, na hora
+    const r3 = await postar({ data_pedido: h(-3600000) });                                     // sem hora do envio
+    const r4 = await postar({ data_pedido: '2026-08-01', origem: 'pdf' });                      // PDF: a data dele
+    const gravado = (r) => mockDb.__getPedidos().find(p => p.id === r.body.pedido_id);
+    const perto = (iso, ms) => Math.abs(new Date(iso).getTime() - (Date.now() + ms)) < 5000;
+    const alt = await req('PATCH', `/api/pedidos/${r1.body.pedido_id}`, { itens: [{ ...item[0], quantidade: 2 }], alterado_em: h(-5 * 3600000), enviado_em: h(0) });
+    assert(r1.status === 201 && perto(gravado(r1).data_pedido, -26 * 3600000) && perto(gravado(r2).data_pedido, 0)
+      && perto(gravado(r3).data_pedido, 0) && gravado(r4).data_pedido === '2026-08-01T00:00:00.000Z'
+      && alt.status === 200 && perto(gravado(r1).atualizado_em, -5 * 3600000),
+      `pedido/alteração do app grava a hora do toque no relógio do servidor (fila offline): ${JSON.stringify([r1, r2, r3, r4].map(r => gravado(r)?.data_pedido).concat(alt.status, gravado(r1)?.atualizado_em))}`);
+  }
+
+  // 18b1c) Pedido reenviado pela fila offline com o mesmo id_envio (a resposta se
+  // perdeu com sinal fraco): devolve o pedido já gravado, não cria outro
+  {
+    const toque0 = new Date(Date.now() - 3 * 3600000).toISOString();
+    const corpo = { cliente: { cliente_id: 9121, nome: 'LOJA FUSO' }, itens: [{ codigo_sku: '70011', quantidade: 3, preco_unitario: 10 }],
+      id_envio: '7f3c2a10-1b2c-4d5e-8f90-a1b2c3d4e5f6', data_pedido: toque0 };
+    const antes = mockDb.__getPedidos().length;
+    const e1 = await req('POST', '/api/pedidos', corpo);
+    const e2 = await req('POST', '/api/pedidos', corpo);
+    // troca a consulta do banco simulado também dentro da transação (pool.connect)
+    const comConsulta = async (troca, fn) => {
+      const q0 = mockDb.pool.query, c0 = mockDb.pool.connect;
+      const q = (sql, params) => troca(sql, params, q0);
+      mockDb.pool.query = q;
+      mockDb.pool.connect = async () => ({ query: q, release: () => {} });
+      try { return await fn(); } finally { mockDb.pool.query = q0; mockDb.pool.connect = c0; }
+    };
+    // corrida (duas abas): a consulta não acha e o INSERT bate no índice único
+    let buscas3 = 0;
+    const e3 = await comConsulta(async (sql, params, q0) => {
+      if (sql.includes('WHERE id_envio = $1') && buscas3++ === 0) return { rows: [] };
+      return q0(sql, params);
+    }, () => req('POST', '/api/pedidos', corpo));
+    // corrida e a busca do já gravado falha (banco instável): 503 (fica na fila e o próximo
+    // envio acha o pedido), não 409 - o 409 tirava da fila como "recusado"
+    let buscas4 = 0;
+    const e4 = await comConsulta(async (sql, params, q0) => {
+      if (sql.includes('WHERE id_envio = $1') && buscas4++ === 0) return { rows: [] };
+      if (sql.includes('WHERE id_envio = $1')) throw new Error('Connection terminated');
+      return q0(sql, params);
+    }, () => req('POST', '/api/pedidos', corpo));
+    assert(e4.status === 503 && buscas3 === 2 && buscas4 === 2,
+      `pedido do app: corrida sem conseguir confirmar o já gravado = 503 (tenta de novo): ${JSON.stringify([e4.status, e4.body, buscas3, buscas4])}`);
+    const semId = await req('POST', '/api/pedidos', { ...corpo, id_envio: 'curto' }); // inválido: vira pedido normal
+    assert(e1.status === 201 && e2.status === 200 && e2.body.mesmo_envio === true && e2.body.pedido_id === e1.body.pedido_id
+      && e3.status === 200 && e3.body.pedido_id === e1.body.pedido_id && semId.status === 201
+      && mockDb.__getPedidos().length === antes + 2,
+      `pedido do app: reenvio com o mesmo id_envio devolve o gravado (também na corrida): ${JSON.stringify([e1.body, e2.body, e3.body, semId.status])}`);
+
+    // (o app carimba enviado_em em cada envio - a versão é a hora do toque no relógio do servidor)
+    const agoraIso = () => new Date().toISOString();
+    // Pedido feito sem internet e ALTERADO antes de o 1º envio sair: o app manda o mesmo
+    // id_envio com os itens novos (e a hora do toque da alteração) - troca os itens do
+    // mesmo pedido. A versão velha que chegar depois (fila de outro aparelho) não volta.
+    const itensDe = (id) => mockDb.__getPedidoItens().filter(i => i.pedido_id === id).map(i => i.quantidade);
+    const toque1 = new Date(Date.now() - 2 * 3600000).toISOString();
+    const nPedidos = mockDb.__getPedidos().length;
+    const alt = await req('POST', '/api/pedidos', { ...corpo, itens: [{ codigo_sku: '70011', quantidade: 5, preco_unitario: 10 }], alterado_em: toque1, enviado_em: agoraIso() });
+    const depoisAlt = itensDe(e1.body.pedido_id);
+    const velho = await req('POST', '/api/pedidos', { ...corpo, enviado_em: agoraIso() }); // a versão de antes chegando atrasada
+    const depoisVelho = itensDe(e1.body.pedido_id);
+    // PATCH (pedido já com número): alteração mais velha que a gravada também não volta
+    const patchVelho = await req('PATCH', `/api/pedidos/${e1.body.pedido_id}`, { itens: [{ codigo_sku: '70011', quantidade: 1, preco_unitario: 10 }], alterado_em: toque0, enviado_em: agoraIso() });
+    // outro aparelho com o relógio 2 h ATRASADO alterando agora: vale (a versão é a hora do
+    // servidor; pelo relógio do aparelho, "hora 2 h atrás" perderia pra versão gravada)
+    const atrasado = new Date(Date.now() - 2 * 3600000 - 60000).toISOString();
+    const patchNovo = await req('PATCH', `/api/pedidos/${e1.body.pedido_id}`, { itens: [{ codigo_sku: '70011', quantidade: 7, preco_unitario: 10 }], alterado_em: atrasado, enviado_em: atrasado });
+    assert(alt.status === 200 && alt.body.atualizado === true && alt.body.pedido_id === e1.body.pedido_id && JSON.stringify(depoisAlt) === '[5]'
+      && velho.status === 200 && velho.body.versao_antiga === true && JSON.stringify(depoisVelho) === '[5]'
+      && patchVelho.body.versao_antiga === true && patchNovo.body.atualizado === true && JSON.stringify(itensDe(e1.body.pedido_id)) === '[7]'
+      && mockDb.__getPedidos().length === nPedidos,
+      `pedido do app: alteração pelo mesmo envio troca os itens; versão mais velha não sobrescreve (POST e PATCH): ${JSON.stringify([alt.body, depoisAlt, depoisVelho, patchVelho.body, itensDe(e1.body.pedido_id)])}`);
+
+    // Reenvio da MESMA versão (resposta perdida) como o app manda de verdade: com
+    // enviado_em novo. Se o reenvio chega mais rápido que o 1º, a versão calculada
+    // sai menor - antes voltava "versão antiga" (aviso falso e lista do aparelho com
+    // os itens de antes). Mesmos itens = sucesso, POST e PATCH.
+    const toqueR = new Date(Date.now() - 60000).toISOString();
+    const corpoR = { ...corpo, id_envio: '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d', data_pedido: toqueR };
+    const r1 = await req('POST', '/api/pedidos', { ...corpoR, enviado_em: agoraIso() });
+    const maisDemorado = new Date(Date.now() + 2000).toISOString(); // espera maior = versão "mais velha"
+    const r2 = await req('POST', '/api/pedidos', { ...corpoR, enviado_em: maisDemorado });
+    const pid = r1.body.pedido_id;
+    const p7 = [{ codigo_sku: '70011', quantidade: 7, preco_unitario: 10 }];
+    const pa = await req('PATCH', `/api/pedidos/${pid}`, { itens: p7, alterado_em: agoraIso(), enviado_em: agoraIso() });
+    const ta = new Date().toISOString();
+    const pb = await req('PATCH', `/api/pedidos/${pid}`, { itens: p7, alterado_em: ta, enviado_em: new Date(Date.parse(ta) + 2000).toISOString() });
+    // sem hora confiável (relógio do aparelho voltou, sem enviado_em) com versão gravada: não passa por cima
+    const semHora = await req('PATCH', `/api/pedidos/${pid}`, { itens: [{ codigo_sku: '70011', quantidade: 9, preco_unitario: 10 }], alterado_em: agoraIso() });
+    assert(r1.status === 201 && r2.status === 200 && r2.body.pedido_id === pid && !r2.body.versao_antiga
+      && pa.body.atualizado === true && pb.status === 200 && pb.body.atualizado === true && !pb.body.versao_antiga
+      && semHora.body.versao_antiga === true && JSON.stringify(itensDe(pid)) === '[7]',
+      `pedido do app: reenvio da mesma versão (enviado_em novo, chegando mais rápido) não vira "versão antiga"; sem hora não sobrescreve: ${JSON.stringify([r2.body, pb.body, semHora.body, itensDe(pid)])}`);
+    // só o contexto mudou (prazo sem mudar preço): não é reenvio, grava; o mesmo contexto
+    // com as chaves em outra ordem (jsonb não guarda a ordem) é reenvio
+    const ctxDe = (id) => JSON.parse(mockDb.__getPedidos().find(x => x.id === id).contexto || 'null');
+    const soCtx = await req('PATCH', `/api/pedidos/${pid}`, { itens: p7, contexto: { uf: 'SP', paymentTerm: '28/56 dias' }, alterado_em: agoraIso(), enviado_em: agoraIso() });
+    const ctxGravado = ctxDe(pid);
+    const atualizadoEm = mockDb.__getPedidos().find(x => x.id === pid).atualizado_em;
+    const ordem = await req('PATCH', `/api/pedidos/${pid}`, { itens: p7, contexto: { paymentTerm: '28/56 dias', uf: 'SP' }, alterado_em: agoraIso(), enviado_em: new Date(Date.now() + 3000).toISOString() });
+    const atualizadoEmDepois = mockDb.__getPedidos().find(x => x.id === pid).atualizado_em; // reenvio não regrava
+    // app antigo (sem alterado_em/enviado_em): aplica como antes, não some sem aviso
+    const legado = await req('PATCH', `/api/pedidos/${pid}`, { itens: [{ codigo_sku: '70011', quantidade: 8, preco_unitario: 10 }], contexto: { uf: 'SP', paymentTerm: '28/56 dias' } });
+    assert(soCtx.body.atualizado === true && ctxGravado && ctxGravado.paymentTerm === '28/56 dias'
+      && ordem.body.atualizado === true && !ordem.body.versao_antiga && atualizadoEmDepois === atualizadoEm
+      && legado.body.atualizado === true && !legado.body.versao_antiga && JSON.stringify(itensDe(pid)) === '[8]',
+      `pedido do app: alteração só do contexto grava; mesmo contexto em outra ordem é reenvio; app sem hora aplica: ${JSON.stringify([soCtx.body, ctxGravado, ordem.body, legado.body, itensDe(pid)])}`);
+
+    // A -> B -> A: o vendedor volta ao que já estava gravado (A de novo, mesmos itens)
+    // enquanto B ainda espera na fila de outro aparelho. A versão gravada sobe com o
+    // reenvio igual, e o B atrasado não volta.
+    const corpoV = { ...corpo, id_envio: '1b2c3d4e-5f60-4a7b-8c9d-0e1f2a3b4c5d', data_pedido: new Date(Date.now() - 3 * 3600000).toISOString() };
+    const vA = await req('POST', '/api/pedidos', { ...corpoV, enviado_em: agoraIso() });
+    await req('POST', '/api/pedidos', { ...corpoV, alterado_em: new Date(Date.now() - 3600000).toISOString(), enviado_em: agoraIso() });
+    const vB = await req('POST', '/api/pedidos', { ...corpoV, itens: [{ codigo_sku: '70011', quantidade: 4, preco_unitario: 10 }],
+      alterado_em: new Date(Date.now() - 2 * 3600000).toISOString(), enviado_em: agoraIso() });
+    // corrida no INSERT (sem a trava) com itens diferentes dos gravados: 503 pra fila
+    // mandar de novo e cair na troca de itens (200 aqui perdia a alteração)
+    let buscas5 = 0;
+    const corrida = await comConsulta(async (sql, params, q0) => {
+      if (sql.includes('WHERE id_envio = $1') && buscas5++ === 0) return { rows: [] };
+      return q0(sql, params);
+    }, () => req('POST', '/api/pedidos', { ...corpoV, itens: [{ codigo_sku: '70011', quantidade: 6, preco_unitario: 10 }], alterado_em: agoraIso(), enviado_em: agoraIso() }));
+    const salvosV = await req('GET', '/api/pedidos/salvos');
+    assert(vB.body.versao_antiga === true && JSON.stringify(itensDe(vA.body.pedido_id)) === '[3]'
+      && corrida.status === 503 && buscas5 === 2
+      && (salvosV.body.pedidos.find(p => p.id === vA.body.pedido_id) || {}).id_envio === corpoV.id_envio,
+      `pedido do app: A -> B -> A não deixa o B atrasado voltar; corrida com itens novos = 503; lista traz o id_envio: ${JSON.stringify([vB.body, itensDe(vA.body.pedido_id), corrida.status, buscas5])}`);
+  }
+
+  // 18b2) Recompra da semana (routes/recompra.js + routes/lib/ritmoCompra.js):
+  // ritmo = mediana dos intervalos entre compras dos últimos 12 meses (mín. 3),
+  // pedido a menos de 7 dias do anterior entra na mesma compra (até 14 dias de
+  // compra), previsão = último pedido da última compra + ritmo.
+  const ritmoLib = require('../routes/lib/ritmoCompra');
+  const hojeBr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+  const antesBr = (n) => ritmoLib.somarDias(hojeBr, -n);
+  {
+    const compras = ritmoLib.juntarCompras([
+      { data: antesBr(90), quantidade: 2 }, { data: antesBr(60), quantidade: 1 },
+      { data: antesBr(57), quantidade: 3 }, { data: antesBr(30), quantidade: 6 },
+    ]);
+    assert(compras.length === 3 && compras[1].quantidade === 4 && compras[1].fim === antesBr(57),
+      `juntarCompras junta os pedidos da mesma semana: ${JSON.stringify(compras)}`);
+    const r = ritmoLib.ritmoDasCompras(compras, hojeBr);
+    assert(r && r.ritmo_dias === 30 && r.previsao === hojeBr && r.atraso_dias === 0 && ritmoLib.situacaoDoRitmo(r) === 'semana',
+      `ritmoDasCompras: mediana dos intervalos, previsão = última + ritmo: ${JSON.stringify(r)}`);
+    assert(ritmoLib.ritmoDasCompras(compras.slice(0, 2), hojeBr) === null, 'menos de 3 compras = sem ritmo');
+    // quem compra toda semana: cada semana é uma compra (emendando, o ano inteiro virava uma só)
+    const semanal = ritmoLib.juntarCompras(Array.from({ length: 52 }, (_, i) => ({ data: antesBr(i * 7), quantidade: 1 })));
+    const rs = ritmoLib.ritmoDasCompras(semanal, hojeBr);
+    // comprou hoje: fora da lista hoje (piso de 8 dias depois do último pedido); amanhã já é "semana"
+    const rsAmanha = ritmoLib.ritmoDasCompras(semanal, ritmoLib.somarDias(hojeBr, 1));
+    assert(semanal.length === 52 && rs && rs.ritmo_dias === 7 && rs.ultima_compra === hojeBr && ritmoLib.situacaoDoRitmo(rs) === null
+      && ritmoLib.situacaoDoRitmo(rsAmanha) === 'semana',
+      `juntarCompras: quem compra toda semana tem ritmo de 7 dias: ${JSON.stringify([semanal.length, rs])}`);
+    // pedidos seguidos (35, 29, 22, 15 dias): a semana conta do 1º pedido, e a última
+    // compra é o pedido de 15 dias atrás, não o início da sequência
+    const seguidas = ritmoLib.juntarCompras([95, 65, 35, 29, 22, 15].map(n => ({ data: antesBr(n), quantidade: 1 })));
+    const rq = ritmoLib.ritmoDasCompras(seguidas, hojeBr);
+    assert(seguidas.length === 5 && seguidas[2].data === antesBr(35) && seguidas[2].fim === antesBr(29)
+      && rq.ultima_compra === antesBr(15) && rq.atraso_dias < 0 && ritmoLib.situacaoDoRitmo(rq) !== 'atrasado',
+      `juntarCompras: quem acabou de comprar não aparece atrasado: ${JSON.stringify([seguidas, rq])}`);
+    // cliente mensal com complementos 5 e 8 dias depois do pedido principal: cada mês é
+    // uma compra (contando a semana só do 1º pedido, partia em duas e o ritmo dava ~8)
+    const rajadas = ritmoLib.juntarCompras([152, 147, 144, 122, 117, 114, 92, 87, 84, 62, 57, 54, 32, 27, 24]
+      .map(n => ({ data: antesBr(n), quantidade: 1 })));
+    const rr = ritmoLib.ritmoDasCompras(rajadas, hojeBr);
+    // compra que se arrasta (pedido a cada 6 dias) para em 14 dias
+    const arrastada = ritmoLib.juntarCompras([0, 6, 12, 18].map(n => ({ data: antesBr(60 - n), quantidade: 1 })));
+    // previsão conta do 1º pedido da última compra (há 32 dias) + 30 = há 2 dias: atrasado 2
+    // (contando do último pedido, dava "faltam 6 dias" e ele só entrava na lista depois do dia)
+    assert(rajadas.length === 5 && rr.ritmo_dias === 30 && rr.ultima_compra === antesBr(24) && rr.previsao === antesBr(2)
+      && rr.atraso_dias === 2 && ritmoLib.situacaoDoRitmo(rr) === 'atrasado'
+      && arrastada.length === 2 && arrastada[0].fim === antesBr(48) && arrastada[1].data === antesBr(42),
+      `juntarCompras: complemento até 14 dias fica na mesma compra (mensal = ritmo 30): ${JSON.stringify([rajadas.length, rr, arrastada])}`);
+    // o cliente mensal com complementos entra na lista 7 dias antes do dia em que costuma
+    // comprar, como o sem complemento (achado da 3ª rodada do revisor-cortag)
+    const mensalCompl = ritmoLib.juntarCompras([143, 138, 135, 113, 108, 105, 83, 78, 75, 53, 48, 45, 23, 18, 15]
+      .map(n => ({ data: antesBr(n), quantidade: 1 })));
+    const rm = ritmoLib.ritmoDasCompras(mensalCompl, hojeBr);
+    // ritmo menor que a duração da compra: a régua (há 20 + 10) cairia antes do último pedido;
+    // o piso põe a previsão 8 dias depois dele (há 7 + 8 = amanhã)
+    const curto = ritmoLib.ritmoDasCompras([
+      { data: antesBr(40), fim: antesBr(40), quantidade: 1 }, { data: antesBr(30), fim: antesBr(30), quantidade: 1 },
+      { data: antesBr(20), fim: antesBr(7), quantidade: 1 }], hojeBr);
+    assert(rm.ritmo_dias === 30 && rm.previsao === ritmoLib.somarDias(hojeBr, 7) && ritmoLib.situacaoDoRitmo(rm) === 'semana'
+      && curto.ritmo_dias === 10 && curto.previsao === ritmoLib.somarDias(hojeBr, 1) && curto.ultima_compra === antesBr(7),
+      `ritmoDasCompras: previsão pelo 1º pedido da última compra (mensal com complemento entra 7 dias antes), no mínimo 8 dias depois do último pedido: ${JSON.stringify([rm, curto])}`);
+    // cliente de 10 em 10 dias atrasado que compra: sai da lista (achado da 4ª rodada do
+    // revisor-cortag - o pedido entrava na compra anterior e ele voltava "atrasado" 2 dias depois)
+    const dezEmDez = (ns) => ritmoLib.ritmoDasCompras(ritmoLib.juntarCompras(ns.map(n => ({ data: antesBr(n), quantidade: 1 }))), hojeBr);
+    const antesDeComprar = dezEmDez([42, 32, 22, 11, 5]);   // última compra há 11 dias + complemento há 5
+    const depoisDeComprar = dezEmDez([42, 32, 22, 11, 5, 0]); // fechou o pedido hoje (entra na mesma compra)
+    assert(ritmoLib.situacaoDoRitmo(antesDeComprar) === 'semana' && depoisDeComprar.previsao === ritmoLib.somarDias(hojeBr, 8)
+      && ritmoLib.situacaoDoRitmo(depoisDeComprar) === null,
+      `ritmoDasCompras: quem compra sai da lista, mesmo com o pedido emendado na compra anterior: ${JSON.stringify([antesDeComprar, depoisDeComprar])}`);
+    // ...mas o complemento normal não empurra a previsão (2ª rodada do revisor na correção):
+    // ritmo 13 com complemento 6 dias depois: previsão = piso (complemento + 8 = há 5), 1 dia depois
+    // da régua; contando do último pedido dava hoje (6 dias de atraso pra entrar na lista)
+    const r13 = dezEmDez([71, 65, 58, 52, 45, 39, 32, 26, 19, 13]);
+    assert(r13.ritmo_dias === 13 && r13.previsao === antesBr(5) && ritmoLib.situacaoDoRitmo(r13) === 'atrasado',
+      `ritmoDasCompras: complemento da compra não empurra a previsão: ${JSON.stringify(r13)}`);
+    // proposta "frequente": produto que veio em 2 das 3 últimas compras do cliente conta 2,
+    // mesmo que as compras do produto (juntadas à parte) atravessem a quebra do cliente
+    const cliProp = [{ data: antesBr(80), fim: antesBr(80) }, { data: antesBr(40), fim: antesBr(28) }, { data: antesBr(24), fim: antesBr(24) }];
+    const propFreq = ritmoLib.itensDaProposta({ previsao: hojeBr }, cliProp,
+      new Map([['71009', [{ data: antesBr(28), fim: antesBr(24), quantidade: 4 }]]]), hojeBr);
+    assert(propFreq.length === 1 && propFreq[0].codigo_sku === '71009' && propFreq[0].origem === 'frequente',
+      `itensDaProposta: produto em 2 compras do cliente conta 2 mesmo com a compra do produto atravessando as duas: ${JSON.stringify(propFreq)}`);
+    // ...e a quantidade é a de cada compra do cliente (2 e 2 = 2), não a da compra do produto
+    // que soma as duas (4) - achado da 4ª rodada do revisor-cortag
+    const propQtd = ritmoLib.itensDaProposta({ previsao: hojeBr }, cliProp,
+      new Map([['71009', [{ data: antesBr(28), fim: antesBr(24), quantidade: 4 }]]]), hojeBr,
+      new Map([['71009', [{ data: antesBr(28), quantidade: 2 }, { data: antesBr(24), quantidade: 2 }]]]));
+    assert(propQtd.length === 1 && propQtd[0].quantidade === 2 && propFreq[0].quantidade === 4,
+      `itensDaProposta: quantidade "frequente" por compra do cliente: ${JSON.stringify([propQtd, propFreq])}`);
+    // o mesmo no item "por ritmo": os pedidos de há 14 e 11 dias são compras diferentes do
+    // cliente (a de há 26 dura até 14 dias), mas a compra do produto junta os dois (20)
+    const evCli = [60, 40, 26, 20, 14, 11].map(n => ({ data: antesBr(n), quantidade: 1 }));
+    const evX = [[60, 20], [40, 20], [14, 10], [11, 10]].map(([n, q]) => ({ data: antesBr(n), quantidade: q }));
+    const propRitmo = ritmoLib.itensDaProposta({ previsao: ritmoLib.somarDias(hojeBr, 5) }, ritmoLib.juntarCompras(evCli),
+      new Map([['71010', ritmoLib.juntarCompras(evX)]]), hojeBr, new Map([['71010', evX]]));
+    assert(propRitmo.length === 1 && propRitmo[0].origem === 'ritmo' && propRitmo[0].quantidade === 10,
+      `itensDaProposta: quantidade "por ritmo" por compra do cliente (20, 10, 10 = 10; não 20): ${JSON.stringify(propRitmo)}`);
+    assert(ritmoLib.mediana([10, 30, 200]) === 30 && ritmoLib.quantidadeTipica([{ quantidade: 2 }, { quantidade: 10 }, { quantidade: 4 }, { quantidade: 3 }]) === 4,
+      'mediana ignora a compra fora da curva; quantidade típica = mediana das 3 últimas');
+    const sit = (atraso, ritmo) => ritmoLib.situacaoDoRitmo({ atraso_dias: atraso, ritmo_dias: ritmo });
+    assert(sit(-8, 30) === null && sit(-7, 30) === 'semana' && sit(1, 30) === 'atrasado' && sit(45, 30) === 'atrasado' && sit(46, 30) === 'fora',
+      'situação: 7 dias antes = semana, passou = atrasado, atraso > 1,5x o ritmo = fora');
+  }
+  mockDb.__seed({
+    produtos: [
+      { id: 821, codigo_sku: '71001', nome: 'DESEMPENADEIRA RITMO', categoria: '16' },
+      { id: 822, codigo_sku: '71002', nome: 'ESPATULA RITMO', categoria: '16' },
+      { id: 823, codigo_sku: '71003', nome: 'NIVEL RITMO', categoria: '16' },
+      { id: 824, codigo_sku: '71004', nome: 'TRENA RITMO', categoria: '16' },
+    ],
+    clientes: [
+      { id: 9201, nome: 'RITMO ATRASADO', documento: '22200000000101', codigo_oficial: 'COD9201' },
+      { id: 9202, nome: 'RITMO SEMANA SO APP', documento: '22200000000102' },
+      { id: 9203, nome: 'RITMO EM DIA', documento: '22200000000103', codigo_oficial: 'COD9203' },
+      { id: 9204, nome: 'RITMO DUAS COMPRAS', documento: '22200000000104', codigo_oficial: 'COD9204' },
+      { id: 9205, nome: 'RITMO ENTREGA JUNTA', documento: '22200000000105', codigo_oficial: 'COD9205' },
+      { id: 9206, nome: 'RITMO FORA', documento: '22200000000106', codigo_oficial: 'COD9206' },
+    ],
+    pedidosOficiaisItens: [
+      // 9201: a cada 30 dias (100, 70, 40) -> previsto há 10 dias = atrasado.
+      // Desempenadeira nas 3 (2, P+base 4, 3 -> mediana 3); espátula só em 1.
+      { nr_pedido: '920101', codigo_sku: '71001', cliente_codigo_oficial: 'COD9201', quantidade: 2, valor: 10, data_implantacao: antesBr(100), data_faturamento: antesBr(98), status: 'faturado' },
+      { nr_pedido: '920102', codigo_sku: '71001', cliente_codigo_oficial: 'COD9201', quantidade: 1, valor: 10, data_implantacao: antesBr(70), data_faturamento: antesBr(66), status: 'faturado' },
+      { nr_pedido: '920102', codigo_sku: 'P71001', cliente_codigo_oficial: 'COD9201', quantidade: 3, valor: 10, data_implantacao: antesBr(70), data_faturamento: antesBr(66), status: 'faturado' },
+      { nr_pedido: '920102', codigo_sku: '71002', cliente_codigo_oficial: 'COD9201', quantidade: 5, valor: 10, data_implantacao: antesBr(70), data_faturamento: antesBr(66), status: 'faturado' },
+      { nr_pedido: '920103', codigo_sku: '71001', cliente_codigo_oficial: 'COD9201', quantidade: 3, valor: 10, data_implantacao: antesBr(40), data_faturamento: null, status: 'carteira' },
+      // série de 7 dígitos (avulso) há 5 dias: não conta como compra
+      { nr_pedido: '1092010', codigo_sku: '71004', cliente_codigo_oficial: 'COD9201', quantidade: 1, valor: 5, data_implantacao: antesBr(5), data_faturamento: antesBr(3), status: 'faturado' },
+      // 9203: comprou há 2 dias, ritmo ~29 -> longe da data, fora da lista
+      { nr_pedido: '920301', codigo_sku: '71001', cliente_codigo_oficial: 'COD9203', quantidade: 1, valor: 10, data_implantacao: antesBr(60), data_faturamento: antesBr(58), status: 'faturado' },
+      { nr_pedido: '920302', codigo_sku: '71001', cliente_codigo_oficial: 'COD9203', quantidade: 1, valor: 10, data_implantacao: antesBr(30), data_faturamento: antesBr(28), status: 'faturado' },
+      { nr_pedido: '920303', codigo_sku: '71001', cliente_codigo_oficial: 'COD9203', quantidade: 1, valor: 10, data_implantacao: antesBr(2), data_faturamento: null, status: 'carteira' },
+      // 9204: só 2 compras -> sem ritmo
+      { nr_pedido: '920401', codigo_sku: '71001', cliente_codigo_oficial: 'COD9204', quantidade: 1, valor: 10, data_implantacao: antesBr(90), data_faturamento: antesBr(88), status: 'faturado' },
+      { nr_pedido: '920402', codigo_sku: '71001', cliente_codigo_oficial: 'COD9204', quantidade: 1, valor: 10, data_implantacao: antesBr(60), data_faturamento: antesBr(58), status: 'faturado' },
+      // 9205: 90, 60 + 57 (mesma compra), 30 -> ritmo 30, prevista hoje = semana
+      // (sem juntar seria mediana 27, prevista há 3 dias = atrasado)
+      { nr_pedido: '920501', codigo_sku: '71003', cliente_codigo_oficial: 'COD9205', quantidade: 1, valor: 10, data_implantacao: antesBr(90), data_faturamento: antesBr(88), status: 'faturado' },
+      { nr_pedido: '920502', codigo_sku: '71003', cliente_codigo_oficial: 'COD9205', quantidade: 1, valor: 10, data_implantacao: antesBr(60), data_faturamento: antesBr(58), status: 'faturado' },
+      { nr_pedido: '920503', codigo_sku: '71004', cliente_codigo_oficial: 'COD9205', quantidade: 1, valor: 10, data_implantacao: antesBr(57), data_faturamento: antesBr(55), status: 'faturado' },
+      { nr_pedido: '920504', codigo_sku: '71003', cliente_codigo_oficial: 'COD9205', quantidade: 1, valor: 10, data_implantacao: antesBr(30), data_faturamento: antesBr(28), status: 'faturado' },
+      // 9206: 200, 170, 140 -> ritmo 30, atraso 110 > 45 = fora do ritmo
+      { nr_pedido: '920601', codigo_sku: '71001', cliente_codigo_oficial: 'COD9206', quantidade: 1, valor: 10, data_implantacao: antesBr(200), data_faturamento: antesBr(198), status: 'faturado' },
+      { nr_pedido: '920602', codigo_sku: '71001', cliente_codigo_oficial: 'COD9206', quantidade: 1, valor: 10, data_implantacao: antesBr(170), data_faturamento: antesBr(168), status: 'faturado' },
+      { nr_pedido: '920603', codigo_sku: '71001', cliente_codigo_oficial: 'COD9206', quantidade: 1, valor: 10, data_implantacao: antesBr(140), data_faturamento: antesBr(138), status: 'faturado' },
+    ],
+    pedidos: [
+      // 9201: pedido do app que virou o 920103 (mesma compra, não conta de novo)
+      { id: 9921, cliente_id: 9201, data_pedido: antesBr(41) + 'T12:00:00Z' },
+      // 9202 (sem código no ERP): só app, 55, 35 e 15 dias -> ritmo 20, prevista em 5 dias.
+      // Nenhum produto em 3 compras -> proposta com os que vieram em 2 das 3 últimas.
+      { id: 9922, cliente_id: 9202, data_pedido: antesBr(55) + 'T12:00:00Z' },
+      { id: 9923, cliente_id: 9202, data_pedido: antesBr(35) + 'T12:00:00Z' },
+      { id: 9924, cliente_id: 9202, data_pedido: antesBr(15) + 'T12:00:00Z' },
+    ],
+    pedidoItens: [
+      { id: 9931, pedido_id: 9921, produto_id: 821, quantidade: 3, preco_unitario: 10 },
+      { id: 9932, pedido_id: 9922, produto_id: 823, quantidade: 2, preco_unitario: 10 },
+      { id: 9933, pedido_id: 9923, produto_id: 823, quantidade: 4, preco_unitario: 10 },
+      { id: 9934, pedido_id: 9923, produto_id: 824, quantidade: 1, preco_unitario: 10 },
+      { id: 9935, pedido_id: 9924, produto_id: 824, quantidade: 1, preco_unitario: 10 },
+      { id: 9936, pedido_id: 9924, produto_id: 822, quantidade: 9, preco_unitario: 10 },
+    ],
+  });
+  res = await req('GET', '/api/recompra');
+  {
+    const doTeste = (res.body && res.body.clientes || []).filter(c => c.cliente_id >= 9201 && c.cliente_id <= 9206);
+    const porId = new Map(doTeste.map(c => [c.cliente_id, c]));
+    const a = porId.get(9201), b = porId.get(9202), e = porId.get(9205), f = porId.get(9206);
+    assert(res.status === 200 && res.body.hoje === hojeBr && doTeste.length === 4 && !porId.has(9203) && !porId.has(9204),
+      `recompra: lista só quem está atrasado/na semana/fora, com 3+ compras: ${JSON.stringify(doTeste.map(c => [c.cliente_id, c.situacao]))}`);
+    assert(a && a.situacao === 'atrasado' && a.ritmo_dias === 30 && a.num_compras === 3 && a.ultima_compra === antesBr(40) && a.atraso_dias === 10
+      && a.itens.length === 1 && a.itens[0].codigo_sku === '71001' && a.itens[0].quantidade === 3 && a.itens[0].origem === 'ritmo' && a.itens[0].nome === 'DESEMPENADEIRA RITMO',
+      `recompra: entrada pela implantação (carteira conta), sem série de 7 dígitos, app já no oficial não repete, P+base: ${JSON.stringify(a)}`);
+    assert(b && b.situacao === 'semana' && b.ritmo_dias === 20 && b.previsao === ritmoLib.somarDias(hojeBr, 5)
+      && b.itens.map(i => i.codigo_sku).sort().join() === '71003,71004' && b.itens.every(i => i.origem === 'frequente')
+      && b.itens.find(i => i.codigo_sku === '71003').quantidade === 3,
+      `recompra: cliente só do app; sem produto com ritmo, proposta com os de 2 das 3 últimas compras: ${JSON.stringify(b)}`);
+    assert(e && e.situacao === 'semana' && e.ritmo_dias === 30 && e.num_compras === 3,
+      `recompra: pedidos da mesma semana contam como uma compra só: ${JSON.stringify(e)}`);
+    assert(f && f.situacao === 'fora' && f.atraso_dias === 110 && f.itens.length === 1 && f.itens[0].origem === 'frequente',
+      `recompra: fora do ritmo (atraso > 1,5x), proposta pelos itens frequentes: ${JSON.stringify(f)}`);
+    const ordem = doTeste.map(c => c.cliente_id);
+    assert(ordem.indexOf(9201) < ordem.indexOf(9206) && ordem.indexOf(9206) < ordem.indexOf(9205) && ordem.indexOf(9205) < ordem.indexOf(9202),
+      `recompra: atrasados primeiro, depois fora do ritmo, depois a semana pela data: ${JSON.stringify(ordem)}`);
+  }
+  res = await req('POST', '/api/recompra/9201/adiar', {});
+  assert(res.status === 200 && res.body.adiado_ate === ritmoLib.somarDias(hojeBr, 7), `"Já falei" adia 7 dias: ${JSON.stringify(res.body)}`);
+  res = await req('POST', '/api/recompra/9202/adiar', { em: antesBr(3) });
+  assert(res.status === 200 && res.body.adiado_ate === ritmoLib.somarDias(hojeBr, 4), `"Já falei" pela fila offline conta do dia em que foi tocado: ${JSON.stringify(res.body)}`);
+  res = await req('POST', '/api/recompra/9202/adiar', { em: ritmoLib.somarDias(hojeBr, 30) });
+  assert(res.status === 200 && res.body.adiado_ate === ritmoLib.somarDias(hojeBr, 7), `"Já falei" com data no futuro vale de hoje: ${JSON.stringify(res.body)}`);
+  res = await req('GET', '/api/recompra');
+  {
+    const a = (res.body.clientes || []).find(c => c.cliente_id === 9201);
+    assert(a && a.adiado_ate === ritmoLib.somarDias(hojeBr, 7), `recompra devolve até quando o cliente foi adiado: ${JSON.stringify(a && a.adiado_ate)}`);
+  }
+  res = await req('POST', '/api/recompra/999999/adiar', {});
+  assert(res.status === 404, '"Já falei" de cliente inexistente responde 404');
+  res = await req('POST', '/api/recompra/abc/adiar', {});
+  assert(res.status === 400, '"Já falei" com id inválido responde 400');
+
   // 18c) GET /api/produtos/:codigo/clientes ("Já compraram" da aba Produtos):
   // conta o faturado oficial, não só pedido do app - caso real: lixadeira
   // faturada pelo ERP aparecia "Já compraram (0)". Código promocional conta
@@ -653,6 +1773,7 @@ async function main() {
     clientes: [
       { id: 9131, nome: 'LOJA ERP', documento: '11122233000468', codigo_oficial: 'COD9131' },
       { id: 9132, nome: 'LOJA SEM LEVANTAMENTO', documento: '11122233000549', codigo_oficial: 'COD9132' },
+      { id: 9133, nome: 'LOJA VISITA A NOITE', documento: '11122233000620', codigo_oficial: 'COD9133' },
     ],
     pedidosOficiaisItens: [
       { nr_pedido: 'H1', codigo_sku: '71001', cliente_codigo_oficial: 'COD9131', quantidade: 12, valor: 10, data_faturamento: diasAtrasISO(90), status: 'faturado' },
@@ -662,6 +1783,8 @@ async function main() {
       { nr_pedido: 'H4', codigo_sku: '71003', cliente_codigo_oficial: 'COD9131', quantidade: 3, valor: 10, data_faturamento: diasAtrasISO(150), status: 'faturado' },
       { nr_pedido: 'H5', codigo_sku: '71001', cliente_codigo_oficial: 'COD9131', quantidade: 99, valor: 10, data_faturamento: null, status: 'carteira' },
       { nr_pedido: 'H6', codigo_sku: '71001', cliente_codigo_oficial: 'COD9132', quantidade: 5, valor: 10, data_faturamento: diasAtrasISO(10), status: 'faturado' },
+      // faturado no dia seguinte ao da visita feita às 23h30 de Brasília (02h30 UTC desse dia)
+      { nr_pedido: 'H7', codigo_sku: '71001', cliente_codigo_oficial: 'COD9133', quantidade: 7, valor: 10, data_faturamento: diasAtrasISO(60), status: 'faturado' },
     ],
     // o mesmo desempenador pedido pelo app no dia do faturamento H2 (mesma compra)
     pedidos: [{ id: 9931, cliente_id: 9131, data_pedido: diasAtrasISO(30) + 'T12:00:00Z' }],
@@ -671,11 +1794,15 @@ async function main() {
     levantamentos: [
       { id: 9941, cliente_id: 9131, nome: 'visita 1', data_visita: diasAtrasISO(100) + 'T15:00:00Z' },
       { id: 9942, cliente_id: 9131, nome: 'visita 2', data_visita: diasAtrasISO(20) + 'T15:00:00Z' },
+      { id: 9943, cliente_id: 9133, nome: 'visita à noite', data_visita: diasAtrasISO(60) + 'T02:30:00Z' },
+      { id: 9944, cliente_id: 9133, nome: 'visita seguinte', data_visita: diasAtrasISO(20) + 'T15:00:00Z' },
     ],
     levantamentoItens: [
       { id: 9951, levantamento_id: 9941, produto_id: 831, quantidade_contada: 10 },
       { id: 9952, levantamento_id: 9942, produto_id: 831, quantidade_contada: 4 },
       { id: 9953, levantamento_id: 9942, produto_id: 832, quantidade_contada: 0 },
+      { id: 9954, levantamento_id: 9943, produto_id: 831, quantidade_contada: 2 },
+      { id: 9955, levantamento_id: 9944, produto_id: 831, quantidade_contada: 3 },
     ],
   });
   res = await req('GET', '/api/clientes/9131/historico');
@@ -686,6 +1813,42 @@ async function main() {
       && hDesemp.primeira_compra === diasAtrasISO(90) && hDesemp.ultima_compra === diasAtrasISO(30),
     `historico: faturado oficial + app, P+base juntos, app do mesmo dia não soma: ${JSON.stringify(res.body)}`
   );
+  {
+    // produto fora da Lista de Preços (catalogo_precos) sai com "Descontinuado · " na frente;
+    // o promocional conta pelo código base; catálogo vazio não marca nada
+    const { esquecerCatalogo } = require('../routes/lib/descontinuado');
+    const catalogo = mockDb.__getCatalogoPrecos();
+    const antes = catalogo.splice(0, catalogo.length);
+    catalogo.push({ codigo_sku: '71001', nome: 'NO CATÁLOGO' });
+    esquecerCatalogo();
+    const r = await req('GET', '/api/clientes/9131/historico');
+    const noCat = (r.body || []).find(x => x.codigo_sku === '71001');
+    const fora = (r.body || []).filter(x => x.codigo_sku !== '71001');
+    // "o que oferecer" (Recuperar) tira o descontinuado em vez de marcar: 71002/71003 eram os dois de lá
+    const rec = await req('GET', '/api/clientes/9131/recuperar');
+    catalogo.splice(0, catalogo.length);
+    esquecerCatalogo();
+    const vazio = await req('GET', '/api/clientes/9131/historico');
+    catalogo.push(...antes);
+    esquecerCatalogo();
+    assert(r.status === 200 && noCat && !noCat.descontinuado && !String(noCat.produto).startsWith('Descontinuado')
+      && fora.length === 2 && fora.every(x => x.descontinuado && String(x.produto).startsWith('Descontinuado · '))
+      && !(vazio.body || []).some(x => x.descontinuado)
+      && rec.status === 200 && Array.isArray(rec.body) && rec.body.length === 0,
+      `historico: produto que saiu da Lista de Preços vem com "Descontinuado" na frente: ${JSON.stringify(r.body)}`);
+  }
+  {
+    // 💡 sugestões: grupo some só quando nenhum produto do grupo está na Lista de Preços -
+    // código trocado por um novo (mesmo grupoDoProduto) continua sendo oferecido
+    const { grupoDescontinuado, estaDescontinuado } = require('../routes/lib/descontinuado');
+    const { grupoDoProduto } = require('../routes/lib/agrupamentoProduto');
+    const cat = { codigos: new Set(['70500']), grupos: new Set([grupoDoProduto('DISCO DIAMANTADO TURBO 115 mm').chave]) };
+    assert(!grupoDescontinuado(grupoDoProduto('DISCO DIAMANTADO TURBO 110 mm').chave, cat)
+      && grupoDescontinuado(grupoDoProduto('COLHER P/ PEDREIRO KAEF 07').chave, cat)
+      && !grupoDescontinuado('qualquer', { codigos: new Set(), grupos: new Set() })
+      && !estaDescontinuado('P70500', cat.codigos) && estaDescontinuado('70499', cat.codigos),
+      'descontinuado: grupo com código trocado continua; grupo sem produto ativo sai; promocional pelo código base; catálogo vazio não tira nada');
+  }
   res = await req('GET', '/api/clientes/9131/rotatividade');
   assert(
     res.status === 200 && res.body[0].codigo_sku === '71001' && res.body[0].media_dias_entre_pedidos === 60,
@@ -706,6 +1869,12 @@ async function main() {
   assert(
     res.status === 200 && consumo && consumo.pedido_no_periodo === 24 && consumo.consumo_estimado === 30,
     `consumo estimado conta o faturado entre as visitas (10 + 24 - 4 = 30): ${JSON.stringify(res.body.consumos)}`
+  );
+  res = await req('GET', '/api/clientes/9133/consumo-estimado/831');
+  const consumoNoite = (res.body.consumos || [])[0];
+  assert(
+    res.status === 200 && consumoNoite && consumoNoite.pedido_no_periodo === 7 && consumoNoite.consumo_estimado === 6,
+    `consumo estimado: visita às 23h30 de Brasília conta no dia de Brasília, e o faturado do dia seguinte entra no período (2 + 7 - 3 = 6): ${JSON.stringify(res.body.consumos)}`
   );
   res = await req('GET', '/api/clientes/999999/historico');
   assert(res.status === 404, 'historico de cliente inexistente responde 404');
@@ -750,12 +1919,89 @@ async function main() {
   );
   const tokenOutro = generateToken();
   await mockDb.pool.query('INSERT INTO sessoes (token, usuario_id, expira_em) VALUES ($1, $2, $3)', [hashToken(tokenOutro), outroUsuario.rows[0].id, '90']);
+  // Trocar o nome do usuário (card de oferta, orçamento, vendedor): admin troca
+  // o de qualquer um; quem não é admin, só o próprio
+  {
+    const outroId = outroUsuario.rows[0].id;
+    res = await req('PUT', `/api/auth/usuarios/${outroId}/nome`, { nome: '  Michel\n Russo ' });
+    assert(res.status === 200 && res.body.nome === 'Michel Russo', `admin troca o nome de outro usuário (sem quebra de linha): ${JSON.stringify(res.body)}`);
+    res = await req('PUT', `/api/auth/usuarios/${outroId}/nome`, { nome: 'x' });
+    assert(res.status === 400, 'nome com menos de 2 letras é recusado');
+    const tokenAdm = authToken;
+    authToken = tokenOutro;
+    res = await req('PUT', `/api/auth/usuarios/${outroId}/nome`, { nome: 'Outro Vendedor' });
+    const proprio = res.status;
+    res = await req('PUT', `/api/auth/usuarios/1/nome`, { nome: 'Tentativa' });
+    authToken = tokenAdm;
+    assert(proprio === 200 && res.status === 403, `vendedor troca o próprio nome, mas não o de outro: ${proprio}/${res.status}`);
+    res = await req('PUT', '/api/auth/usuarios/999999/nome', { nome: 'Ninguém' });
+    assert(res.status === 404, 'trocar nome de usuário inexistente: 404');
+  }
   const tokenAntesCotacao = authToken;
   authToken = tokenOutro;
   res = await req('POST', '/api/pedidos', { ...cotacaoBase, pdf_modificado_em: '2026-09-03T10:00:00Z',
     itens: [{ codigo_sku: '60863', quantidade: 1, preco_unitario: 28.59 }] });
   authToken = tokenAntesCotacao;
   assert(res.status === 403, 'cotação: outro usuário (não admin) não sobrescreve a cotação de quem gravou');
+
+  // 18e2) Reabrir pedido do app pra editar (cliente quer mudar quantidade ou
+  // incluir produto): GET /api/pedidos/salvos lista os pedidos do próprio
+  // vendedor com itens, cliente e contexto; PATCH /api/pedidos/:id troca os
+  // itens do MESMO pedido (sem criar outro). Só o autor/admin, só origem 'app'.
+  const contextoPedido = { uf: 'SC', canal: 'ATACADO', channelDiscount: 22, paymentTerm: 'A Vista', qtyDiscounts: { '61362': 5 } };
+  res = await req('POST', '/api/pedidos', {
+    cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' }, vendedor_nome: 'Michel Russo', contexto: contextoPedido,
+    itens: [{ codigo_sku: '60863', quantidade: 20, preco_unitario: 28.59 }],
+  });
+  const pedidoEditavelId = res.body.pedido_id;
+  const dataPedidoEditavel = res.body.data_pedido;
+  let salvos = await req('GET', '/api/pedidos/salvos');
+  let salvo = salvos.body && salvos.body.pedidos.find(p => p.id === pedidoEditavelId);
+  assert(
+    salvos.status === 200 && salvo && salvo.cliente_nome === 'João Silva Materiais' && salvo.contexto && salvo.contexto.canal === 'ATACADO'
+      && salvo.itens.length === 1 && salvo.itens[0].codigo_sku === '60863' && salvo.itens[0].quantidade === 20
+      && !salvos.body.pedidos.some(p => p.id === pedidoCotacaoId),
+    `pedidos salvos: lista o pedido do app com itens, cliente e contexto (e não a cotação em PDF): ${JSON.stringify(salvos.body && salvos.body.pedidos.map(p => p.id))}`
+  );
+  const novoContexto = { ...contextoPedido, paymentTerm: '28 dias' };
+  res = await req('PATCH', `/api/pedidos/${pedidoEditavelId}`, { contexto: novoContexto, itens: [
+    { codigo_sku: '60863', quantidade: 30, preco_unitario: 28.59 }, { codigo_sku: '61362', quantidade: 2, preco_unitario: 206.55 },
+  ] });
+  const itensEditados = mockDb.__getPedidoItens().filter(i => i.pedido_id === pedidoEditavelId);
+  assert(
+    res.status === 200 && res.body.atualizado === true && res.body.pedido_id === pedidoEditavelId && res.body.data_pedido === dataPedidoEditavel
+      && res.body.atualizado_em && itensEditados.length === 2 && itensEditados.some(i => i.quantidade === 30) && itensEditados.some(i => i.quantidade === 2),
+    `editar pedido: troca os itens do mesmo pedido, mantém a data do pedido e marca atualizado_em: ${JSON.stringify(itensEditados)}`
+  );
+  salvos = await req('GET', '/api/pedidos/salvos');
+  salvo = salvos.body.pedidos.filter(p => p.id === pedidoEditavelId);
+  assert(salvo.length === 1 && salvo[0].itens.length === 2 && salvo[0].contexto.paymentTerm === '28 dias' && salvos.body.pedidos[0].id === pedidoEditavelId,
+    'editar pedido: continua um pedido só, com os itens e o contexto novos, no topo da lista (editado por último)');
+  res = await req('PATCH', `/api/pedidos/${pedidoEditavelId}`, { itens: [{ codigo_sku: '60863', quantidade: 0, preco_unitario: 28.59 }] });
+  assert(res.status === 422, 'editar pedido: recusa item com quantidade zero');
+  res = await req('PATCH', `/api/pedidos/${pedidoEditavelId}`, { itens: [] });
+  assert(res.status === 422, 'editar pedido: recusa pedido sem itens');
+  res = await req('PATCH', `/api/pedidos/${pedidoEditavelId}`, { itens: [{ codigo_sku: 'CODIGO-INEXISTENTE', quantidade: 1, preco_unitario: 1 }] });
+  assert(res.status === 400 && res.body.erro.includes('não encontrado') && mockDb.__getPedidoItens().filter(i => i.pedido_id === pedidoEditavelId).length === 2,
+    'editar pedido: produto inexistente recusa sem perder os itens que já estavam gravados (rollback)');
+  res = await req('PATCH', `/api/pedidos/${pedidoCotacaoId}`, { itens: [{ codigo_sku: '60863', quantidade: 1, preco_unitario: 28.59 }] });
+  assert(res.status === 422, 'editar pedido: cotação importada do PDF não é editada por aqui');
+  res = await req('PATCH', '/api/pedidos/999999', { itens: [{ codigo_sku: '60863', quantidade: 1, preco_unitario: 28.59 }] });
+  assert(res.status === 404, 'editar pedido: pedido inexistente responde 404');
+  authToken = tokenOutro;
+  res = await req('PATCH', `/api/pedidos/${pedidoEditavelId}`, { itens: [{ codigo_sku: '60863', quantidade: 1, preco_unitario: 28.59 }] });
+  const salvosOutro = await req('GET', '/api/pedidos/salvos');
+  authToken = tokenAntesCotacao;
+  assert(res.status === 403, 'editar pedido: outro usuário (não admin) não altera o pedido de quem gravou');
+  assert(salvosOutro.status === 200 && !salvosOutro.body.pedidos.some(p => p.id === pedidoEditavelId),
+    'pedidos salvos: cada vendedor vê só os pedidos que ele fechou');
+  res = await req('POST', '/api/pedidos', {
+    cliente: { cliente_id: clienteId, nome: 'João Silva Materiais' }, contexto: { lixo: 'x'.repeat(30000) },
+    itens: [{ codigo_sku: '60863', quantidade: 1, preco_unitario: 28.59 }],
+  });
+  salvos = await req('GET', '/api/pedidos/salvos');
+  salvo = salvos.body.pedidos.find(p => p.id === res.body.pedido_id);
+  assert(res.status === 201 && salvo && salvo.contexto === null, 'pedido: contexto grande demais é ignorado (grava o pedido sem ele)');
 
   // 18f) Pedido do app não conta em dobro com o faturado oficial
   // (routes/lib/comprasApp.js): o vendedor fecha no app e o ERP fatura dias
@@ -866,8 +2112,15 @@ async function main() {
     identificador_matriz_filial: 1, descricao_identificador_matriz_filial: 'MATRIZ',
     cnaes_secundarios: [{ codigo: 4742300, descricao: 'x' }, { codigo: 4741500, descricao: 'y' }],
     qsa: [{ nome_socio: 'FULANO DE TAL', qualificacao_socio: 'Sócio-Administrador', codigo_qualificacao_socio: 49 }],
+    opcao_pelo_simples: true, data_opcao_pelo_simples: '2013-10-03', data_exclusao_do_simples: null,
+    opcao_pelo_mei: false, data_opcao_pelo_mei: null, data_exclusao_do_mei: null,
   };
   const conv = brasilApiParaFormatoRadar(respostaBrasilApi);
+  assert(
+    conv.simples.optante === true && conv.simples.dataOpcao === '2013-10-03' && conv.mei.optante === false
+      && brasilApiParaFormatoRadar({ cnpj: '1', opcao_pelo_simples: null }).simples === null,
+    'BrasilAPI: opção pelo Simples/MEI vira {optante, dataOpcao, dataExclusao} como no radar-cnpj; null = desconhecido'
+  );
   assert(
     conv.razaoSocial === 'MATERIAIS SILVA LTDA' && conv.situacao.label === 'Ativa' && conv.porte.label === 'Microempresa'
       && conv.endereco.logradouro === 'DAS FLORES' && conv.endereco.municipio === 'MOGI MIRIM' && conv.endereco.complemento === null
@@ -975,6 +2228,28 @@ async function main() {
   r = await preench.rodarRodada(fd);
   assert(r.consultas === 0 && r.motivo === 'pausado_hoje', 'depois de pausar, não tenta de novo na mesma noite');
 
+  fd = fakeDeps({ pendentes: [1, { id: 2, atualizar: true }] });
+  const pedidos = [];
+  const obterOriginal = fd.obterFicha;
+  fd.obterFicha = async (id, atualizar) => { pedidos.push(`${id}:${!!atualizar}`); return obterOriginal(id); };
+  r = await preench.rodarRodada(fd);
+  assert(pedidos.join() === '1:false,2:true' && r.consultas === 2,
+    'madrugada: cliente sem ficha consulta normal; ficha antiga (sem devedor contumaz/30 dias) é atualizada à força');
+
+  {
+    const respostas = { 1: { fonte: 'cache_vencido', aviso: 'radar-cnpj respondeu 429; reserva: BrasilAPI respondeu 503' },
+      2: { fonte: 'cache_vencido', aviso: 'CNPJ não encontrado', naoEncontrado: true }, 3: { fonte: 'origem' } };
+    const pela = preench.obterFichaDaRodada(async (id) => respostas[id]);
+    const erroDe = async (id, atualizar) => { try { await pela(id, atualizar); return null; } catch (e) { return e; } };
+    const e1 = await erroDe(1, true), e2 = await erroDe(2, true), e3 = await erroDe(3, true), e4 = await erroDe(1, false);
+    assert(e1 && !e1.status && e2 && e2.status === 404 && !e3 && !e4,
+      'madrugada: atualizar ficha com a origem falhando vira erro (pausa a noite; CNPJ não achado registra falha)');
+    fd = fakeDeps({ pendentes: [{ id: 1, atualizar: true }, { id: 2, atualizar: true }] });
+    fd.obterFicha = pela;
+    r = await preench.rodarRodada(fd);
+    assert(r.motivo === 'origem_indisponivel' && r.consultas === 1, 'atualização com as origens fora do ar pausa a noite');
+  }
+
   fd = fakeDeps({ pendentes: muitos, agora: '2026-09-25T15:00:00Z' });
   r = await preench.rodarRodada(fd);
   assert(r.consultas === 0 && r.motivo === 'fora_da_janela' && fd.consultados.length === 0, 'fora da madrugada não consulta nada');
@@ -1003,6 +2278,331 @@ async function main() {
   assert(res.status === 200 && res.body.com_cnpj >= 2 && res.body.faltam === res.body.com_cnpj - res.body.com_ficha
     && res.body.hoje.limite === 40 && res.body.janela === '01h–06h',
     'status do preenchimento devolve progresso, limite e janela');
+
+  // 21a) nome completo dos sócios (routes/lib/nomesSocios.js): o radar-cnpj manda
+  // abreviado desde 25/09/2026; a BrasilAPI ou a ficha anterior completam.
+  {
+    const ns = require('../routes/lib/nomesSocios');
+    assert(ns.casaComAbreviado('FRANCISCO A. M.', 'FRANCISCO DE ASSIS MARTINHAGO')
+      && ns.casaComAbreviado('MAICON B. M.', 'MAICON BORTOLOZZO MARTINHAGO')
+      && ns.casaComAbreviado('JOSÉ A. S.', 'JOSE ANTONIO DA SILVA')
+      && !ns.casaComAbreviado('FRANCISCO A. M.', 'FRANCISCA DE ASSIS MARTINHAGO')
+      && !ns.casaComAbreviado('FRANCISCO A. M.', 'FRANCISCO ALVES')
+      && !ns.nomeAbreviado('CIMENTO SUPER LTDA') && ns.nomeAbreviado('ED W. B. M.'),
+      'sócio abreviado casa com o nome completo pelo 1º nome e as iniciais, sem as partículas (DE, DA...)');
+    const amb = ns.completarNomesSocios([{ nome: 'JOSE A. S.' }, { nome: 'EMPRESA X LTDA' }],
+      [{ nome: 'JOSE ANTONIO SILVA' }, { nome: 'JOSE AUGUSTO SOUZA' }]);
+    const um = ns.completarNomesSocios([{ nome: 'JOSE A. S.', qualificacao: 'Sócio' }],
+      [{ nome: 'JOSE ANTONIO SILVA', dataEntrada: '2020-01-02', faixaEtaria: 5 }]);
+    assert(amb[0].nome === 'JOSE A. S.' && amb[1].nome === 'EMPRESA X LTDA'
+      && um[0].nome === 'JOSE ANTONIO SILVA' && um[0].qualificacao === 'Sócio' && um[0].dataEntrada === '2020-01-02' && um[0].faixaEtaria === 5,
+      'dois nomes completos que batem com o mesmo abreviado: fica abreviado; um só: troca e traz entrada/faixa');
+
+    const tm = require('../routes/lib/telefoneMascarado');
+    assert(tm.completarTelefone('(44) 3•••••03', ['(44) 35681404', '(44) 35681403']) === '(44) 35681403'
+      && tm.completarTelefone('(44) 9•••••21', ['(44) 98282121']) === '(44) 98282121'
+      && tm.completarTelefone('(44) 3•••••03', ['(43) 35681403', '(44) 3568140']) === '(44) 3•••••03'
+      && tm.completarTelefone('(44) 3•••••03', []) === '(44) 3•••••03'
+      && tm.completarTelefone('(44) 32321234', ['(44) 99999999']) === '(44) 32321234',
+      'telefone escondido ("(44) 3•••••03") só é trocado pelo que bate: DDD, dígitos visíveis e tamanho');
+
+    const radarMascarado = { ok: true, data: {
+      razaoSocial: 'DEPEL LTDA', situacao: { label: 'Ativa' }, mascarado: true,
+      contato: { telefone1: '(44) 9•••••21', email: 'd••••••@g••••.com' },
+      devedorContumaz: { consta: true, conferidoEm: '2026-10-16', fonte: 'Receita Federal — lista de devedores contumazes' },
+      socios: [{ nome: 'FRANCISCO A. M.', dataEntrada: '2026-04-22T00:00:00.000Z', faixaEtaria: 8, qualificacao: { descricao: 'Sócio-Administrador' } }],
+    } };
+    const brasilCompleto = { ...respostaBrasilApi, ddd_telefone_1: '4498282121', ddd_telefone_2: '000000000000', qsa: [
+      { nome_socio: 'FRANCISCO DE ASSIS MARTINHAGO', qualificacao_socio: 'Sócio-Administrador', data_entrada_sociedade: '2026-04-22', codigo_faixa_etaria: 8 },
+    ] };
+    mockDb.__seed({ clientes: [
+      { id: 9311, nome: 'DEPEL', documento: '66496887000169' },
+      { id: 9312, nome: 'DEPEL CACHE', documento: '66496887000240' },
+      { id: 9313, nome: 'DEPEL ANTIGA', documento: '66496887000320' },
+    ] });
+    console.warn = () => {};
+    try {
+      simularFetch({ status: 200, body: radarMascarado }, { status: 200, body: brasilCompleto });
+      res = await req('GET', '/api/clientes/9311/ficha-cnpj');
+      const s0 = res.body.ficha && res.body.ficha.socios[0];
+      assert(res.status === 200 && s0.nome === 'FRANCISCO DE ASSIS MARTINHAGO' && s0.dataEntrada === '2026-04-22' && s0.faixaEtaria === 8
+        && chamadas.join() === 'radar,brasilapi' && res.body.ficha.dados_brutos.socios[0].nome === 'FRANCISCO A. M.',
+        'ficha nova com sócio abreviado: nome completo vem da BrasilAPI (dados brutos ficam como vieram)');
+      assert(res.body.ficha.telefone === '(44) 98282121', 'telefone escondido pelo radar-cnpj é completado pela BrasilAPI');
+      res = await req('GET', '/api/clientes/sync');
+      const noSync = ((res.body && res.body.clientes) || []).find((c) => c.id === 9311);
+      assert(res.status === 200 && noSync && noSync.devedor_contumaz === '2026-10-16',
+        '/api/clientes/sync manda devedor_contumaz (dia da conferência) quando o CNPJ consta na lista');
+
+      mockDb.__seed({ fichasCnpj: { 9312: {
+        cliente_id: 9312, razao_social: 'DEPEL LTDA', atualizado_em: new Date().toISOString(), mascarado_completado_em: null,
+        socios: [{ nome: 'FRANCISCO A. M.', qualificacao: 'Sócio-Administrador' }], dados_brutos: radarMascarado.data,
+      } } });
+      simularFetch(new Error('radar não devia ser chamado'), { status: 200, body: brasilCompleto });
+      res = await req('GET', '/api/clientes/9312/ficha-cnpj');
+      const primeira = res.status === 200 && res.body.fonte === 'cache' && res.body.ficha.socios[0].nome === 'FRANCISCO DE ASSIS MARTINHAGO'
+        && chamadas.join() === 'brasilapi';
+      simularFetch(new Error('não devia consultar'), new Error('não devia consultar'));
+      mockDb.__seed({ fichasCnpj: { 9312: { ...res.body.ficha, socios: [{ nome: 'FRANCISCO A. M.' }] } } });
+      res = await req('GET', '/api/clientes/9312/ficha-cnpj');
+      assert(primeira && res.status === 200 && chamadas.length === 0,
+        'ficha já gravada com sócio abreviado completa pela BrasilAPI uma vez, sem consultar o radar; depois não pergunta de novo');
+
+      mockDb.__seed({ fichasCnpj: { 9313: {
+        cliente_id: 9313, razao_social: 'DEPEL LTDA', atualizado_em: new Date().toISOString(),
+        socios: [{ nome: 'FRANCISCO DE ASSIS MARTINHAGO', qualificacao: 'Sócio-Administrador' }],
+      } } });
+      simularFetch({ status: 200, body: radarMascarado }, new Error('fetch failed'));
+      res = await req('POST', '/api/clientes/9313/ficha-cnpj/atualizar');
+      assert(res.status === 200 && res.body.ficha.socios[0].nome === 'FRANCISCO DE ASSIS MARTINHAGO' && chamadas.join() === 'radar,brasilapi',
+        'atualizar a ficha com a BrasilAPI fora do ar mantém o nome completo da ficha anterior');
+
+      mockDb.__seed({ fichasCnpj: { 9313: {
+        cliente_id: 9313, razao_social: 'DEPEL LTDA', atualizado_em: new Date().toISOString(),
+        socios: [{ nome: 'FRANCISCO ALVES MOURA', qualificacao: 'Sócio-Administrador' }],
+      } } });
+      const brasilSocioNovo = { ...brasilCompleto, qsa: [{ ...brasilCompleto.qsa[0], nome_socio: 'FRANCISCO AUGUSTO MELO' }] };
+      simularFetch({ status: 200, body: radarMascarado }, { status: 200, body: brasilSocioNovo });
+      res = await req('POST', '/api/clientes/9313/ficha-cnpj/atualizar');
+      assert(res.status === 200 && res.body.ficha.socios[0].nome === 'FRANCISCO AUGUSTO MELO',
+        'BrasilAPI vale antes da ficha anterior (ex-sócio com as mesmas iniciais não volta)');
+
+      mockDb.__seed({ fichasCnpj: { 9313: {
+        cliente_id: 9313, razao_social: 'DEPEL LTDA', atualizado_em: new Date().toISOString(),
+        dados_brutos: { devedorContumaz: { consta: true, conferidoEm: '2026-10-16' } },
+      } } });
+      simularFetch({ status: 429, body: { ok: false } }, { status: 200, body: brasilCompleto });
+      res = await req('POST', '/api/clientes/9313/ficha-cnpj/atualizar');
+      assert(res.status === 200 && res.body.ficha.dados_brutos.origem === 'brasilapi'
+        && res.body.ficha.dados_brutos.devedorContumaz && res.body.ficha.dados_brutos.devedorContumaz.consta === true,
+        'ficha atualizada pela BrasilAPI (sem a lista) mantém a última conferência de devedor contumaz');
+
+      mockDb.__seed({ clientes: [{ id: 9314, nome: 'SEM BRASILAPI', documento: '66496887000400' }], fichasCnpj: { 9314: {
+        cliente_id: 9314, razao_social: 'X LTDA', atualizado_em: new Date().toISOString(), mascarado_completado_em: null,
+        socios: [{ nome: 'FRANCISCO A. M.' }], dados_brutos: radarMascarado.data,
+      } } });
+      simularFetch(new Error('radar não devia ser chamado'), { status: 503, body: {} });
+      res = await req('GET', '/api/clientes/9314/ficha-cnpj');
+      const falhou = res.status === 200 && res.body.ficha.socios[0].nome === 'FRANCISCO A. M.' && chamadas.join() === 'brasilapi';
+      chamadas.length = 0;
+      res = await req('GET', '/api/clientes/9314/ficha-cnpj');
+      assert(falhou && res.status === 200 && chamadas.length === 0,
+        'BrasilAPI fora do ar: a ficha abre do cache e a abertura seguinte não espera por ela de novo');
+    } finally {
+      global.fetch = fetchOriginal;
+      console.warn = erroSilencioso;
+    }
+  }
+
+  // 21b) posição das lojas pelo endereço da ficha (routes/lib/geocodificacao.js)
+  {
+    const geo = require('../routes/lib/geocodificacao');
+    assert(geo.ruaENumero({ tipo: 'AVENIDA', logradouro: 'COLOMBO', numero: '7266' }).rua === 'AVENIDA COLOMBO'
+      && geo.ruaENumero({ tipo: 'AVENIDA', logradouro: 'AVENIDA COLOMBO', numero: 'S/N' }).rua === 'AVENIDA COLOMBO'
+      && geo.ruaENumero({ tipo: 'RUA', logradouro: 'X', numero: 'S/N' }).numero === ''
+      && geo.ruaENumero({ logradouro: 'X', numero: '0' }).numero === '',
+      'rua com o tipo (sem repetir) e número sem "S/N"/"0", como no botão Waze');
+    const respostaNominatim = (lista, status = 200) => async (url, opts) => {
+      respostaNominatim.ultima = { url, opts };
+      return { ok: status === 200, status, json: async () => lista };
+    };
+    const end = { tipo: 'AVENIDA', logradouro: 'COLOMBO', numero: '7266', municipio: 'MARINGA', uf: 'PR' };
+    let pos = await geo.geocodificarEndereco(end, respostaNominatim([{ lat: '-23.4176', lon: '-51.9775', place_rank: 26, display_name: 'Avenida Colombo, Maringá, Paraná, Brasil' }]));
+    const consultada = new URL(respostaNominatim.ultima.url);
+    assert(pos && pos.latitude === -23.4176 && pos.longitude === -51.9775 && pos.nivel === 'rua'
+      && consultada.searchParams.get('street') === '7266 AVENIDA COLOMBO' && consultada.searchParams.get('city') === 'MARINGA'
+      && consultada.searchParams.get('countrycodes') === 'br' && /CortagRevolutionTools/.test(respostaNominatim.ultima.opts.headers['User-Agent']),
+      `consulta o Nominatim pela rua + número + cidade, com User-Agent do app: ${respostaNominatim.ultima.url}`);
+    pos = await geo.geocodificarEndereco(end, respostaNominatim([{ lat: '-23.41', lon: '-51.97', place_rank: 30, display_name: '7266, Avenida Colombo, Maringá' }]));
+    assert(pos && pos.nivel === 'numero', 'achou o prédio: nível "numero"');
+    pos = await geo.geocodificarEndereco({ logradouro: 'RUA X', numero: '1', municipio: 'SAO JOAO DEL REI', uf: 'MG' },
+      respostaNominatim([{ lat: '-21.13', lon: '-44.26', place_rank: 26, display_name: "Rua X, São João del-Rei, Minas Gerais" }]));
+    assert(pos && pos.nivel === 'rua', 'município com hífen no OSM ("del-Rei") bate com o da ficha ("DEL REI")');
+    const semEspera = async () => {};
+    assert(await geo.geocodificarEndereco(end, respostaNominatim([]), semEspera) === null
+      && await geo.geocodificarEndereco(end, respostaNominatim([{ lat: '-23.42', lon: '-51.93', place_rank: 16, display_name: 'Maringá, Paraná' }]), semEspera) === null
+      && await geo.geocodificarEndereco(end, respostaNominatim([{ lat: '-25.4', lon: '-49.2', place_rank: 26, display_name: 'Avenida Colombo, Curitiba, Paraná' }]), semEspera) === null
+      && await geo.geocodificarEndereco(end, respostaNominatim([{ lat: '38.7', lon: '-9.1', place_rank: 26, display_name: 'Avenida Colombo, Maringa, Portugal' }]), semEspera) === null
+      && await geo.geocodificarEndereco({ ...end, logradouro: '' }, respostaNominatim([]), semEspera) === null,
+      'sem resultado, só a cidade, outro município ou fora do Brasil = não encontrado');
+    // abreviação da ficha por extenso; letra sozinha no meio é inicial e fica
+    assert(geo.expandirAbreviacoes('AVENIDA PRES CASTELO BRANCO') === 'AVENIDA PRESIDENTE CASTELO BRANCO'
+      && geo.expandirAbreviacoes('AVENIDA GOV. PAULO CRUZ PIMENTEL') === 'AVENIDA GOVERNADOR PAULO CRUZ PIMENTEL'
+      && geo.expandirAbreviacoes('AVENIDA DR DIDIO B BELLO') === 'AVENIDA DOUTOR DIDIO B BELLO'
+      && geo.expandirAbreviacoes('AV BRASIL') === 'AVENIDA BRASIL'
+      && geo.expandirAbreviacoes('RUA NEY BRAGA') === 'RUA NEY BRAGA',
+      'abreviações do endereço da ficha por extenso');
+    const buscas = geo.buscasDoEndereco({ tipo: 'AVENIDA', logradouro: 'PRES CASTELO BRANCO', numero: '2381', municipio: 'IPORA', uf: 'PR' });
+    assert(buscas.length === 4 && buscas[0].street === '2381 AVENIDA PRES CASTELO BRANCO'
+      && buscas[1].street === '2381 AVENIDA PRESIDENTE CASTELO BRANCO' && buscas[2].street === 'AVENIDA PRESIDENTE CASTELO BRANCO'
+      && buscas[3].q === 'AVENIDA PRESIDENTE CASTELO BRANCO, IPORA, PR' && buscas[2].city === 'IPORA' && buscas[2].state === 'PR',
+      `buscas em ordem: como está, por extenso, sem número, busca livre: ${JSON.stringify(buscas)}`);
+    assert(geo.buscasDoEndereco({ tipo: 'RUA', logradouro: 'NEY BRAGA', numero: 'S/N', municipio: 'CAMPO MOURAO' }).length === 2,
+      'sem abreviação e sem número não repete a mesma busca');
+    {
+      const urls = [];
+      let esperas = 0;
+      const fetchSo3a = async (url) => {
+        urls.push(new URL(url));
+        const achou = urls.length === 3;
+        return { ok: true, status: 200, json: async () => (achou
+          ? [{ lat: '-23.6', lon: '-52.0', place_rank: 26, display_name: 'Avenida Presidente Castelo Branco, Iporã, Paraná' }] : []) };
+      };
+      const p3 = await geo.geocodificarEndereco({ tipo: 'AVENIDA', logradouro: 'PRES CASTELO BRANCO', numero: '2381', municipio: 'IPORA', uf: 'PR' },
+        fetchSo3a, async (ms) => { if (ms >= 1000) esperas++; });
+      assert(p3 && p3.nivel === 'rua' && urls.length === 3 && esperas === 2
+        && urls[2].searchParams.get('street') === 'AVENIDA PRESIDENTE CASTELO BRANCO',
+        'não achou como está na ficha: tenta por extenso e sem número, esperando 1 s+ entre as consultas');
+    }
+    // só achou a rua: tenta pelo número com o nome da rua do OSM (address.road)
+    {
+      const ruaNominatim = respostaNominatim([{ lat: '-23.4272', lon: '-51.9111', place_rank: 26, name: 'Avenida Brasil',
+        address: { road: 'Avenida Brasil' }, display_name: 'Avenida Brasil, Maringá, Paraná, Brasil' }]);
+      const depel = { tipo: 'AVENIDA', logradouro: 'BRASIL', numero: '4516', municipio: 'MARINGA', uf: 'PR' };
+      let pedido = null;
+      let p = await geo.geocodificarEndereco(depel, ruaNominatim, semEspera,
+        async (q) => { pedido = q; return { latitude: -23.4207, longitude: -51.9463, nivel: 'interpolado' }; });
+      assert(p && p.nivel === 'interpolado' && p.latitude === -23.4207 && p.numeroTentado === true
+        && pedido && pedido.rua === 'Avenida Brasil' && pedido.numero === '4516' && pedido.latitude === -23.4272
+        && new URL(respostaNominatim.ultima.url).searchParams.get('addressdetails') === '1',
+        `ponto da rua refinado pelo número (rua do OSM + número da ficha): ${JSON.stringify({ p, pedido })}`);
+      p = await geo.geocodificarEndereco(depel, ruaNominatim, semEspera, async () => null);
+      assert(p && p.nivel === 'rua' && p.latitude === -23.4272 && p.numeroTentado === true, 'sem dado pro número: fica a rua, tentativa marcada');
+      p = await geo.geocodificarEndereco(depel, ruaNominatim, semEspera, async () => { throw new Error('Overpass respondeu 504'); });
+      assert(p && p.nivel === 'rua' && p.numeroTentado === false && p.overpassFalhou === true,
+        'Overpass fora do ar: fica a rua e tenta de novo (não para a noite), falha contada');
+      p = await geo.geocodificarEndereco(depel, ruaNominatim, semEspera, async () => { const e = new Error('já falhou'); e.pausado = true; throw e; });
+      assert(p && p.numeroTentado === false && p.overpassFalhou === false, 'Overpass pulado (já falhou na noite): não conta falha pra loja');
+      assert(pedido && pedido.municipio === 'MARINGA'
+        && new URL(respostaNominatim.ultima.url).searchParams.get('namedetails') === '1', 'manda o município (filtra addr:city) e pede namedetails');
+      const comNomeCru = respostaNominatim([{ lat: '-23.4', lon: '-51.9', place_rank: 26, name: 'Brazil Avenue',
+        namedetails: { name: 'Avenida Brasil', 'name:en': 'Brazil Avenue' }, address: { road: 'Brazil Avenue' }, display_name: 'Avenida Brasil, Maringá' }]);
+      await geo.geocodificarEndereco(depel, comNomeCru, semEspera, async (q) => { pedido = q; return null; });
+      assert(pedido.rua === 'Avenida Brasil', 'usa o "name" cru do OSM (namedetails), não o traduzido');
+      let chamou = false;
+      p = await geo.geocodificarEndereco({ ...depel, numero: 'S/N' }, ruaNominatim, semEspera, async () => { chamou = true; return null; });
+      assert(p && p.nivel === 'rua' && !chamou, 'ficha sem número não consulta o Overpass');
+    }
+    // cálculo pelo número (routes/lib/posicaoPeloNumero.js): rua reta a leste,
+    // 1 número = 1 m; endereços a ~20 m da rua
+    {
+      const ppn = require('../routes/lib/posicaoPeloNumero');
+      const grau = 1 / (111320 * Math.cos(23.4 * Math.PI / 180));
+      const naRua = (m) => [-51.95 + m * grau, -23.4];
+      const casa = (m) => [-51.95 + m * grau, -23.4 + 0.00018];
+      const linhas = [[naRua(0), naRua(1500)], [naRua(1500), naRua(3000)]];
+      const ends = (...ns) => new Map(ns.map((n) => [n, casa(n)]));
+      const longe = (r, m) => r && ppn.distM([r.longitude, r.latitude], casa(m));
+      let r = ppn.estimarPeloNumero({ enderecos: ends(1000, 1400), linhas, numero: 1200 });
+      assert(r && r.nivel === 'interpolado' && r.modo === 'entre' && longe(r, 1200) < 30, `entre dois números, pelo traçado: ${JSON.stringify(r)}`);
+      r = ppn.estimarPeloNumero({ enderecos: ends(500, 700), linhas, numero: 900 });
+      assert(r && r.nivel === 'interpolado' && r.modo === 'um_lado' && longe(r, 900) < 30, `de um lado só, perto: ${JSON.stringify(r)}`);
+      r = ppn.estimarPeloNumero({ enderecos: ends(500, 700), linhas, numero: 2200 });
+      assert(r && r.nivel === 'estimado' && longe(r, 2200) < 40, `de um lado só, longe (1500 números): estimado ${JSON.stringify(r)}`);
+      r = ppn.estimarPeloNumero({ enderecos: ends(2200, 2400), linhas, numero: 1000 });
+      assert(r && r.modo === 'um_lado' && longe(r, 1000) < 40, 'de um lado só, números acima: anda pra trás');
+      assert(ppn.estimarPeloNumero({ enderecos: ends(700), linhas, numero: 900 }) === null
+        && ppn.estimarPeloNumero({ enderecos: ends(700, 750), linhas, numero: 900 }) === null,
+        'um número só (ou dois muito perto) não dá direção: não calcula');
+      r = ppn.estimarPeloNumero({ enderecos: ends(1000, 1400), linhas: [], numero: 1200 });
+      assert(r && r.modo === 'entre_reta' && r.nivel === 'interpolado' && longe(r, 1200) < 5, 'sem traçado, vão até 600: reta');
+      r = ppn.estimarPeloNumero({ enderecos: ends(100, 2000), linhas: [], numero: 1200 });
+      assert(r && r.modo === 'entre_reta' && r.nivel === 'estimado', 'sem traçado, vão grande: reta como estimado');
+      assert(ppn.estimarPeloNumero({ enderecos: new Map([[100, casa(100)], [200, casa(1500)]]), linhas, numero: 150 }) === null,
+        'metros por número absurdo (100 números em 1,4 km): descarta');
+      r = ppn.estimarPeloNumero({ enderecos: ends(1000, 1400), linhas, numero: 1400 });
+      assert(r && r.nivel === 'numero' && r.modo === 'exato', 'o próprio número no OSM');
+      r = ppn.estimarPeloNumero({ enderecos: new Map([[1400, [-51.9, -23.45]]]), linhas, numero: 1400 });
+      assert(r === null, 'o próprio número longe do traçado (rua homônima no raio) não vira "numero"');
+      const overpass = { elements: [
+        { type: 'way', tags: { highway: 'primary', name: 'Avenida Brasil' }, geometry: [{ lat: -23.4, lon: -51.95 }, { lat: -23.4, lon: -51.9 }] },
+        { type: 'node', lat: -23.4001, lon: -51.94, tags: { 'addr:housenumber': '1000', 'addr:street': 'Avenida Brasil' } },
+        { type: 'way', tags: { 'addr:housenumber': '1400A', 'addr:street': 'Avenida Brasil' }, geometry: [{ lat: -23.4001, lon: -51.936 }, { lat: -23.4003, lon: -51.936 }] },
+      ] };
+      let enviado = null;
+      const o = await ppn.consultarOverpass({ latitude: -23.4, longitude: -51.94, rua: 'Avenida "X"' },
+        async (url, opts) => { enviado = { url, opts }; return { ok: true, status: 200, json: async () => overpass }; });
+      const corpo = new URLSearchParams(enviado.opts.body).get('data');
+      assert(o.linhas.length === 1 && o.enderecos.get(1000)[0] === -51.94 && o.enderecos.has(1400)
+        && enviado.url === ppn.OVERPASS_URL && /around:6000,-23\.4,-51\.94/.test(corpo) && corpo.includes('"Avenida \\"X\\""'),
+        `Overpass: endereços (nó e prédio) e traçado da rua, nome escapado: ${corpo}`);
+      let erroOv = null;
+      try { await ppn.consultarOverpass({ latitude: -23.4, longitude: -51.94, rua: 'X' }, async () => ({ ok: false, status: 504 })); } catch (e) { erroOv = e; }
+      assert(erroOv && /504/.test(erroOv.message), 'Overpass fora do ar lança erro');
+      erroOv = null;
+      try {
+        await ppn.consultarOverpass({ latitude: -23.4, longitude: -51.94, rua: 'X' },
+          async () => ({ ok: true, status: 200, json: async () => ({ remark: 'runtime error: Query timed out in "query" at line 1 after 26 seconds.', elements: [] }) }));
+      } catch (e) { erroOv = e; }
+      assert(erroOv && /timed out/.test(erroOv.message), 'Overpass 200 com consulta estourada (remark) é falha, não "sem dado"');
+      const outraCidade = await ppn.consultarOverpass({ latitude: -23.4, longitude: -51.94, rua: 'Avenida Brasil', municipio: 'MARINGA' },
+        async () => ({ ok: true, status: 200, json: async () => ({ elements: [
+          { type: 'node', lat: -23.40, lon: -51.94, tags: { 'addr:housenumber': '100', 'addr:city': 'Maringá' } },
+          { type: 'node', lat: -23.41, lon: -51.95, tags: { 'addr:housenumber': '200', 'addr:city': 'Sarandi' } },
+          { type: 'node', lat: -23.42, lon: -51.96, tags: { 'addr:housenumber': '300' } },
+        ] }) }));
+      assert(outraCidade.enderecos.has(100) && !outraCidade.enderecos.has(200) && outraCidade.enderecos.has(300),
+        'endereço com addr:city de outro município (conurbação) fica de fora; sem addr:city entra');
+    }
+    let erroOrigem = null;
+    try { await geo.geocodificarEndereco(end, respostaNominatim([], 429)); } catch (e) { erroOrigem = e; }
+    assert(erroOrigem && erroOrigem.origem === true, 'Nominatim no limite (429) é erro da origem, não do cliente');
+
+    const fakeGeo = ({ estado = null, pendentes = [], resultados = {}, agora = '2026-09-25T05:00:00Z' } = {}) => {
+      const d = {
+        estadoSalvo: estado, gravados: [], falhas: [], esperas: 0,
+        agora: () => new Date(agora),
+        esperar: async () => { d.esperas++; },
+        lerEstado: async () => d.estadoSalvo,
+        salvarEstado: async (e) => { d.estadoSalvo = { ...e }; },
+        listarPendentes: async (limite) => pendentes.slice(0, limite),
+        geocodificar: async (c) => {
+          const r = resultados[c.id];
+          if (r === 'origem') { const e = new Error('Nominatim respondeu 503'); e.origem = true; throw e; }
+          return r === undefined ? { latitude: -23, longitude: -51, nivel: 'rua' } : r;
+        },
+        gravarPosicao: async (c) => { d.gravados.push(c.id); },
+        registrarFalha: async (c) => { d.falhas.push(c.id); },
+      };
+      return d;
+    };
+    const clientesGeo = Array.from({ length: 200 }, (_, i) => ({ id: i + 1 }));
+    let g = fakeGeo({ pendentes: clientesGeo });
+    let rg = await geo.rodarRodada(g);
+    assert(rg.consultas === geo.LIMITE_DIARIO && g.gravados.length === geo.LIMITE_DIARIO && g.esperas === geo.LIMITE_DIARIO - 1,
+      `geocodificação para no limite da noite (${geo.LIMITE_DIARIO}), com espera entre consultas`);
+    g = fakeGeo({ pendentes: [{ id: 1 }, { id: 2 }, { id: 3 }], resultados: { 2: null } });
+    rg = await geo.rodarRodada(g);
+    assert(g.gravados.join() === '1,3' && g.falhas.join() === '2', 'endereço não encontrado registra falha e segue');
+    g = fakeGeo({ pendentes: [{ id: 1 }, { id: 2 }, { id: 3 }], resultados: { 2: 'origem' } });
+    rg = await geo.rodarRodada(g);
+    assert(rg.motivo === 'origem_indisponivel' && g.gravados.join() === '1' && g.falhas.length === 0 && g.estadoSalvo.pausado_no_dia === '2026-09-25',
+      'Nominatim fora do ar para a noite sem culpar o cliente');
+    rg = await geo.rodarRodada(fakeGeo({ pendentes: clientesGeo, agora: '2026-09-25T15:00:00Z' }));
+    assert(rg.consultas === 0 && rg.motivo === 'fora_da_janela', 'geocodificação só de madrugada');
+
+    mockDb.__seed({
+      clientes: [
+        { id: 9861, nome: 'GEO COM GPS', latitude: -23.1, longitude: -51.1 },
+        { id: 9862, nome: 'GEO PELO ENDERECO' },
+        { id: 9863, nome: 'GEO FALTA' },
+        { id: 9864, nome: 'GEO NAO ACHOU' },
+      ],
+      fichasCnpj: {
+        9862: { logradouro: 'A', numero: '1', municipio: 'MARINGA', uf: 'PR' },
+        9863: { logradouro: 'B', numero: '2', municipio: 'MARINGA', uf: 'PR' },
+        9864: { logradouro: 'C', numero: '3', municipio: 'MARINGA', uf: 'PR' },
+      },
+      geocodificacao: {
+        9862: { endereco: '|A|1|MARINGA|PR', latitude: -23.4, longitude: -51.9, nivel: 'interpolado', tentativas: 0 },
+        9864: { endereco: '|C|3|MARINGA|PR', latitude: null, longitude: null, nivel: null, tentativas: 3 },
+      },
+    });
+    res = await req('GET', '/api/geocodificacao/status');
+    assert(res.status === 200 && res.body.com_gps >= 1 && res.body.pelo_endereco >= 1 && res.body.nao_encontrados >= 1
+      && res.body.faltam >= 1 && res.body.limite === geo.LIMITE_DIARIO && res.body.pelo_numero >= 1,
+      `status da posição das lojas pro Painel: ${JSON.stringify(res.body)}`);
+  }
 
   // 22) Política Comercial: o percentual do classificatório vem do NOME
   // (routes/lib/politicaComercial.js), não do número do relatório do ERP -
@@ -1067,6 +2667,2231 @@ async function main() {
       && (abcDesc.body || []).some(r => r.codigo_sku === '99110' && r.produto === 'CORTADOR HD-900'),
     `produto fora da tabela de preços aparece com a Descrição do relatório (histórico e curva ABC): ${JSON.stringify((histDesc.body || []).filter(r => r.codigo_sku === '99110'))}`
   );
+
+  // 25) Aba de pedidos à vista aguardando pagamento: a importação troca a
+  // lista inteira (o pedido que saiu da aba foi pago), relatório sem a aba
+  // não mexe, e o histórico do cliente devolve os pendentes dele - também
+  // quando a aba não traz o código do cliente (casa pelo Nr.Pedido).
+  mockDb.__seed({ clientes: [{ id: 9405, nome: 'LOJA A VISTA', codigo_oficial: 'COD9405' }] });
+  res = await req('POST', '/api/pedidos-oficiais/importar', {
+    itens: [{ nr_pedido: 'AV1', codigo_sku: '1001', cliente_codigo_oficial: 'COD9405', cliente_nome: 'LOJA A VISTA', status: 'carteira',
+      valor: 300, quantidade: 1, data_implantacao: '2026-09-20' }],
+    pendentes_pagamento: [
+      { nr_pedido: 'AV1', valor: 100, data_implantacao: '2026-09-20' },
+      { nr_pedido: 'AV1', valor: 200 },
+      { nr_pedido: '0000777', cliente_codigo_oficial: 'COD9405', valor: 50, data_implantacao: '2026-09-22' },
+      { nr_pedido: '888', cliente_codigo_oficial: 'OUTRO', valor: 10 },
+      { valor: 99 },
+    ],
+  });
+  const clienteAV = mockDb.__getClientes().find(c => c.codigo_oficial === 'COD9405').id;
+  let histAV = await req('GET', '/api/pedidos-oficiais/' + clienteAV);
+  const pendAV = (histAV.body && histAV.body.pendentes_pagamento) || [];
+  assert(
+    res.status < 300 && res.body.pendentesPagamento === 3 && pendAV.length === 2
+      && pendAV.some(p => p.nr_pedido === 'AV1' && Number(p.valor) === 300) && pendAV.some(p => p.nr_pedido === '777'),
+    `à vista pendente: importa a aba (soma por pedido, zeros à esquerda) e o histórico do cliente mostra os dele: ${JSON.stringify(pendAV)}`
+  );
+  res = await req('POST', '/api/pedidos-oficiais/importar', {
+    itens: [{ nr_pedido: 'AV2', codigo_sku: '1001', cliente_codigo_oficial: 'COD9405', cliente_nome: 'LOJA A VISTA', status: 'carteira', valor: 1, quantidade: 1 }],
+  });
+  const aindaTres = mockDb.__getPedidosPendentesPagamento().length === 3;
+  res = await req('POST', '/api/pedidos-oficiais/importar', { pendentes_pagamento: [{ nr_pedido: '777', cliente_codigo_oficial: 'COD9405' }] });
+  histAV = await req('GET', '/api/pedidos-oficiais/' + clienteAV);
+  assert(
+    aindaTres && res.status < 300 && histAV.body.pendentes_pagamento.length === 1 && histAV.body.pendentes_pagamento[0].nr_pedido === '777',
+    `à vista pendente: relatório sem a aba não mexe; com a aba, o pedido que saiu dela (pago) some: ${JSON.stringify(histAV.body.pendentes_pagamento)}`
+  );
+
+  // 26) Aba "Pendentes à Vista": títulos (nota fiscal + parcela) de pedido já
+  // faturado com boleto à vista em aberto - ligados ao cliente pelo código ou
+  // pela nota fiscal; mesma regra de foto (sumiu da aba = pago).
+  mockDb.__seed({ clientes: [{ id: 9406, nome: 'LOJA TITULO', codigo_oficial: 'COD9406' }] });
+  res = await req('POST', '/api/pedidos-oficiais/importar', {
+    itens: [{ nr_pedido: 'TT1', codigo_sku: '1001', cliente_codigo_oficial: 'COD9406', cliente_nome: 'LOJA TITULO', status: 'faturado',
+      valor: 9917.82, quantidade: 1, data_implantacao: '2026-09-20', data_faturamento: '2026-09-22', nota_fiscal: '919895' }],
+    titulos_avista: [
+      { titulo: 919895, parcela: 1, vencimento: '2026-09-25', valor: 9917.82 },
+      { titulo: '000555', parcela: 1, cliente_codigo_oficial: 'COD9406', vencimento: '2026-10-05', valor: 100 },
+      { titulo: '777', parcela: 1, cliente_codigo_oficial: 'OUTRO', valor: 1 },
+      { valor: 3 },
+    ],
+  });
+  const clienteTT = mockDb.__getClientes().find(c => c.codigo_oficial === 'COD9406').id;
+  let histTT = await req('GET', '/api/pedidos-oficiais/' + clienteTT);
+  const titTT = (histTT.body && histTT.body.titulos_avista) || [];
+  const pendentesAntes = mockDb.__getPedidosPendentesPagamento().length;
+  assert(
+    res.status < 300 && res.body.titulosAvista === 3 && res.body.pendentesPagamento === null && pendentesAntes > 0
+      && titTT.length === 2 && titTT.some(t => t.titulo === '919895' && t.parcela === '1') && titTT.some(t => t.titulo === '555'),
+    `títulos à vista: importa a aba (sem mexer nos pedidos aguardando pagamento) e o histórico mostra os do cliente, pela NF ou pelo código: ${JSON.stringify(titTT)}`
+  );
+  res = await req('POST', '/api/pedidos-oficiais/importar', { titulos_avista: [] });
+  histTT = await req('GET', '/api/pedidos-oficiais/' + clienteTT);
+  assert(res.status < 300 && histTT.body.titulos_avista.length === 0, 'títulos à vista: aba vazia no relatório novo = todos pagos');
+
+  // 27) Faturamento não conta pedido à vista com título pendente (a NF já está
+  // na aba Faturamento, mas o pedido só é faturado depois do pagamento):
+  // Curva ABC sem o item enquanto o título está na aba; pago (sumiu), volta.
+  const hojeISO = new Date().toISOString().slice(0, 10);
+  res = await req('POST', '/api/pedidos-oficiais/importar', {
+    itens: [
+      { nr_pedido: 'FV1', codigo_sku: '99771', cliente_codigo_oficial: 'COD9406', cliente_nome: 'LOJA TITULO', status: 'faturado',
+        valor: 700, quantidade: 7, data_implantacao: hojeISO, data_faturamento: hojeISO, nota_fiscal: '990001' },
+      { nr_pedido: 'FV2', codigo_sku: '99772', cliente_codigo_oficial: 'COD9406', cliente_nome: 'LOJA TITULO', status: 'faturado',
+        valor: 50, quantidade: 1, data_implantacao: hojeISO, data_faturamento: hojeISO, nota_fiscal: '990002' },
+    ],
+    titulos_avista: [{ titulo: '990001', parcela: 1, valor: 700 }],
+  });
+  let abcFV = await req('GET', '/api/produtos-abc-geral');
+  const pendenteFora = !(abcFV.body || []).some(r => r.codigo_sku === '99771') && (abcFV.body || []).some(r => r.codigo_sku === '99772');
+  await req('POST', '/api/pedidos-oficiais/importar', { titulos_avista: [] });
+  abcFV = await req('GET', '/api/produtos-abc-geral');
+  assert(
+    res.status < 300 && pendenteFora && (abcFV.body || []).some(r => r.codigo_sku === '99771'),
+    'faturamento: item de pedido à vista com título pendente fica fora da Curva ABC e volta quando o título é pago'
+  );
+
+  // 28) Produto faturado só em parte: o saldo da Carteira e cada nota fiscal
+  // do mesmo código ficam em linhas próprias (antes a chave era só
+  // nr_pedido + codigo_sku e uma linha sobrescrevia a outra - sumia o saldo, e
+  // da entrega em duas notas ficava só a última).
+  const { planejarCarteira } = require('../routes/pedidosOficiais');
+  const plano = planejarCarteira([
+    { nr_pedido: 'X1', codigo_sku: 'A', status: 'faturado', nota_fiscal: '1', situacao_pedido: 'Atendido Parcial' },
+    { nr_pedido: 'X1', codigo_sku: 'A', status: 'carteira', situacao_pedido: 'Atendido Parcial' },
+    { nr_pedido: 'X1', codigo_sku: 'B', status: 'faturado', nota_fiscal: '1', situacao_pedido: 'Atendido Parcial' },
+    { nr_pedido: 'X2', codigo_sku: 'C', status: 'faturado', nota_fiscal: '2', situacao_pedido: 'Atendido Total' },
+    { nr_pedido: 'X2', codigo_sku: 'D', status: 'carteira', situacao_pedido: 'Atendido Total' },
+  ]);
+  assert(
+    plano.gravar.length === 4 && !plano.gravar.some(it => it.codigo_sku === 'D')
+      && JSON.stringify(plano.pedidosConcluidos) === '["X2"]'
+      && JSON.stringify(plano.paresSemSaldo) === '[{"nr_pedido":"X1","codigo_sku":"B"}]',
+    `planejarCarteira: saldo do faturado em parte fica, pedido Atendido Total não fica com carteira: ${JSON.stringify(plano)}`
+  );
+
+  // cenário próprio: os relatórios daqui são de setembro, depois do de hoje do teste 27
+  mockDb.__setConfiguracao('relatorio_oficial_mais_novo', null);
+  mockDb.__seed({
+    clientes: [{ id: 9407, nome: 'LOJA PARCIAL', codigo_oficial: 'COD9407' }],
+    pedidosOficiaisItens: [
+      // item cancelado no ERP: pedido depois sai como Atendido Total sem ele
+      { nr_pedido: 'PZ29407', codigo_sku: '62001', cliente_codigo_oficial: 'COD9407', quantidade: 3, valor: 30, data_implantacao: '2026-09-01', status: 'carteira', situacao_pedido: 'Aberto' },
+      // relatório só com o Faturamento: o faturado ainda apaga o saldo (como antes)
+      { nr_pedido: 'PZ39407', codigo_sku: '62002', cliente_codigo_oficial: 'COD9407', quantidade: 2, valor: 20, data_implantacao: '2026-09-01', status: 'carteira', situacao_pedido: 'Aberto' },
+      { nr_pedido: 'PZ39407', codigo_sku: '62003', cliente_codigo_oficial: 'COD9407', quantidade: 5, valor: 50, data_implantacao: '2026-09-01', status: 'carteira', situacao_pedido: 'Aberto' },
+    ],
+  });
+  const base9407 = { cliente_codigo_oficial: 'COD9407', cliente_nome: 'LOJA PARCIAL', data_implantacao: '2026-09-01' };
+  const linhasPC = (nr) => mockDb.__getPedidosOficiaisItens().filter(it => it.nr_pedido === nr);
+  // relatório 1: 6 de 10 faturados na NF 5001, 4 ainda na Carteira
+  res = await req('POST', '/api/pedidos-oficiais/importar', {
+    itens: [
+      { ...base9407, nr_pedido: 'PZ19407', codigo_sku: '60863', status: 'carteira', quantidade: 4, valor: 40, situacao_pedido: 'Atendido Parcial' },
+      { ...base9407, nr_pedido: 'PZ19407', codigo_sku: '60863', status: 'faturado', quantidade: 6, valor: 60, data_faturamento: '2026-09-05', nota_fiscal: '5001', situacao_pedido: 'Atendido Parcial' },
+      { ...base9407, nr_pedido: 'PZ29407', codigo_sku: '62004', status: 'faturado', quantidade: 1, valor: 10, data_faturamento: '2026-09-05', nota_fiscal: '5002', situacao_pedido: 'Atendido Total' },
+      { ...base9407, nr_pedido: 'PZ39407', codigo_sku: '62002', status: 'faturado', quantidade: 2, valor: 20, data_faturamento: '2026-09-05', nota_fiscal: '5003', situacao_pedido: 'Atendido Parcial' },
+    ],
+  });
+  const pc1Rel1 = linhasPC('PZ19407');
+  assert(
+    res.status < 300 && pc1Rel1.length === 2
+      && pc1Rel1.some(it => it.status === 'carteira' && Number(it.quantidade) === 4)
+      && pc1Rel1.some(it => it.status === 'faturado' && it.nota_fiscal === '5001' && Number(it.quantidade) === 6),
+    `importação: produto faturado em parte guarda o faturado e o saldo em carteira: ${JSON.stringify(pc1Rel1)}`
+  );
+  assert(
+    linhasPC('PZ29407').length === 1 && linhasPC('PZ29407')[0].status === 'faturado'
+      && linhasPC('PZ39407').length === 2 && !linhasPC('PZ39407').some(it => it.codigo_sku === '62002' && it.status === 'carteira')
+      && linhasPC('PZ39407').some(it => it.codigo_sku === '62003' && it.status === 'carteira'),
+    `importação: pedido Atendido Total perde o que sobrou em carteira; produto faturado sem saldo sai da carteira: ${JSON.stringify([...linhasPC('PZ29407'), ...linhasPC('PZ39407')])}`
+  );
+  // relatório 2: o saldo saiu na NF 5009 - duas notas do mesmo código, sem carteira
+  res = await req('POST', '/api/pedidos-oficiais/importar', {
+    itens: [
+      { ...base9407, nr_pedido: 'PZ19407', codigo_sku: '60863', status: 'faturado', quantidade: 6, valor: 60, data_faturamento: '2026-09-05', nota_fiscal: '5001', situacao_pedido: 'Atendido Total' },
+      { ...base9407, nr_pedido: 'PZ19407', codigo_sku: '60863', status: 'faturado', quantidade: 4, valor: 40, data_faturamento: '2026-09-12', nota_fiscal: '5009', situacao_pedido: 'Atendido Total' },
+    ],
+  });
+  const pc1Rel2 = linhasPC('PZ19407');
+  assert(
+    res.status < 300 && pc1Rel2.length === 2 && pc1Rel2.every(it => it.status === 'faturado')
+      && pc1Rel2.reduce((s, it) => s + Number(it.quantidade), 0) === 10,
+    `importação: entrega em duas notas do mesmo código guarda as duas, e o saldo sai da carteira: ${JSON.stringify(pc1Rel2)}`
+  );
+  // as duas notas do mesmo pedido são uma compra só no histórico/rotatividade
+  const hist9407 = await req('GET', '/api/clientes/9407/historico');
+  const disco9407 = (hist9407.body || []).find(r => r.codigo_sku === '60863');
+  assert(
+    hist9407.status === 200 && disco9407 && disco9407.total_acumulado === 10 && disco9407.num_pedidos === 1
+      && disco9407.media_dias_entre_pedidos === null && disco9407.primeira_compra === disco9407.ultima_compra,
+    `histórico: entrega dividida em duas notas conta como uma compra: ${JSON.stringify(disco9407)}`
+  );
+
+  // 28b) Relatório oficial mais antigo que o já importado (reimportado por engano,
+  // e-mail atrasado): grava só as linhas faturadas e as descrições - não recria
+  // saldo em carteira já faturado (carteira e faturada têm chaves diferentes) e
+  // não volta as listas à vista pra foto antiga.
+  {
+    const { dataDoRelatorio } = require('../routes/pedidosOficiais');
+    assert(dataDoRelatorio([{ data_implantacao: '2026-09-15', data_faturamento: '2026-09-20' }, { data_implantacao: '2062-09-01' }], [{ data_implantacao: '2026-09-18' }], new Date('2026-10-05T12:00:00Z')) === '2026-09-20'
+      && dataDoRelatorio([], null) === null
+      // amanhã (Brasília) também é erro de planilha: senão o relatório do dia seguinte sairia "antigo"
+      && dataDoRelatorio([{ data_implantacao: '2026-10-06' }, { data_implantacao: '2026-10-04' }], [], new Date('2026-10-05T12:00:00Z')) === '2026-10-04',
+      'relatório oficial: a data dele é a mais nova que ele traz (data no futuro é erro de planilha e não conta)');
+    mockDb.__setConfiguracao('relatorio_oficial_mais_novo', null);
+    mockDb.__seed({ clientes: [{ id: 9408, nome: 'LOJA RELATORIO VELHO', codigo_oficial: 'COD9408' }] });
+    const base = { cliente_codigo_oficial: 'COD9408', cliente_nome: 'LOJA RELATORIO VELHO' };
+    const linhas = (nr) => mockDb.__getPedidosOficiaisItens().filter(it => it.nr_pedido === nr);
+    // relatório de 30/09: o pedido já foi todo faturado; nada à vista pendente
+    const r30 = await req('POST', '/api/pedidos-oficiais/importar', {
+      itens: [{ ...base, nr_pedido: 'PV19408', codigo_sku: '60863', status: 'faturado', quantidade: 5, valor: 50, data_implantacao: '2026-09-15', data_faturamento: '2026-09-30', nota_fiscal: '6001', situacao_pedido: 'Atendido Total' }],
+      pendentes_pagamento: [], titulos_avista: [],
+    });
+    // relatório de 20/09 reimportado depois: ainda trazia o saldo em carteira e as listas à vista daquele dia
+    const r20 = await req('POST', '/api/pedidos-oficiais/importar', {
+      itens: [
+        { ...base, nr_pedido: 'PV19408', codigo_sku: '60863', status: 'carteira', quantidade: 5, valor: 50, data_implantacao: '2026-09-15', descricao: 'DISCO DO RELATORIO VELHO', situacao_pedido: 'Aberto' },
+        { ...base, nr_pedido: 'PV29408', codigo_sku: '61362', status: 'faturado', quantidade: 1, valor: 200, data_implantacao: '2026-09-10', data_faturamento: '2026-09-20', nota_fiscal: '5990', situacao_pedido: 'Atendido Total' },
+        { ...base, nr_pedido: 'PV39408', codigo_sku: '61362', status: 'carteira', quantidade: 2, valor: 400, data_implantacao: '2026-09-18', situacao_pedido: 'Aberto' },
+      ],
+      pendentes_pagamento: [{ nr_pedido: 'PV19408', cliente_codigo_oficial: 'COD9408', valor: 50 }],
+      titulos_avista: [{ titulo: '6001', parcela: 1, valor: 50 }],
+    });
+    assert(r30.status === 200 && !r30.body.relatorioAntigo && r30.body.dataRelatorio === '2026-09-30'
+      && r20.status === 200 && r20.body.relatorioAntigo === true && r20.body.carteiraIgnorada === 2 && /20\/09\/2026/.test(r20.body.aviso) && /30\/09\/2026/.test(r20.body.aviso)
+      && r20.body.pendentesPagamento === null && r20.body.titulosAvista === null,
+      `relatório antigo: a resposta diz que é antigo e o que ficou de fora: ${JSON.stringify(r20.body)}`);
+    assert(linhas('PV19408').length === 1 && linhas('PV19408')[0].status === 'faturado' && linhas('PV19408')[0].descricao === 'DISCO DO RELATORIO VELHO'
+      && linhas('PV39408').length === 0
+      && linhas('PV29408').length === 1 && linhas('PV29408')[0].status === 'faturado' && linhas('PV29408')[0].nota_fiscal === '5990'
+      && !mockDb.__getPedidosPendentesPagamento().some(p => p.nr_pedido === 'PV19408') && !mockDb.__getTitulosAvistaPendentes().some(t => t.titulo === '6001')
+      && mockDb.__getConfiguracao('relatorio_oficial_mais_novo') === '2026-09-30',
+      `relatório antigo: não recria o saldo já faturado nem grava carteira, grava o faturado e a descrição, não troca as listas à vista: ${JSON.stringify([linhas('PV19408'), linhas('PV29408'), linhas('PV39408')])}`);
+    // o do mesmo dia (ou mais novo) vale inteiro, como antes
+    const rMesmoDia = await req('POST', '/api/pedidos-oficiais/importar', {
+      itens: [{ ...base, nr_pedido: 'PV49408', codigo_sku: '61362', status: 'carteira', quantidade: 1, valor: 200, data_implantacao: '2026-09-30', situacao_pedido: 'Aberto' }],
+      titulos_avista: [{ titulo: '6001', parcela: 1, valor: 50 }],
+    });
+    assert(rMesmoDia.status === 200 && !rMesmoDia.body.relatorioAntigo && linhas('PV49408').length === 1 && mockDb.__getTitulosAvistaPendentes().some(t => t.titulo === '6001'),
+      `relatório do mesmo dia do mais novo grava a carteira e troca as listas à vista: ${JSON.stringify(rMesmoDia.body)}`);
+    // planilha só com as abas de pagamento (pedido implantado dias antes): não é "antiga",
+    // troca a lista à vista - antes a data dos pendentes a fazia sair antiga sempre
+    const rSoPagamento = await req('POST', '/api/pedidos-oficiais/importar', {
+      pendentes_pagamento: [{ nr_pedido: 'PV59408', cliente_codigo_oficial: 'COD9408', valor: 80, data_implantacao: '2026-09-12' }],
+    });
+    assert(rSoPagamento.status === 200 && !rSoPagamento.body.relatorioAntigo && mockDb.__getPedidosPendentesPagamento().some(p => p.nr_pedido === 'PV59408'),
+      `planilha só com as abas de pagamento troca a lista à vista: ${JSON.stringify(rSoPagamento.body)}`);
+    // NF com zero à esquerda (vinda de fora do importadores.js) grava igual ao
+    // Título da aba "Pendentes à Vista", que liga nela
+    const rNfZeros = await req('POST', '/api/pedidos-oficiais/importar', {
+      itens: [{ ...base, nr_pedido: 'PV69408', codigo_sku: '61362', status: 'faturado', quantidade: 1, valor: 90, data_implantacao: '2026-09-28', data_faturamento: '2026-09-30', nota_fiscal: ' 0006002', situacao_pedido: 'Atendido Total' }],
+      titulos_avista: [{ titulo: '0006002', parcela: 1, valor: 90 }],
+    });
+    assert(rNfZeros.status === 200 && linhas('PV69408').length === 1 && linhas('PV69408')[0].nota_fiscal === '6002'
+      && mockDb.__getTitulosAvistaPendentes().some(t => t.titulo === '6002'),
+      `relatório oficial: NF com zero à esquerda grava como o Título dos pendentes à vista: ${JSON.stringify(linhas('PV69408'))}`);
+    await req('POST', '/api/pedidos-oficiais/importar', { titulos_avista: [], pendentes_pagamento: [] });
+    mockDb.__setConfiguracao('relatorio_oficial_mais_novo', null);
+  }
+
+  // 28b) Filiais com o mesmo nome (mesma razão social, CNPJs diferentes): o código
+  // novo que aparece no relatório vai pra filial de mesmo nome ainda sem código -
+  // nunca troca o código da que já tem outro (ficava trocando a cada relatório)
+  {
+    const nomeF = 'COMERCIO DE MATERIAIS FILIAL TESTE LTDA';
+    mockDb.__seed({ clientes: [
+      { id: 9801, nome: nomeF, codigo_oficial: 'F1', documento: '11.111.111/0001-11' },
+      { id: 9802, nome: nomeF, codigo_oficial: null, documento: '11.111.111/0004-11' },
+    ] });
+    const linha = (cod, nr) => ({ cliente_codigo_oficial: cod, cliente_nome: nomeF, nr_pedido: nr, codigo_sku: '60863', status: 'carteira', quantidade: 1, valor: 10, situacao_pedido: 'Aberto' });
+    const r1 = await req('POST', '/api/pedidos-oficiais/importar', { itens: [linha('F2', 'PF9801')] });
+    const cli = (id) => mockDb.__getClientes().find(c => c.id === id);
+    // terceira filial, todas as de mesmo nome já com código: não troca ninguém
+    const r2 = await req('POST', '/api/pedidos-oficiais/importar', { itens: [linha('F3', 'PF9802')] });
+    assert(r1.status === 200 && cli(9801).codigo_oficial === 'F1' && cli(9802).codigo_oficial === 'F2'
+      && r2.status === 200 && cli(9801).codigo_oficial === 'F1' && cli(9802).codigo_oficial === 'F2',
+      `filial de mesmo nome: código novo vai pra que está sem, nunca troca o de outra: ${JSON.stringify([cli(9801).codigo_oficial, cli(9802).codigo_oficial, r1.body.clientesVinculados, r2.body])}`);
+  }
+
+  // 29) Saldo mínimo em carteira (política de cancelamento): R$ 300, R$ 600 no
+  // Norte/Nordeste pela UF da ficha de CNPJ; sem ficha vale o padrão.
+  const { saldoMinimoDaUf } = require('../routes/lib/saldoMinimo');
+  assert(
+    saldoMinimoDaUf('PR').valor === 300 && saldoMinimoDaUf(' ba ').valor === 600 && saldoMinimoDaUf('BA').regiao === 'Norte/Nordeste'
+      && saldoMinimoDaUf('AM').valor === 600 && saldoMinimoDaUf(null).valor === 300,
+    'saldo mínimo em carteira: R$ 300, R$ 600 no Norte/Nordeste, padrão sem UF'
+  );
+  let oficiais9407 = await req('GET', '/api/pedidos-oficiais/9407');
+  const minimoSemFicha = oficiais9407.body && oficiais9407.body.saldo_minimo;
+  mockDb.__seed({ fichasCnpj: { 9407: { cliente_id: 9407, uf: 'CE' } } });
+  oficiais9407 = await req('GET', '/api/pedidos-oficiais/9407');
+  assert(
+    minimoSemFicha && minimoSemFicha.valor === 300
+      && oficiais9407.body.saldo_minimo && oficiais9407.body.saldo_minimo.valor === 600 && oficiais9407.body.saldo_minimo.uf === 'CE',
+    `pedidos oficiais do cliente trazem o saldo mínimo pela UF da ficha: ${JSON.stringify([minimoSemFicha, oficiais9407.body.saldo_minimo])}`
+  );
+
+  // 29b) Ocorrência no Pós-Vendas (routes/ocorrencias.js): grava quando o
+  // vendedor confirma "Enviei", reenvio do mesmo id_envio não duplica, vem nos
+  // pedidos oficiais do cliente e qualquer vendedor marca resolvida.
+  {
+    const base = { cliente_id: 9407, nr_pedido: '677304', nota_fiscal: '245118', tipo: 'avariado', resumo: '2 un. 62796', id_envio: 'oc-teste-0001' };
+    const r1 = await req('POST', '/api/ocorrencias', base);
+    const r2 = await req('POST', '/api/ocorrencias', { ...base, resumo: 'reenvio' });
+    const invalido = await req('POST', '/api/ocorrencias', { ...base, tipo: 'qualquer', id_envio: 'oc-teste-0002' });
+    const semCliente = await req('POST', '/api/ocorrencias', { ...base, cliente_id: 99999, id_envio: 'oc-teste-0003' });
+    const futuro = await req('POST', '/api/ocorrencias', { ...base, id_envio: 'oc-teste-0004', enviado_em: new Date(Date.now() + 5 * 86400000).toISOString() });
+    // feita sem internet: 3 dias na fila, contados pelo relógio do aparelho e descontados do servidor
+    const envio = new Date(Date.now() + 2 * 86400000); // relógio do celular adiantado 2 dias
+    const fila = await req('POST', '/api/ocorrencias', { ...base, nr_pedido: '677304-1', id_envio: 'oc-teste-0005',
+      hora_toque: new Date(envio.getTime() - 3 * 86400000).toISOString(), enviado_em: envio.toISOString() });
+    const atraso = (Date.now() - Date.parse(fila.body.enviado_em)) / 86400000;
+    assert(fila.status === 200 && atraso > 2.9 && atraso < 3.1,
+      `ocorrência feita sem internet fica com a hora do toque, sem o relógio errado do celular: ${JSON.stringify([fila.status, fila.body, atraso])}`);
+    mockDb.__getOcorrencias().splice(mockDb.__getOcorrencias().findIndex(o => o.id_envio === 'oc-teste-0005'), 1);
+    const lista = await req('GET', '/api/pedidos-oficiais/9407');
+    assert(r1.status === 200 && r1.body.id && r2.status === 200 && r2.body.id === r1.body.id && r2.body.resumo === '2 un. 62796'
+      && invalido.status === 422 && semCliente.status === 404 && futuro.status === 200 && Date.parse(futuro.body.enviado_em) <= Date.now()
+      && mockDb.__getOcorrencias().length === 2
+      && Array.isArray(lista.body.ocorrencias) && lista.body.ocorrencias.length === 2 && lista.body.ocorrencias.every(o => o.nr_pedido === '677304'),
+      `ocorrência: grava, reenvio não duplica, tipo inválido 422, cliente que não existe 404, data futura vira agora, vem nos pedidos oficiais: ${JSON.stringify([r1.status, r2.body, invalido.status, semCliente.status, lista.body.ocorrencias])}`);
+    const resolvida = await req('PATCH', `/api/ocorrencias/${r1.body.id}`, { resolvida: true });
+    const reaberta = await req('PATCH', `/api/ocorrencias/${futuro.body.id}`, { resolvida: false });
+    const naoExiste = await req('PATCH', '/api/ocorrencias/9999', { resolvida: true });
+    const semCampo = await req('PATCH', `/api/ocorrencias/${r1.body.id}`, {});
+    assert(resolvida.status === 200 && resolvida.body.resolvida_em && reaberta.status === 200 && reaberta.body.resolvida_em === null
+      && naoExiste.status === 404 && semCampo.status === 422,
+      `ocorrência: marcar resolvida/reabrir, 404 sem a ocorrência, 422 sem o campo: ${JSON.stringify([resolvida.body, reaberta.body, naoExiste.status, semCampo.status])}`);
+  }
+
+  // 30) Avisos de importação (routes/lib/novidades.js + routes/novidades.js)
+  const nov = require('../routes/lib/novidades');
+  {
+    // push só em dia útil, 7h-20h de Brasília (UTC-3)
+    const j = (iso) => nov.proximaJanelaPush(new Date(iso)).toISOString();
+    assert(j('2026-10-07T13:00:00Z') === '2026-10-07T13:00:00.000Z', 'push: quarta 10h sai na hora');
+    assert(j('2026-10-07T23:30:00Z') === '2026-10-08T10:00:00.000Z', 'push: quarta 20h30 fica pra quinta 7h');
+    assert(j('2026-10-07T08:00:00Z') === '2026-10-07T10:00:00.000Z', 'push: quarta 5h fica pras 7h do mesmo dia');
+    assert(j('2026-10-09T23:10:00Z') === '2026-10-12T10:00:00.000Z', 'push: sexta 20h10 fica pra segunda 7h');
+    assert(j('2026-10-10T15:00:00Z') === '2026-10-12T10:00:00.000Z', 'push: sábado fica pra segunda 7h');
+    assert(j('2026-10-12T02:00:00Z') === '2026-10-12T10:00:00.000Z', 'push: domingo 23h fica pra segunda 7h');
+    assert(nov.endpointPushValido('https://fcm.googleapis.com/fcm/send/abc') && nov.endpointPushValido('https://web.push.apple.com/xyz')
+      && !nov.endpointPushValido('http://fcm.googleapis.com/x') && !nov.endpointPushValido('https://exemplo.com/fcm.googleapis.com')
+      && !nov.endpointPushValido('https://googleapis.com.evil.test/x')
+      // hosts exatos: outra API do Google (ou subdomínio inventado) não é servidor de push
+      && nov.endpointPushValido('https://updates.push.services.mozilla.com/wpush/v2/abc')
+      && nov.endpointPushValido('https://wns2-par02p.notify.windows.com/w/?token=abc')
+      && nov.endpointPushValido('https://FCM.googleapis.com/fcm/send/abc')
+      && !nov.endpointPushValido('https://storage.googleapis.com/bucket/x')
+      && !nov.endpointPushValido('https://www.googleapis.com/upload/x')
+      && !nov.endpointPushValido('https://x.fcm.googleapis.com/fcm/send/abc')
+      && !nov.endpointPushValido('https://evil.push.services.mozilla.com/x')
+      && !nov.endpointPushValido('https://api.push.apple.com/3/device/x')
+      && !nov.endpointPushValido('https://a.b.notify.windows.com/w/')
+      && !nov.endpointPushValido('https://notify.windows.com/w/')
+      && !nov.endpointPushValido('https://fcm.googleapis.com:8443/fcm/send/abc')
+      && !nov.endpointPushValido('https://user@fcm.googleapis.com/fcm/send/abc'),
+      'push: só aceita endpoint https dos serviços de push dos navegadores');
+    // inscrição gravada antes da regra de hosts exatos: não recebe o POST e sai do banco
+    mockDb.__getPushInscricoes().push({ id: 9801, usuario_id: 1, endpoint: 'https://storage.googleapis.com/bucket/x', p256dh: 'a', auth: 'b' });
+    const enviadosAntes = webPushEnviados.length;
+    const foi = await nov.enviarPush({ id: 9801, endpoint: 'https://storage.googleapis.com/bucket/x', p256dh: 'a', auth: 'b' }, '{}', 'teste');
+    assert(foi === false && webPushEnviados.length === enviadosAntes && !mockDb.__getPushInscricoes().some(i => i.id === 9801),
+      'push: inscrição antiga com host que não é servidor de push não recebe o POST e é apagada');
+  }
+  // as importações feitas acima (classificatório, objetivos, relatório oficial
+  // várias vezes) viraram novidades - reimportação em até 30 min = a mesma
+  res = await req('GET', '/api/novidades');
+  {
+    const tipos = (res.body.novidades || []).map(n => n.tipo);
+    const rel = (res.body.novidades || []).find(n => n.tipo === 'relatorio-oficial');
+    assert(res.status === 200 && tipos.filter(t => t === 'relatorio-oficial').length === 1 && tipos.includes('classificatorio') && tipos.includes('objetivos-trimestrais')
+      && rel && rel.emoji === '📋' && /^Pedidos até \d{2}\/\d{2}$/.test(rel.texto) && res.body.chave_push === 'BChaveDeTeste_123' && res.body.vistas_ate === null,
+      `novidades: uma por tipo (reimportação junta), com emoji e texto curto: ${JSON.stringify(res.body)}`);
+    const maisNova = res.body.novidades[0].atualizado_em;
+    res = await req('POST', '/api/novidades/vistas', { ate: maisNova });
+    const r2 = await req('GET', '/api/novidades');
+    assert(res.status === 200 && new Date(r2.body.vistas_ate).getTime() === new Date(maisNova).getTime(),
+      `novidades: abrir a lista marca como vistas até a mais nova: ${JSON.stringify(r2.body.vistas_ate)}`);
+    res = await req('POST', '/api/novidades/vistas', { ate: '2020-01-01T00:00:00Z' });
+    assert(new Date(res.body.vistas_ate).getTime() === new Date(maisNova).getTime(), 'novidades: "vistas" nunca volta pra trás');
+  }
+  res = await req('POST', '/api/novidades/push/inscrever', { endpoint: 'http://169.254.169.254/latest', keys: { p256dh: 'abc', auth: 'def' } });
+  assert(res.status === 400, 'push: inscrição com endpoint fora dos serviços de push é recusada');
+  res = await req('POST', '/api/novidades/push/inscrever', { endpoint: 'https://fcm.googleapis.com/fcm/send/aparelho1', keys: { p256dh: 'BPchave-1_x', auth: 'auth1' } });
+  const res2 = await req('POST', '/api/novidades/push/inscrever', { endpoint: 'https://fcm.googleapis.com/fcm/send/morta', keys: { p256dh: 'BPchave2', auth: 'auth2' } });
+  assert(res.status === 200 && res2.status === 200 && mockDb.__getPushInscricoes().length === 2, 'push: aparelho ativa os avisos');
+  await new Promise(r => setTimeout(r, 50));
+  webPushEnviados.length = 0;
+  {
+    const id1 = await nov.avisarImportacao('catalogo-precos', '10 produtos');
+    const id2 = await nov.avisarImportacao('catalogo-precos', '12 produtos');
+    const n = mockDb.__getNovidades().find(x => x.id === id1);
+    assert(id1 && id1 === id2 && n && n.texto === '12 produtos' && mockDb.__getNovidades().filter(x => x.tipo === 'catalogo-precos').length === 1,
+      `aviso: o mesmo tipo em até 30 min atualiza a mesma novidade: ${JSON.stringify([id1, id2, n])}`);
+    // força a janela (o teste pode rodar à noite/fim de semana) e envia
+    await new Promise(r => setTimeout(r, 50));
+    mockDb.__getNovidades().forEach(x => { if (x.id === id1) { x.push_pendente = true; x.push_enviar_em = new Date(Date.now() - 1000); } });
+    webPushEnviados.length = 0;
+    await nov.processarPushPendentes();
+    const p = webPushEnviados.find(e => e.payload.tag === `novidade-${id1}`);
+    assert(p && p.endpoint.endsWith('aparelho1') && p.payload.titulo === '💲 Catálogo de preços atualizado' && p.payload.texto === '12 produtos'
+      && p.payload.url === './index.html#novidades' && p.opts.topic === `novidade${id1}`,
+      `push: sai com o título do tipo, texto curto, tag da novidade e abre a lista: ${JSON.stringify(webPushEnviados)}`);
+    assert(mockDb.__getPushInscricoes().length === 1 && !mockDb.__getPushInscricoes().some(i => i.endpoint.includes('morta')),
+      'push: inscrição expirada (410) é apagada');
+    webPushEnviados.length = 0;
+    assert(await nov.processarPushPendentes() === 0 && webPushEnviados.length === 0, 'push: o que já foi enviado não sai de novo');
+    mockDb.__getNovidades().forEach(x => { if (x.id === id1) { x.push_pendente = true; x.push_enviar_em = new Date(Date.now() + 3600000); } });
+    assert(await nov.processarPushPendentes() === 0 && webPushEnviados.length === 0, 'push: fora do horário fica esperando a janela');
+  }
+  webPushEnviados.length = 0;
+  res = await req('POST', '/api/novidades/push/teste', {});
+  assert(res.status === 200 && res.body.enviados === 1 && webPushEnviados.length === 1 && webPushEnviados[0].payload.tag === 'teste',
+    `push: aviso de teste vai só pros aparelhos de quem pediu: ${JSON.stringify(res.body)}`);
+  res = await req('POST', '/api/novidades/push/cancelar', { endpoint: 'https://fcm.googleapis.com/fcm/send/aparelho1' });
+  assert(res.status === 200 && mockDb.__getPushInscricoes().length === 0, 'push: desativar apaga a inscrição do aparelho');
+
+  // 31) Importação automática por e-mail (routes/importacaoEmail.js) e leitura
+  // compartilhada das planilhas (importadores.js - a mesma do Painel)
+  const XLSXt = require('@e965/xlsx');
+  const Importadores = require('../importadores');
+  const planilha = (abas) => {
+    const wb = XLSXt.utils.book_new();
+    for (const [nome, linhas] of Object.entries(abas)) XLSXt.utils.book_append_sheet(wb, XLSXt.utils.aoa_to_sheet(linhas, { cellDates: true }), nome);
+    return XLSXt.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  };
+  const dia = (a, m, d) => new Date(a, m - 1, d);
+  const xlsRelatorio = planilha({
+    Carteira: [['Relatório de Carteira'], [],
+      ['Cliente', 'Cod.Cliente', 'Nr.Pedido', 'Item', 'Descrição', 'Qte.Pedida', 'Vlr.Pedido', 'Implantação', 'Classificatório'],
+      ['LOJA EMAIL', 'COD9501', '00676001', '60863', 'DISCO', 4, 400, dia(2026, 10, 1), 'Varejo Premium (17)'],
+      ['Total', null, null, null, null, null, null, null, null]],
+    Faturamento: [['Relatório de Faturamento'], [],
+      ['Cliente', 'Cod.Cliente', 'Nr.Pedido', 'Item', 'Descrição', 'Qte.Faturada', 'Vlr.Faturado', 'Dt.Implant', 'Dt.Emissão', 'Nota Fiscal', 'Classificatório', 'Situação'],
+      ['LOJA EMAIL', 'COD9501', '675990', '61362', 'CORTADOR', 2, 300, dia(2026, 9, 25), dia(2026, 9, 30), ' 000889001', 'Varejo Premium (17)', 'Atendido Total']],
+  });
+  const xlsClassif = planilha({ Cliente: [['Relatório Classificatório'],
+    ['Cod.Cliente', 'CNPJ', 'Matriz', 'Classificatorio', 'Fat.Cliente', 'Ult.Compra'],
+    ['COD9501', '55.555.555/0001-55', 'LOJA EMAIL', 'Varejo Master (20)', 1234.5, dia(2026, 8, 31)],
+    ['COD9502', '66.666.666/0001-66', 'OUTRA', null, 10, dia(2026, 8, 1)]] });
+  const xlsPrevisao = planilha({ Plan1: [['Item', 'Descrição', 'Qt. Disp.', 'Qt. Carteira', 'Qt. Compra', 'Previsão', 'Saldo'],
+    ['60863', 'DISCO', 0, 5, 10, dia(2026, 10, 20), -5],
+    ['61362', 'CORTADOR', 3, 0, 0, 'Sem Previsão', 3]] });
+  const ufsExatas = ['MG', 'RJ', 'PR', 'SC', 'RS'];
+  const xlsPrecos = planilha({
+    'Referência Estados': [[], [], [], ...ufsExatas.map((uf, i) => [uf, null, null, null, null, null, null, 11 + i])],
+    'TRIBUTAÇÃO': [[], [], [], ['60863', 'DISCO DE CORTE', 10, null, '68042211', 0.05, null, null, null, null, 0.1, 0.1, 0.2, 0.1, 0.1]],
+    'PRECIFICAÇÃO': [[], [], [], ['60863', null, ...Array.from({ length: 18 }, (_, i) => 10 + i)]],
+  });
+  const xlsQualquer = planilha({ Plan1: [['Nome', 'Telefone'], ['Fulano', '123']] });
+  {
+    assert(Importadores.detectarTipoPlanilha(XLSXt, xlsRelatorio) === 'relatorio' && Importadores.detectarTipoPlanilha(XLSXt, xlsClassif) === 'classificatorio'
+      && Importadores.detectarTipoPlanilha(XLSXt, xlsPrevisao) === 'previsao' && Importadores.detectarTipoPlanilha(XLSXt, xlsPrecos) === 'precos'
+      && Importadores.detectarTipoPlanilha(XLSXt, xlsQualquer) === null,
+      'importadores: reconhece relatório, Classificatório, previsão e lista de preços pelas abas/colunas');
+    const rel = Importadores.lerRelatorioOficial(XLSXt, xlsRelatorio);
+    const cart = rel.itens.find(i => i.status === 'carteira');
+    const fat = rel.itens.find(i => i.status === 'faturado');
+    assert(rel.itens.length === 2 && cart.nr_pedido === '676001' && cart.data_implantacao === '2026-10-01' && cart.data_faturamento === null && cart.valor === 400
+      && fat.data_implantacao === '2026-09-25' && fat.data_faturamento === '2026-09-30' && fat.nota_fiscal === '889001' && fat.descricao === 'CORTADOR'
+      && rel.classificacoes.length === 1 && rel.classificacoes[0].tipo === 'Varejo Premium' && rel.pendentesPagamento === null,
+      `importadores: lê Carteira e Faturamento (datas, zeros do pedido e da NF, classificação): ${JSON.stringify(rel)}`);
+    const cl = Importadores.lerClassificatorio(XLSXt, xlsClassif);
+    assert(cl.length === 1 && cl[0].codigoOficial === 'COD9501' && cl[0].classificatorioTipo === 'Varejo Master' && cl[0].ultimaCompra === '2026-08-31' && cl[0].fat12mCliente === 1234.5
+      && Importadores.dataRelatorioClassificatorio("02.10.2026_RUSSO'S REPRESENTACO_Classificatorio.xlsx") === '2026-10-02',
+      `importadores: lê o Classificatório e a data do relatório pelo nome do arquivo: ${JSON.stringify(cl)}`);
+    const pv = Importadores.lerPrevisao(XLSXt, xlsPrevisao);
+    assert(pv['60863'].previsao === '2026-10-20' && pv['60863'].qtCarteira === 5 && pv['61362'].previsao === null,
+      `importadores: lê os itens em falta (previsão de estoque): ${JSON.stringify(pv)}`);
+    // data em texto é dia/mês (antes new Date() lia "05/11/2026" como 11 de maio e "15/10/2026" como inválida)
+    const pvTexto = Importadores.lerPrevisao(XLSXt, planilha({ Plan1: [['Item', 'Descrição', 'Qt. Disp.', 'Qt. Carteira', 'Qt. Compra', 'Previsão', 'Saldo'],
+      ['70001', 'A', 0, 1, 1, '05/11/2026', -1], ['70002', 'B', 0, 1, 1, '15/10/2026', -1], ['70003', 'C', 0, 1, 1, '2026-12-01', -1], ['70004', 'D', 0, 1, 1, 'Sem Previsão', -1]] }));
+    assert(pvTexto['70001'].previsao === '2026-11-05' && pvTexto['70002'].previsao === '2026-10-15' && pvTexto['70003'].previsao === '2026-12-01' && pvTexto['70004'].previsao === null,
+      `importadores: previsão de estoque com data em texto dd/mm/aaaa: ${JSON.stringify(pvTexto)}`);
+  }
+  const CHAVE_EMAIL = process.env.IMPORTACAO_EMAIL_CHAVE;
+  const enviarArquivo = (nome, buf, chave = CHAVE_EMAIL, extra = {}) => req('POST', '/api/importacao-email/arquivo',
+    { nome, arquivoBase64: buf.toString('base64'), remetente: 'noreply@cortag.com.br', assunto: 'teste', recebidoEm: '2026-10-04T06:10:25Z', mensagemId: 'm1', ...extra },
+    { 'X-Chave-Importacao': chave, Authorization: '' });
+  res = await enviarArquivo('ESCE007-28092026060311.xlsx', xlsPrevisao, 'chave-errada');
+  assert(res.status === 401 && mockDb.__getImportacoesEmail().length === 0, 'importação por e-mail: chave errada é recusada antes de ler o arquivo');
+  mockDb.__seed({ clientes: [{ id: 9501, nome: 'LOJA EMAIL', documento: '55555555000155', codigo_oficial: 'COD9501' }] });
+  res = await enviarArquivo('ESCE007-28092026060311.xlsx', xlsPrevisao);
+  assert(res.status === 200 && res.body.tipo === 'previsao' && mockDb.__getPrevisaoEstoque().length === 2
+    && mockDb.__getNovidades().some(n => n.tipo === 'previsao-estoque' && n.texto === '2 itens')
+    && mockDb.__getImportacoesEmail().some(i => i.status === 'ok' && i.tipo === 'previsao' && i.mensagem_id === 'm1'),
+    `importação por e-mail: itens em falta entram, registram e geram a novidade: ${JSON.stringify(res.body)}`);
+  res = await enviarArquivo('ESCE007-28092026060311.xlsx', xlsPrevisao);
+  assert(res.status === 200 && res.body.duplicado === true, 'importação por e-mail: o mesmo arquivo de novo não é importado outra vez');
+  mockDb.__setConfiguracao('relatorio_oficial_mais_novo', null); // cenário próprio (relatórios de 01/10)
+  res = await enviarArquivo('Repres-20.xlsx', xlsRelatorio);
+  assert(res.status === 200 && res.body.tipo === 'relatorio' && res.body.resultado.itens === 2
+    && mockDb.__getPedidosOficiaisItens().some(i => i.nr_pedido === '676001' && i.status === 'carteira'),
+    `importação por e-mail: relatório Carteira/Faturamento entra pelo mesmo caminho do Painel: ${JSON.stringify(res.body)}`);
+  res = await enviarArquivo("02.10.2026_RUSSO'S REPRESENTACO_Classificatorio.xlsx", xlsClassif);
+  assert(res.status === 200 && res.body.tipo === 'classificatorio' && res.body.resultado.atualizados === 1,
+    `importação por e-mail: Classificatório entra (sem precisar de admin): ${JSON.stringify(res.body)}`);
+  res = await enviarArquivo('02.09.2026 - LISTA PADRÃO 2026 - NORTE NORDESTE Por Canal_REV 4.xlsx', xlsPrecos, CHAVE_EMAIL, { remetente: 'vendas@cortag.com' });
+  assert(res.status === 422 && /SUL SUDESTE/.test(res.body.erro), `importação por e-mail: lista de preços de outra região é recusada: ${JSON.stringify(res.body)}`);
+  {
+    // remetente falso: o nome de exibição diz "vendas@cortag.com", o endereço é outro
+    const catalogoAntes = JSON.stringify(mockDb.__getCatalogoPrecos());
+    res = await enviarArquivo('02.09.2026 - LISTA PADRÃO 2026 - SUL SUDESTE Por Canal_REV 4.xlsx', xlsPrecos, CHAVE_EMAIL,
+      { remetente: '"vendas@cortag.com" <golpe@outro-dominio.com>' });
+    const xlsRelatorio2 = planilha({ Carteira: [['Relatório de Carteira'], [],
+      ['Cliente', 'Cod.Cliente', 'Nr.Pedido', 'Item', 'Descrição', 'Qte.Pedida', 'Vlr.Pedido', 'Implantação', 'Classificatório'],
+      ['LOJA EMAIL', 'COD9501', '00676777', '60863', 'DISCO', 1, 99, dia(2026, 10, 2), 'Varejo Premium (17)']] });
+    const r2 = await enviarArquivo('Repres-22.xlsx', xlsRelatorio2, CHAVE_EMAIL, { remetente: 'vendas@cortag.com' });
+    assert(res.status === 422 && /vendas@cortag\.com/.test(res.body.erro) && JSON.stringify(mockDb.__getCatalogoPrecos()) === catalogoAntes
+      && r2.status === 422 && /noreply@cortag\.com\.br/.test(r2.body.erro) && !mockDb.__getPedidosOficiaisItens().some(i => i.nr_pedido === '676777'),
+      `importação por e-mail: cada tipo só vale do remetente dele (endereço exato, não o nome de exibição): ${JSON.stringify([res.body, r2.body])}`);
+  }
+  res = await enviarArquivo('02.09.2026 - LISTA PADRÃO 2026 - SUL SUDESTE Por Canal_REV 4.xlsx', Buffer.concat([xlsPrecos]), CHAVE_EMAIL, { remetente: 'Vendas <vendas@cortag.com>' });
+  {
+    const p = mockDb.__getCatalogoPrecos().find(x => x.codigo_sku === '60863');
+    assert(res.status === 200 && res.body.tipo === 'precos' && p && p.precos.VAREJO.SP === 10.5 && p.precos_sem_imposto.VAREJO.SP === 10,
+      `importação por e-mail: Lista de Preços SUL SUDESTE substitui o catálogo: ${JSON.stringify([res.body, p && p.precos.VAREJO])}`);
+  }
+  {
+    // Lista de Preços pelo e-mail que tiraria mais de 5% dos códigos do catálogo é
+    // recusada (422 = "Cortag/Falhou") sem mexer no catálogo; até 5% passa. A
+    // importação manual pelo Painel continua sem trava.
+    const listaPrecos = (codigos, base) => planilha({
+      'Referência Estados': [[], [], [], ...ufsExatas.map((uf, i) => [uf, null, null, null, null, null, null, 11 + i])],
+      'TRIBUTAÇÃO': [[], [], [], ...codigos.map(c => [c, 'PRODUTO ' + c, 10, null, '68042211', 0.05, null, null, null, null, 0.1, 0.1, 0.2, 0.1, 0.1])],
+      'PRECIFICAÇÃO': [[], [], [], ...codigos.map(c => [c, null, ...Array.from({ length: 18 }, (_, i) => base + i)])],
+    });
+    const nomeLista = '03.10.2026 - LISTA PADRÃO 2026 - SUL SUDESTE Por Canal_REV 5.xlsx';
+    const linhaCat = (c) => ({ codigo_sku: c, nome: 'X', emb: 1, ipi: 0, familia: null, preco_fixo: false, canais_fx: [], precos: {}, precos_sem_imposto: {} });
+    const vinte = Array.from({ length: 20 }, (_, i) => `CAT${String(i).padStart(2, '0')}`);
+    mockDb.__getCatalogoPrecos().splice(0, Infinity, ...vinte.map(linhaCat));
+    const antes = JSON.stringify(mockDb.__getCatalogoPrecos());
+    // tira 2 de 20 (10%): recusada
+    res = await enviarArquivo(nomeLista, listaPrecos(vinte.slice(2), 20), CHAVE_EMAIL, { remetente: 'vendas@cortag.com' });
+    assert(res.status === 422 && /2 de 20/.test(res.body.erro) && JSON.stringify(mockDb.__getCatalogoPrecos()) === antes
+      && mockDb.__getImportacoesEmail().some(i => i.status === 'falhou' && i.tipo === 'precos' && /2 de 20/.test(i.erro)),
+      `importação por e-mail: Lista de Preços que tiraria mais de 5% do catálogo é recusada sem mexer nele: ${JSON.stringify(res.body)}`);
+    // tira 1 de 20 (5%): passa
+    res = await enviarArquivo(nomeLista, listaPrecos(vinte.slice(1), 30), CHAVE_EMAIL, { remetente: 'vendas@cortag.com' });
+    assert(res.status === 200 && res.body.resultado.produtosRemovidos === 1 && mockDb.__getCatalogoPrecos().length === 19,
+      `importação por e-mail: Lista de Preços que tira até 5% do catálogo entra: ${JSON.stringify(res.body)}`);
+    // e os produtos novos dela entram no cadastro de produtos (o que pedido/levantamento usam),
+    // sem mexer no nome/categoria dos que já estavam lá (o /api/produtos/sync é quem cuida deles)
+    const prods = mockDb.__getProdutos();
+    assert(res.body.resultado.produtosNovos === 19 && prods.some(p => p.codigo_sku === 'CAT07' && p.nome === 'PRODUTO CAT07')
+      && prods.find(p => p.codigo_sku === '60863').nome === 'DISCO DE CORTE DIAMANTADO TURBO PORCELANATO 110 mm',
+      `importação da Lista de Preços cria em produtos só os códigos novos: ${JSON.stringify(res.body.resultado)}`);
+    // Painel (manual): continua substituindo o catálogo inteiro, sem trava
+    res = await req('POST', '/api/catalogo-precos/importar', { arquivoBase64: listaPrecos(['CAT05'], 40).toString('base64') });
+    assert(res.status === 200 && res.body.produtosRemovidos === 18 && mockDb.__getCatalogoPrecos().length === 1,
+      `importação manual da Lista de Preços pelo Painel continua sem a trava dos 5%: ${JSON.stringify(res.body)}`);
+    // Painel: o cadastro de produtos guarda o que saiu do catálogo, então "total" nunca bate com o
+    // catálogo; a contagem diz o tamanho do catálogo e quantos dele faltam no cadastro
+    res = await req('GET', '/api/produtos/contagem');
+    assert(res.status === 200 && res.body.catalogo === 1 && res.body.fora_do_cadastro === 0 && res.body.total > res.body.catalogo,
+      `contagem de produtos separa cadastro, catálogo e o que falta no cadastro: ${JSON.stringify(res.body)}`);
+    mockDb.__getCatalogoPrecos().push({ codigo_sku: 'SOCAT01', nome: 'SÓ NO CATÁLOGO' });
+    res = await req('GET', '/api/produtos/contagem');
+    assert(res.status === 200 && res.body.catalogo === 2 && res.body.fora_do_cadastro === 1,
+      `contagem de produtos acusa código do catálogo que falta no cadastro: ${JSON.stringify(res.body)}`);
+    mockDb.__getCatalogoPrecos().pop();
+
+    // Cache das tabelas lidas inteiras (routes/lib/cacheTabela.js, egress do Supabase): com a
+    // versão da tabela (pg_stat_user_tables) parada, a leitura repetida não vai ao banco
+    const leituras = (re) => mockDb.__queryLog.filter(q => re.test(q.sql)).length;
+    const LE_CATALOGO = /FROM catalogo_precos ORDER BY codigo_sku/;
+    mockDb.__fixarVersaoTabelas(1);
+    const c1 = await req('GET', '/api/catalogo-precos');
+    const n1 = leituras(LE_CATALOGO);
+    const c2 = await req('GET', '/api/catalogo-precos');
+    assert(c1.status === 200 && c2.status === 200 && c1.body.produtos.length === 1 && leituras(LE_CATALOGO) === n1
+      && JSON.stringify(c2.body.produtos) === JSON.stringify(c1.body.produtos),
+      `catálogo de preços: 2ª leitura com a tabela parada sai do cache, sem ir ao banco (${leituras(LE_CATALOGO)} leituras)`);
+    // mudança feita fora do app (SQL direto no Supabase) muda a versão: lê de novo
+    mockDb.__getCatalogoPrecos().push({ codigo_sku: 'CAT99', nome: 'NOVO POR SQL' });
+    mockDb.__fixarVersaoTabelas(2);
+    const c3 = await req('GET', '/api/catalogo-precos');
+    assert(c3.status === 200 && c3.body.produtos.length === 2 && leituras(LE_CATALOGO) === n1 + 1,
+      `catálogo de preços: versão da tabela mudou, lê do banco de novo: ${JSON.stringify(c3.body.produtos)}`);
+    // importação esquece o cache na hora (os contadores do Postgres chegam com atraso)
+    res = await req('POST', '/api/catalogo-precos/importar', { arquivoBase64: listaPrecos(['CAT05', 'CAT06', 'CAT07'], 50).toString('base64') });
+    const c4 = await req('GET', '/api/catalogo-precos');
+    assert(res.status === 200 && c4.body.produtos.map(p => p.codigo_sku).join() === 'CAT05,CAT06,CAT07',
+      `catálogo de preços: importação aparece na hora mesmo com a versão parada: ${JSON.stringify(c4.body.produtos)}`);
+    const f1 = await req('GET', '/api/fichas-tecnicas');
+    res = await req('POST', '/api/fichas-tecnicas/importar', { fichas: { CAT05: { nome: 'FICHA', desc: 'd', foto: '', specs: { a: 1 } } } });
+    const f2 = await req('GET', '/api/fichas-tecnicas');
+    assert(f1.status === 200 && res.status === 200 && f2.body.valor.CAT05?.nome === 'FICHA' && !f1.body.valor.CAT05,
+      `fichas técnicas: leitura em cache e importação aparecendo na hora: ${JSON.stringify(f2.body)}`);
+    const e1 = await req('GET', '/api/codigos-produto');
+    res = await req('POST', '/api/codigos-produto/importar', { codigos: { CAT05: { ean: '7890000000001', dun14: '' } } });
+    const e2 = await req('GET', '/api/codigos-produto');
+    assert(e1.status === 200 && res.status === 200 && e2.body.valor.CAT05?.ean === '7890000000001' && !e1.body.valor.CAT05,
+      `códigos de produto: leitura em cache e importação aparecendo na hora: ${JSON.stringify(e2.body)}`);
+    mockDb.__fixarVersaoTabelas(null);
+  }
+  res = await enviarArquivo('Repres-21.xlsx', xlsQualquer);
+  assert(res.status === 422 && mockDb.__getImportacoesEmail().some(i => i.status === 'falhou' && i.nome_arquivo === 'Repres-21.xlsx'),
+    `importação por e-mail: planilha não reconhecida é recusada (422) e fica registrada: ${JSON.stringify(res.body)}`);
+  res = await enviarArquivo('relatorio.pdf', xlsPrevisao);
+  assert(res.status === 422, 'importação por e-mail: só aceita .xlsx');
+  {
+    // planilha que parece relatório mas sem as colunas: erro do leitor = recusada (422, não tenta de novo)
+    const xlsSemColunas = planilha({ Carteira: [['Relatório de Carteira'], [], ['Cliente', 'Coisa'], ['LOJA', 'x']] });
+    res = await enviarArquivo('Repres-23.xlsx', xlsSemColunas);
+    assert(res.status === 422 && res.body.tipo === 'relatorio',
+      `importação por e-mail: erro do leitor da planilha é recusa (422): ${JSON.stringify(res.body)}`);
+    // importou, mas o registro em importacoes_email falhou: continua 200 (antes: 422 "Cortag/Falhou"
+    // com o arquivo já dentro do app, e a mensagem crua do banco na resposta)
+    const queryOriginal = mockDb.pool.query;
+    mockDb.pool.query = async (sql, params) => {
+      if (sql.includes('importacao-email:registrar') && params && params[7] === 'ok') throw new Error('conexão perdida SEGREDO-DO-BANCO');
+      return queryOriginal(sql, params);
+    };
+    const xlsPrevisao2 = planilha({ Plan1: [['Item', 'Descrição', 'Qt. Disp.', 'Qt. Carteira', 'Qt. Compra', 'Previsão', 'Saldo'],
+      ['60863', 'DISCO', 1, 5, 10, dia(2026, 10, 25), -4]] });
+    try {
+      res = await enviarArquivo('ESCE007-05102026060311.xlsx', xlsPrevisao2);
+    } finally {
+      mockDb.pool.query = queryOriginal;
+    }
+    assert(res.status === 200 && res.body.tipo === 'previsao' && !JSON.stringify(res.body).includes('SEGREDO')
+      && mockDb.__getPrevisaoEstoque().some(p => p.codigo_sku === '60863' && Number(p.qt_disponivel) === 1),
+      `importação por e-mail: falha só no registro depois de importar não vira "Falhou": ${JSON.stringify(res.body)}`);
+  }
+  res = await req('GET', '/api/importacao-email/status', null, { Authorization: '' });
+  assert(res.status === 401, 'importação por e-mail: o status do Painel exige login');
+  res = await req('GET', '/api/importacao-email/status');
+  {
+    const porTipo = Object.fromEntries((res.body.tipos || []).map(t => [t.tipo, t]));
+    assert(res.status === 200 && porTipo.previsao.status === 'ok' && porTipo.precos.status === 'ok' && porTipo.relatorio && porTipo.classificatorio,
+      `importação por e-mail: status do Painel traz o último de cada tipo: ${JSON.stringify(res.body)}`);
+  }
+  {
+    // e-mails sem planilha: Pedido Bloqueado e Pedido de Venda à Vista (texto real de 09/2026)
+    const EmailCortag = require('../routes/lib/emailCortag');
+    const textoBloqueado = 'Prezado(a),\r\n\r\nInformamos que o pedido *00677375* foi bloqueado conforme abaixo:\r\n\r\n'
+      + 'Cliente: 22236 DEPOSITO DE MATS. P/ CONSTR. LOANDA LTDA\r\nMotivo: 02-Rejeitado/Limite Crédito\r\n\r\nAtenciosamente';
+    const textoAvista = 'COMUNICADO\n\nBoa tarde, CIA ACABAMENTOS LTDA, segue anexo pedido de venda No.00677304 Valor R$ 2.410,03,\n'
+      + 'aguardando O pagamento para liberação, caso já tenha efetuado o pagamento favor desconsiderar.';
+    const b = EmailCortag.lerPedidoBloqueado('Pedido Bloqueado 00677375', textoBloqueado);
+    assert(EmailCortag.ehPedidoBloqueado('Pedido Bloqueado 00677375') && b && b.nr_pedido === '677375' && b.cliente_codigo_oficial === '22236'
+      && b.cliente_nome === 'DEPOSITO DE MATS. P/ CONSTR. LOANDA LTDA' && b.motivo === 'Rejeitado/Limite Crédito' && b.motivo_curto === 'Limite Crédito',
+      `e-mail Cortag: lê o pedido bloqueado (número sem zeros, cliente, motivo): ${JSON.stringify(b)}`);
+    const a = EmailCortag.lerPedidoAvista('Pedido de Venda à Vista - Cortag', textoAvista);
+    assert(EmailCortag.ehPedidoAvista('Pedido de Venda à Vista - Cortag') && !EmailCortag.ehPedidoAvista('Pedido Bloqueado 1')
+      && a && a.nr_pedido === '677304' && a.cliente_nome === 'CIA ACABAMENTOS LTDA' && a.valor === 2410.03,
+      `e-mail Cortag: lê o pedido à vista (número, cliente, valor): ${JSON.stringify(a)}`);
+
+    const enviarMensagem = (assunto, texto, extra = {}, chave = CHAVE_EMAIL) => req('POST', '/api/importacao-email/mensagem',
+      { assunto, texto, remetente: 'noreply@cortag.com.br', recebidoEm: new Date().toISOString(), mensagemId: 'msg-' + assunto, ...extra },
+      { 'X-Chave-Importacao': chave, Authorization: '' });
+    mockDb.__seed({ clientes: [
+      { id: 9502, nome: 'DEPOSITO LOANDA', documento: '55555555000256', codigo_oficial: '22236' },
+      { id: 9503, nome: 'CIA ACABAMENTOS LTDA', documento: '55555555000337', codigo_oficial: '30001' },
+    ] });
+    res = await enviarMensagem('Pedido Bloqueado 00677375', textoBloqueado, {}, 'chave-errada');
+    assert(res.status === 401 && mockDb.__getPedidosBloqueados().length === 0, 'e-mail Cortag: mensagem com chave errada é recusada');
+
+    const novidadesAntes = mockDb.__getNovidades().length;
+    res = await enviarMensagem('Pedido Bloqueado 00677375', textoBloqueado);
+    const nb = mockDb.__getNovidades().find(n => n.tipo === 'pedido-bloqueado');
+    assert(res.status === 200 && res.body.tipo === 'bloqueado' && res.body.resultado.avisado === true
+      && mockDb.__getPedidosBloqueados().some(x => x.nr_pedido === '677375' && x.cliente_codigo_oficial === '22236')
+      && nb && nb.titulo === 'Pedido 677375 bloqueado' && nb.texto === 'DEPOSITO LOANDA · Limite Crédito',
+      `e-mail Cortag: pedido bloqueado grava o selo e gera o aviso com o nome do cliente no app: ${JSON.stringify([res.body, nb])}`);
+    res = await enviarMensagem('Pedido Bloqueado 00677375', textoBloqueado);
+    assert(res.status === 200 && res.body.duplicado === true && mockDb.__getNovidades().length === novidadesAntes + 1,
+      'e-mail Cortag: a mesma mensagem de novo não gera outro aviso');
+
+    res = await req('GET', '/api/pedidos-oficiais/9502');
+    const bloqueadosDoCliente = res.body.bloqueados || [];
+    res = await req('GET', '/api/clientes/sync');
+    const sync9502 = (res.body.clientes || []).find(c => c.id === 9502);
+    const sync9503 = (res.body.clientes || []).find(c => c.id === 9503);
+    assert(bloqueadosDoCliente.length === 1 && bloqueadosDoCliente[0].motivo === 'Rejeitado/Limite Crédito'
+      && sync9502 && sync9502.bloqueados && sync9502.bloqueados[0].nr_pedido === '677375' && sync9503 && !sync9503.bloqueados,
+      `e-mail Cortag: o bloqueio aparece no histórico do cliente e na cópia local (sync): ${JSON.stringify([bloqueadosDoCliente, sync9502])}`);
+
+    mockDb.__seed({ pedidosOficiaisItens: [{ nr_pedido: '677375', codigo_sku: '60863', cliente_codigo_oficial: '22236', cliente_nome: 'DEPOSITO LOANDA',
+      status: 'faturado', quantidade: 1, valor: 10, data_implantacao: '2026-10-01', data_faturamento: '2026-10-03', nota_fiscal: '900001' }] });
+    res = await req('GET', '/api/pedidos-oficiais/9502');
+    assert((res.body.bloqueados || []).length === 0, `e-mail Cortag: o selo de bloqueado some quando o pedido aparece faturado: ${JSON.stringify(res.body.bloqueados)}`);
+
+    const velho = new Date(Date.now() - 5 * 86400000).toISOString();
+    res = await enviarMensagem('Pedido Bloqueado 00677400', textoBloqueado.replace('00677375', '00677400'), { recebidoEm: velho });
+    assert(res.status === 200 && res.body.resultado.ativo === true && res.body.resultado.avisado === false
+      && !mockDb.__getNovidades().some(n => n.titulo === 'Pedido 677400 bloqueado'),
+      'e-mail Cortag: e-mail antigo (1ª rodada do script) grava o selo sem mandar push');
+
+    res = await enviarMensagem('Pedido de Venda à Vista - Cortag', textoAvista);
+    const na = mockDb.__getNovidades().find(n => n.tipo === 'pedido-avista');
+    const pend = mockDb.__getPedidosPendentesPagamento().find(p => p.nr_pedido === '677304');
+    assert(res.status === 200 && res.body.tipo === 'avista' && pend && pend.cliente_codigo_oficial === '30001' && pend.valor === 2410.03
+      && na && na.titulo === 'Pedido 677304 aguardando pagamento' && na.texto === 'CIA ACABAMENTOS LTDA · R$ 2.410,03',
+      `e-mail Cortag: pedido à vista entra nos pendentes (cliente pelo nome) e gera o aviso: ${JSON.stringify([res.body, pend, na])}`);
+
+    // relatório oficial importado depois do e-mail já traz a foto certa: e-mail velho não ressuscita o pedido
+    res = await enviarMensagem('Pedido de Venda à Vista - Cortag', textoAvista.replace('00677304', '00677299'), { recebidoEm: '2026-10-01T15:00:00Z' });
+    assert(res.status === 200 && res.body.resultado.ignorado && !mockDb.__getPedidosPendentesPagamento().some(p => p.nr_pedido === '677299'),
+      `e-mail Cortag: à vista mais velho que o último relatório oficial é ignorado: ${JSON.stringify(res.body)}`);
+
+    res = await enviarMensagem('Pedido Bloqueado 00677998', textoBloqueado.replace('00677375', '00677998'), { remetente: 'Cortag <noreply@cortag.com.br.golpe.com>' });
+    assert(res.status === 422 && !mockDb.__getPedidosBloqueados().some(x => x.nr_pedido === '677998'),
+      `e-mail Cortag: pedido bloqueado de outro remetente é recusado (sem selo nem push): ${JSON.stringify(res.body)}`);
+
+    {
+      // gravou o selo e mandou o aviso, mas o registro final falhou: 200 (com 503 o script
+      // reenviava e cada reenvio mandava outro push)
+      const queryOriginal = mockDb.pool.query;
+      mockDb.pool.query = async (sql, params) => {
+        if (sql.includes('importacao-email:registrar') && params && params[7] === 'ok') throw new Error('conexão perdida');
+        return queryOriginal(sql, params);
+      };
+      const avisosAntes = mockDb.__getNovidades().filter(n => n.titulo === 'Pedido 677997 bloqueado').length;
+      try {
+        res = await enviarMensagem('Pedido Bloqueado 00677997', textoBloqueado.replace('00677375', '00677997'));
+      } finally {
+        mockDb.pool.query = queryOriginal;
+      }
+      assert(res.status === 200 && res.body.tipo === 'bloqueado'
+        && mockDb.__getNovidades().filter(n => n.titulo === 'Pedido 677997 bloqueado').length === avisosAntes + 1,
+        `e-mail Cortag: falha só no registro depois de gravar o bloqueio responde 200 (sem reenvio = sem push repetido): ${JSON.stringify(res.body)}`);
+    }
+
+    res = await enviarMensagem('Pedido Bloqueado 00677999', 'texto sem o formato esperado');
+    const res2 = await enviarMensagem('Relatório de Comissões', 'qualquer coisa');
+    assert(res.status === 200 && res.body.resultado.nr_pedido === '677999' && res2.status === 503
+      && mockDb.__getImportacoesEmail().some(i => i.status === 'falhou' && i.nome_arquivo === 'Relatório de Comissões'),
+      `e-mail Cortag: número só no assunto ainda vale; e-mail não reconhecido responde 503 (servidor mais velho que o script: o script tenta de novo): ${JSON.stringify([res.body, res2.body])}`);
+
+    // "Cancelamento saldo em carteira" (assistente comercial): tabela HTML do e-mail real de 13/10/2026
+    const [cA, cM, cD] = hojeBr.split('-');
+    const assuntoCanc = `Cancelamento saldo em carteira ${cD}.${cM}.${cA}`;
+    const linhaCanc = (cod, nome, nr, item, desc, oc, motivo, qt, vl) => '<tr>\r\n' + ['VILMAR HEDLER JUNIOR', "RUSSO'S REPRESENTACOES COMERCIAIS LTDA",
+      cod, nome, nr, 'V', item, desc, oc, motivo, qt, vl].map(c => `<td>${c}</td>\r\n`).join('') + '</tr>\r\n';
+    const htmlCanc = '<html><body><p>Prezado(a) RUSSO&#39;S REPRESENTACOES COMERCIAIS LTDA,</p>'
+      + '<table border="1"><tbody>\r\n<tr style="background-color:#D9D9D9;">'
+      + ['Gestor', 'Representante', 'Cod. Cliente', 'Nome Cliente', 'Nr. Pedido', 'Venda/Bonific', 'Item', 'Descrição', 'O.C.', 'Motivo', 'Qt. Pendente', 'Vl. Pendente']
+        .map(c => `<th>${c}</th>\r\n`).join('') + '</tr>\r\n'
+      + linhaCanc('3663', 'PEOCA', '676656', '60538', 'JOELHEIRA EM EVA PARA ASSENTAMENTO PISOS', '23045', 'Abaixo R$ 300,00', '6', '120,76')
+      + linhaCanc('217739', 'C R DE CON07', '00677106', '60226', 'ESTILETE DE METAL - PROFISSIONAL', '', 'Abaixo R$ 300,00', '10', '146,62')
+      + linhaCanc('217739', 'C R DE CON07', '00677106', '60538', 'JOELHEIRA EM EVA &amp; CIA', '', 'Abaixo R$ 300,00', '6', '128,31')
+      + linhaCanc('226838', 'BIGALTONIA', '00673525', '62980', 'MINI DISCO DIAMANTADO 50mm', '', 'Sem previsão', '6', '1.380,22')
+      + '</tbody></table><p>Peço por gentileza que informe os seus clientes.</p></body></html>';
+    const lidoCanc = EmailCortag.lerCancelamentoSaldo(assuntoCanc, htmlCanc);
+    assert(EmailCortag.ehCancelamentoSaldo(assuntoCanc) && !EmailCortag.ehCancelamentoSaldo('RES: ' + assuntoCanc) && !EmailCortag.ehCancelamentoSaldo('Fwd: ' + assuntoCanc)
+      && lidoCanc && lidoCanc.data_aviso === hojeBr && lidoCanc.itens.length === 4
+      && lidoCanc.itens[0].nr_pedido === '676656' && lidoCanc.itens[0].cliente_codigo_oficial === '3663' && lidoCanc.itens[0].ordem_compra === '23045'
+      && lidoCanc.itens[0].minimo === 300 && lidoCanc.itens[0].quantidade === 6 && lidoCanc.itens[0].valor === 120.76
+      && lidoCanc.itens[1].nr_pedido === '677106' && lidoCanc.itens[1].ordem_compra === null && lidoCanc.itens[2].descricao === 'JOELHEIRA EM EVA & CIA'
+      && lidoCanc.itens[3].minimo === null && lidoCanc.itens[3].motivo === 'Sem previsão' && lidoCanc.itens[3].valor === 1380.22,
+      `e-mail Cortag: lê a tabela do cancelamento de saldo (pedido sem zeros, O.C. vazia, mínimo do motivo): ${JSON.stringify(lidoCanc)}`);
+    const cortado = EmailCortag.lerCancelamentoSaldo(assuntoCanc, htmlCanc.slice(0, htmlCanc.indexOf('BIGALTONIA')));
+    assert(!lidoCanc.parcial && cortado.parcial === true && cortado.itens.length === 3,
+      `e-mail Cortag: tabela cortada no envio fica marcada como parcial: ${JSON.stringify([lidoCanc.parcial, cortado.parcial, cortado.itens.length])}`);
+    mockDb.__seed({ clientes: [
+      { id: 9511, nome: 'PEOCA MATERIAIS DE CONSTRUCAO', documento: '55555555001100', codigo_oficial: '3663' },
+      { id: 9512, nome: 'C R DE CONSTRUCAO LTDA', documento: '55555555001200', codigo_oficial: '217739' },
+    ] });
+    const deThamiris = { remetente: 'Thamiris Sabino <thamiris.sabino@cortag.com>', html: htmlCanc, mensagemId: 'canc-1' };
+    res = await enviarMensagem(assuntoCanc, 'texto puro', { ...deThamiris, remetente: 'noreply@cortag.com.br' });
+    assert(res.status === 422 && mockDb.__getAvisosCancelamento().length === 0,
+      `e-mail Cortag: cancelamento de saldo só vale das assistentes comerciais: ${JSON.stringify(res.body)}`);
+    res = await enviarMensagem(assuntoCanc, 'texto puro', { ...deThamiris, html: '' });
+    assert(res.status === 422 && /script do Gmail/.test(res.body.erro), `e-mail Cortag: cancelamento sem HTML (script antigo) é recusado: ${JSON.stringify(res.body)}`);
+    const avisosCancAntes = mockDb.__getNovidades().filter(n => n.tipo === 'cancelamento-saldo').length;
+    res = await enviarMensagem(assuntoCanc, 'texto puro', deThamiris);
+    const nCanc = mockDb.__getNovidades().filter(n => n.tipo === 'cancelamento-saldo');
+    assert(res.status === 200 && res.body.tipo === 'cancelamento' && res.body.resultado.novos === 4 && res.body.resultado.avisado === true
+      && mockDb.__getAvisosCancelamento().length === 4 && nCanc.length === avisosCancAntes + 1
+      && nCanc[nCanc.length - 1].titulo === 'Saldo de 3 pedidos vai ser cancelado (3 clientes)'
+      && /PEOCA MATERIAIS DE CONSTRUCAO, C R DE CONSTRUCAO LTDA, BIGALTONIA · aumentar a quantidade salva o saldo/.test(nCanc[nCanc.length - 1].texto),
+      `e-mail Cortag: cancelamento de saldo grava um aviso por item e manda um push com os clientes: ${JSON.stringify([res.body, nCanc[nCanc.length - 1]])}`);
+    // a assistente reenvia o mesmo e-mail (outra mensagem, mesmo dia): não manda outro push
+    res = await enviarMensagem(assuntoCanc, 'texto puro', { ...deThamiris, mensagemId: 'canc-2' });
+    assert(res.status === 200 && res.body.resultado.novos === 0 && res.body.resultado.avisado === false
+      && mockDb.__getNovidades().filter(n => n.tipo === 'cancelamento-saldo').length === avisosCancAntes + 1,
+      `e-mail Cortag: o mesmo aviso de cancelamento reenviado não gera outro push: ${JSON.stringify(res.body)}`);
+    res = await req('GET', '/api/pedidos-oficiais/9512');
+    const avisos9512 = res.body.avisos_cancelamento || [];
+    res = await req('GET', '/api/clientes/sync');
+    const sync9512 = (res.body.clientes || []).find(c => c.id === 9512);
+    const sync9502b = (res.body.clientes || []).find(c => c.id === 9502);
+    assert(avisos9512.length === 2 && avisos9512.every(a => a.nr_pedido === '677106' && a.minimo === 300 && a.data_aviso === hojeBr && a.remetente === 'thamiris.sabino@cortag.com')
+      && sync9512 && sync9512.cancelamentos && sync9512.cancelamentos.length === 2 && !sync9502b.cancelamentos,
+      `e-mail Cortag: o aviso de cancelamento aparece no histórico do cliente e na cópia local (sync): ${JSON.stringify([avisos9512, sync9512 && sync9512.cancelamentos])}`);
+    // o vendedor pediu o aumento e o item saiu faturado: o aviso some (só desse item)
+    mockDb.__seed({ pedidosOficiaisItens: [{ nr_pedido: '677106', codigo_sku: '60226', cliente_codigo_oficial: '217739', status: 'faturado',
+      quantidade: 12, valor: 175, data_implantacao: '2026-08-01', data_faturamento: hojeBr, nota_fiscal: '900776' }] });
+    res = await req('GET', '/api/pedidos-oficiais/9512');
+    assert((res.body.avisos_cancelamento || []).length === 2,
+      `e-mail Cortag: faturado no próprio dia do aviso não tira o aviso (pode ser a nota de antes do e-mail): ${JSON.stringify(res.body.avisos_cancelamento)}`);
+    const amanhaCanc = new Date(new Date(`${hojeBr}T12:00:00Z`).getTime() + 86400000).toISOString().slice(0, 10);
+    mockDb.__seed({ pedidosOficiaisItens: [{ nr_pedido: '677106', codigo_sku: '60226', cliente_codigo_oficial: '217739', status: 'faturado',
+      quantidade: 12, valor: 175, data_implantacao: '2026-08-01', data_faturamento: amanhaCanc, nota_fiscal: '900777' }] });
+    res = await req('GET', '/api/pedidos-oficiais/9512');
+    assert((res.body.avisos_cancelamento || []).length === 1 && res.body.avisos_cancelamento[0].codigo_sku === '60538',
+      `e-mail Cortag: o aviso de cancelamento some quando o item sai faturado depois dele: ${JSON.stringify(res.body.avisos_cancelamento)}`);
+    // relatório importado depois do aviso: com o item ainda em carteira o aviso fica;
+    // sem ele em carteira (saldo já cortado), o aviso sai da lista
+    mockDb.__seed({ pedidosOficiaisItens: [{ nr_pedido: '677106', codigo_sku: '60538', cliente_codigo_oficial: '217739', status: 'carteira',
+      quantidade: 6, valor: 90, data_implantacao: '2026-08-01', data_faturamento: null, nota_fiscal: null, nota_chave: '' }] });
+    await new Promise(r => setTimeout(r, 5));
+    await mockDb.registrarImportacao(null, 'pedidos-oficiais/importar', 1);
+    res = await req('GET', '/api/pedidos-oficiais/9512');
+    assert((res.body.avisos_cancelamento || []).length === 1,
+      `e-mail Cortag: relatório depois do aviso com o item ainda em carteira mantém o aviso: ${JSON.stringify(res.body.avisos_cancelamento)}`);
+    const itensCanc = mockDb.__getPedidosOficiaisItens();
+    itensCanc.splice(itensCanc.findIndex(i => i.nr_pedido === '677106' && i.codigo_sku === '60538' && i.status === 'carteira'), 1);
+    res = await req('GET', '/api/pedidos-oficiais/9512');
+    const syncCanc = (await req('GET', '/api/clientes/sync')).body.clientes.find(c => c.id === 9512);
+    assert((res.body.avisos_cancelamento || []).length === 0 && !(syncCanc.cancelamentos && syncCanc.cancelamentos.length),
+      `e-mail Cortag: relatório depois do aviso sem o item em carteira (saldo já cortado) tira o aviso: ${JSON.stringify([res.body.avisos_cancelamento, syncCanc.cancelamentos])}`);
+    // resposta ao e-mail ("RES: Cancelamento...") não é aviso novo
+    res = await enviarMensagem('RES: ' + assuntoCanc, 'Boa tarde, ajustado conforme solicitado.', { ...deThamiris, mensagemId: 'canc-res' });
+    assert(res.status !== 200 && res.body.tipo == null, `e-mail Cortag: resposta ao cancelamento de saldo não é lida como aviso: ${JSON.stringify(res.body)}`);
+  }
+  // 31b) "Para reativar" (routes/reativacao.js): Relatório de Clientes Sem
+  // Compra do ERP (todo dia 2, anexo de nome cortado - o script do Gmail
+  // reconhece pelo assunto). Layout do arquivo real de 02/10/2026: 3 linhas de
+  // título, cabeçalho, clientes e linhas de total no fim.
+  {
+    const [hA, hM] = hojeBr.split('-').map(Number);
+    const mesAtras = (n) => { const t = hA * 12 + (hM - 1) - n; return { a: Math.floor(t / 12), m: (t % 12) + 1 }; };
+    const mesISO = (n) => { const { a, m } = mesAtras(n); return `${a}-${String(m).padStart(2, '0')}`; };
+    const mesData = (n) => { const { a, m } = mesAtras(n); return new Date(Date.UTC(a, m - 1, 1)); };
+    const br = (iso) => iso.split('-').reverse().join('/');
+    const inicioPeriodo = `${mesISO(12)}-01`;
+    const cab = ['Matriz', 'Cod', 'Razao Social', 'Grupo Cliente', 'Meses sem Compra', 'Mes Ultima Compra', '12 Meses - Faturamento Cliente',
+      'CNPJ/CPF', 'Situacao', 'Tipo Negocio', 'Endereco', 'Bairro', 'Cidade', 'UF', 'Telefone', 'Gestor', 'Cadastro Cliente', 'Cod Repres', 'Representante', null];
+    const linha = (cod, nome, meses, fat, cnpj, cidade) => ['MATRIZ ' + nome, Number(cod), nome, 'Varejo Master (20)', meses, mesData(meses), fat,
+      cnpj, 'Ativo', 'Mercado interno', 'R TESTE, 1', 'CENTRO', cidade, 'PR', '44 3333.4444', 'GESTOR', null, 20, 'RUSSO', null];
+    const xlsSemCompra = (dataIso) => planilha({ Clientes: [
+      ["Listagem de Clientes - Representante RUSSO'S REPRESENTACOES COMERCIAIS LTDA"],
+      [`Data: ${br(dataIso)}    Clientes: 7    Periodo Analisado: ${br(inicioPeriodo)} a ${br(hojeBr)}`],
+      [],
+      cab,
+      linha(9601, 'LOJA AMARELA', 4, 5000, '96.010.000/0001-01', 'Maringa'),
+      linha(9602, 'LOJA VERMELHA', 8, 9000, '96.020.000/0001-02', 'Londrina'),
+      linha(9603, 'LOJA EM DIA', 1, 7000, '96.030.000/0001-03', 'Maringa'),
+      linha(9604, 'LOJA QUE VOLTOU', 5, 3000, '96.040.000/0001-04', 'Maringa'),
+      linha(9607, 'LOJA SEM CODIGO', 3, 100, '96.070.000/0001-07', 'Cambe'),
+      linha(9608, 'LOJA NOVA NO APP', 6, 200, '96.080.000/0001-08', 'Cambe'),
+      [],
+      ['Total de Clientes Processados', 6],
+      ['Clientes com Compra ate 2 meses (Verde)', 1, 0.17],
+    ] });
+    const buf = xlsSemCompra(hojeBr);
+    assert(Importadores.detectarTipoPlanilha(XLSXt, buf) === 'semcompra', 'importadores: reconhece o Relatório de Clientes Sem Compra');
+    const lido = Importadores.lerClientesSemCompra(XLSXt, buf);
+    assert(lido.dataRelatorio === hojeBr && lido.periodoInicio === inicioPeriodo && lido.itens.length === 6
+      && lido.itens[0].codigo_oficial === '9601' && lido.itens[0].mes_ultima_compra === mesISO(4) && lido.itens[0].meses_sem_compra === 4
+      && lido.itens[0].fat_12m === 5000 && lido.itens[0].cidade === 'Maringa' && lido.itens[0].documento === '96.010.000/0001-01',
+      `importadores: lê o Relatório de Clientes Sem Compra (título, mês da última compra, sem as linhas de total): ${JSON.stringify(lido).slice(0, 600)}`);
+    assert(Importadores.mesAnoISO(XLSXt, 'Sep-26') === '2026-09' && Importadores.mesAnoISO(XLSXt, 'set/26') === '2026-09'
+      && Importadores.mesAnoISO(XLSXt, '09/2026') === '2026-09' && Importadores.mesAnoISO(XLSXt, 'xyz') === null,
+      'importadores: "Mes Ultima Compra" em texto também é lido');
+
+    const { faixaDosMeses } = require('../routes/reativacao');
+    assert(faixaDosMeses(2) === null && faixaDosMeses(3) === 'amarelo' && faixaDosMeses(5) === 'amarelo' && faixaDosMeses(6) === 'vermelho'
+      && faixaDosMeses(12) === 'vermelho' && faixaDosMeses(13) === 'perdido', 'reativação: faixas pelas cores do ERP (3-5 amarelo, 6-12 vermelho)');
+
+    mockDb.__seed({
+      clientes: [
+        { id: 9601, nome: 'LOJA AMARELA', documento: '96010000000101', codigo_oficial: '9601' },
+        { id: 9602, nome: 'LOJA VERMELHA', documento: '96020000000102', codigo_oficial: '9602' },
+        { id: 9603, nome: 'LOJA EM DIA', documento: '96030000000103', codigo_oficial: '9603' },
+        { id: 9604, nome: 'LOJA QUE VOLTOU', documento: '96040000000104', codigo_oficial: '9604' },
+        { id: 9605, nome: 'LOJA SUMIDA', documento: '96050000000105', codigo_oficial: '9605' },
+        { id: 9606, nome: 'LOJA SEM HISTORICO', documento: '96060000000106', codigo_oficial: '9606' },
+        { id: 9607, nome: 'LOJA SEM CODIGO', documento: '96.070.000/0001-07' },
+      ],
+      pedidosOficiaisItens: [
+        // 9604 pediu depois do relatório (carteira, pela implantação): sai da lista
+        { nr_pedido: '696041', codigo_sku: '60863', cliente_codigo_oficial: '9604', quantidade: 1, valor: 100, data_implantacao: hojeBr, data_faturamento: null, status: 'carteira' },
+        // 9601: item avulso da série de 7 dígitos não conta como compra
+        { nr_pedido: '1096011', codigo_sku: '60863', cliente_codigo_oficial: '9601', quantidade: 1, valor: 5, data_implantacao: hojeBr, data_faturamento: null, status: 'carteira' },
+        // 9605: fora do relatório, última compra há ~20 meses - "mais de 12 meses"
+        { nr_pedido: '696051', codigo_sku: '60863', cliente_codigo_oficial: '9605', quantidade: 1, valor: 700, data_implantacao: `${mesISO(20)}-05`, data_faturamento: `${mesISO(20)}-10`, status: 'faturado', nota_fiscal: '9605001' },
+        { nr_pedido: '696052', codigo_sku: '60863', cliente_codigo_oficial: '9605', quantidade: 1, valor: 500, data_implantacao: `${mesISO(24)}-05`, data_faturamento: `${mesISO(24)}-10`, status: 'faturado', nota_fiscal: '9605002' },
+        { nr_pedido: '696053', codigo_sku: '60863', cliente_codigo_oficial: '9605', quantidade: 1, valor: 999, data_implantacao: `${mesISO(40)}-05`, data_faturamento: `${mesISO(40)}-10`, status: 'faturado', nota_fiscal: '9605003' },
+      ],
+    });
+    res = await req('GET', '/api/reativacao');
+    assert(res.status === 200 && res.body.relatorio === null && res.body.clientes.length === 0, `reativação: sem relatório importado, lista vazia: ${JSON.stringify(res.body)}`);
+
+    res = await enviarArquivo(`ClientesSemCompra_${hojeBr}.xlsx`, buf, CHAVE_EMAIL, { assunto: 'Relatório de Clientes Sem Compra', mensagemId: 'msc1' });
+    assert(res.status === 200 && res.body.tipo === 'semcompra' && res.body.resultado.total === 6 && res.body.resultado.amarelo === 3
+      && res.body.resultado.vermelho === 2 && res.body.resultado.semCliente === 1 && res.body.resultado.codigosNovos === 1
+      && !mockDb.__getClientes().some(c => c.codigo_oficial === '9608') && mockDb.__getClientes().find(c => c.id === 9607).codigo_oficial === '9607'
+      && mockDb.__getNovidades().some(n => n.tipo === 'clientes-sem-compra' && n.texto === '5 para reativar · 3 de 3 a 5 meses, 2 de 6 a 12'),
+      `reativação: relatório pelo e-mail entra, acha cliente pelo CNPJ, não cria cliente (evita duplicado) e gera a novidade: ${JSON.stringify(res.body)}`);
+
+    res = await req('GET', '/api/reativacao');
+    {
+      const lista = res.body.clientes || [];
+      const por = (id) => lista.find(c => c.cliente_id === id);
+      const ids = lista.map(c => c.cliente_id);
+      assert(res.status === 200 && res.body.relatorio.data === hojeBr && !por(9603) && !por(9604) && !por(9606)
+        && por(9601) && por(9601).mes_ultima_compra === mesISO(4) && por(9601).fat === 5000 && por(9601).fat_origem === 'erp_12m' && por(9601).cidade === 'Maringa'
+        && por(9602) && por(9605) && por(9605).no_relatorio === false && por(9605).mes_ultima_compra === mesISO(20)
+        && por(9605).fat === 1200 && por(9605).fat_origem === 'ultimo_ano' && por(9605).ultima_compra === `${mesISO(20)}-05`,
+        `reativação: lista 3+ meses, tira quem pediu depois, inclui quem saiu do relatório com compra antiga: ${JSON.stringify(lista)}`);
+      // amarelo (por valor) -> vermelho -> mais de 12 meses
+      assert(ids.length === 4 && ids.indexOf(9601) < ids.indexOf(9607) && ids.indexOf(9607) < ids.indexOf(9602) && ids.indexOf(9602) < ids.indexOf(9605),
+        `reativação: ordem por faixa e, dentro dela, quem comprava mais: ${JSON.stringify(ids)}`);
+    }
+
+    // relatório mais antigo (ex.: o "Base de Clientes x Compra" de julho) não troca a foto
+    res = await req('POST', '/api/reativacao/importar', { ...Importadores.lerClientesSemCompra(XLSXt, xlsSemCompra(antesBr(90))) });
+    assert(res.status === 200 && res.body.ignorado === true && mockDb.__getConfiguracao('clientes_sem_compra_relatorio').data === hojeBr,
+      `reativação: relatório mais antigo que o importado não muda nada: ${JSON.stringify(res.body)}`);
+    {
+      // vendedor (não admin) não importa pelo Painel
+      const tokenAdmin = authToken;
+      authToken = tokenOutro;
+      res = await req('POST', '/api/reativacao/importar', { ...lido });
+      authToken = tokenAdmin;
+      assert(res.status === 403, `reativação: só admin importa pelo Painel: ${res.status}`);
+    }
+    res = await req('POST', '/api/reativacao/importar', { dataRelatorio: 'ontem', itens: [] });
+    assert(res.status === 400, 'reativação: importação sem data/itens responde 400');
+
+    res = await req('POST', '/api/reativacao/9601/adiar', { tipo: 'ja_falei', em: hojeBr });
+    assert(res.status === 200 && res.body.tipo === 'ja_falei' && res.body.adiado_ate === ritmoLib.somarDias(hojeBr, 30), `reativação: "Já falei" tira por 30 dias: ${JSON.stringify(res.body)}`);
+    res = await req('POST', '/api/reativacao/9602/adiar', { tipo: 'nao_reativar' });
+    assert(res.status === 200 && res.body.tipo === 'nao_reativar' && res.body.adiado_ate === null, `reativação: "Não reativar": ${JSON.stringify(res.body)}`);
+    res = await req('POST', '/api/reativacao/9602/adiar', { tipo: 'ja_falei' });
+    assert(res.status === 200 && res.body.tipo === 'nao_reativar', '"Já falei" depois de "Não reativar" não traz o cliente de volta');
+    res = await req('GET', '/api/reativacao');
+    {
+      const lista = res.body.clientes || [];
+      const a = lista.find(c => c.cliente_id === 9601);
+      assert(a && a.adiado_ate === ritmoLib.somarDias(hojeBr, 30) && !lista.some(c => c.cliente_id === 9602),
+        `reativação: devolve o "Já falei" e esconde o "Não reativar": ${JSON.stringify(lista.map(c => [c.cliente_id, c.adiado_ate]))}`);
+    }
+    res = await req('POST', '/api/reativacao/999999/adiar', { tipo: 'ja_falei' });
+    assert(res.status === 404, 'reativação: adiar cliente inexistente responde 404');
+
+    // 31b0) Relatório "Todas Contas" do Salesforce (routes/contasSalesforce.js):
+    // ativo de outro vendedor sai das oportunidades; inativo fora do app vira
+    // cliente e entra no Para reativar com a última compra do Salesforce;
+    // placar "Recuperados". Layout do relatório real de 18/10/2026.
+    {
+      // leituras com o outro usuário: o limite de 40/min das rotas de carteira é por usuário
+      const getComoOutro = async (url) => { const t = authToken; authToken = tokenOutro; const r = await req('GET', url); authToken = t; return r; };
+      const cabSf = ['Nome da Empresa', 'Data de criação', 'Cidade', 'Código Região', 'Estado da Conta', 'Código cliente ERP', 'Situação', 'CPF/CNPJ',
+        'Classificatório', 'Telefone', 'Email comercial', 'Primeiro nome do proprietário', 'Transportadora', 'Data da última compra', 'Aprovado Gestor'];
+      const contaSf = (nome, cod, sit, cnpj, classi, tel, dono, ultima, regiao = 'R2') => [nome, '05/01/2018', 'Maringá', regiao, 'PR', cod, sit, cnpj, classi, tel,
+        'loja@example.com', dono, 'TRD TRANSPORTE', ultima, null];
+      const xlsSf = planilha({ 'Todas Contas': [
+        ['Todas Contas - Representante (Parceiros Cortag)'],
+        ['Exibindo registros 1 - 9'],
+        [],
+        cabSf,
+        contaSf('LOJA AMARELA', 9601, 'Ativo', '96.010.000/0001-01', 'Varejo Master (20)', '44 3333 4444', 'SERGIO LUIZ', '10/09/2026 10:00'),
+        contaSf('LOJA EM DIA', 9603, 'Ativo', '96.030.000/0001-03', 'Varejo Master (20)', '44 3333 4444', 'SERGIO LUIZ', '10/10/2026 10:00'),
+        // 9605 já estava em "mais de 12 meses": hoje compra com o Rodrigo
+        contaSf('LOJA SUMIDA', 9605, 'Ativo', '96.050.000/0001-05', 'Varejo Exclusive (15)', '44 3333 4444', 'Rodrigo', '08/10/2026 10:30'),
+        // fora do app, do Rodrigo e parada: vira cliente
+        contaSf('LOJA DO RODRIGO PARADA', 9701, 'Inativo', '97.010.000/0001-01', 'Varejo Exclusive (15)', '44 3664 1112 44 9 91268052', 'Rodrigo', `${br(`${mesISO(30)}-15`)} 09:07`),
+        // ativa de outro vendedor e fora do app: não vira cliente
+        contaSf('LOJA ATIVA DO RODRIGO', 9702, 'Ativo', '97.020.000/0001-02', 'Rede', '44 3333 4444', 'Rodrigo', '01/10/2026 08:00'),
+        // no app sem histórico: a última compra vem do Salesforce
+        // inativa no Salesforce com compra há 8 meses com outro vendedor (fora do relatório do ERP do representante)
+        contaSf('LOJA DA MARINA PARADA', 9703, 'Inativo', '97.030.000/0001-03', 'Varejo Master (20)', '(44) 3333-4444', 'Marina', `${br(`${mesISO(8)}-20`)} 10:00`, 'VENDAS INTERNAS'),
+        // a conta da própria representação (dona outra pessoa no Salesforce) não é de outro vendedor
+        // conta ativa da gerência (o "Gestor" do Classificatório) não é de outro vendedor
+        contaSf('LOJA DO GERENTE', 9705, 'Ativo', '97.050.000/0001-05', 'Varejo Master (20)', '(44) 3333-4444', 'Vilmar', '01/10/2026 08:00'),
+        contaSf('REPRESENTACOES DO TESTE LTDA', 9704, 'Ativo', '97.040.000/0001-04', 'Representante', '(44) 3333-4444', 'Vilmar', '01/10/2026 08:00'),
+        contaSf('LOJA SEM HISTORICO', 9606, 'Inativo', '96.060.000/0001-06', 'Sem Classificatório', '(44) 99812-4471', 'SERGIO LUIZ', `${br(`${mesISO(20)}-03`)} 14:00`),
+      ] });
+      assert(Importadores.detectarTipoPlanilha(XLSXt, xlsSf) === 'contasSalesforce', 'importadores: reconhece o relatório "Todas Contas" do Salesforce (antes do Classificatório)');
+      const lidoSf = Importadores.lerContasSalesforce(XLSXt, xlsSf);
+      const c9701 = lidoSf.contas.find(c => c.codigo_oficial === '9701');
+      assert(lidoSf.contas.length === 9 && c9701.situacao === 'Inativo' && c9701.proprietario === 'Rodrigo' && c9701.ultima_compra === `${mesISO(30)}-15`
+        && c9701.documento === '97.010.000/0001-01' && c9701.regiao === 'R2' && c9701.classificatorio === 'Varejo Exclusive (15)',
+        `importadores: lê as contas do Salesforce (data com hora vira só o dia): ${JSON.stringify(lidoSf.contas.slice(0, 4))}`);
+      const { classificatorioDaConta } = require('../routes/contasSalesforce');
+      assert(JSON.stringify(classificatorioDaConta('Varejo Exclusive (15)')) === '{"tipo":"Varejo Exclusive","desconto":15}'
+        && classificatorioDaConta('Sem Classificatório') === null && classificatorioDaConta('Locação').desconto === 12,
+        'contas do Salesforce: classificatório pela política, pelo nome');
+      {
+        const tokenAdmin = authToken;
+        authToken = tokenOutro;
+        res = await req('POST', '/api/reativacao/contas-salesforce', lidoSf);
+        authToken = tokenAdmin;
+        assert(res.status === 403, `contas do Salesforce: só admin importa: ${res.status}`);
+      }
+      // a conta da representação já está no app (compra amostras)
+      mockDb.__seed({ clientes: [{ id: 9704, nome: 'REPRESENTACOES DO TESTE LTDA', documento: '97040000000104', codigo_oficial: '9704' }],
+        pedidosOficiaisItens: [{ nr_pedido: '697041', codigo_sku: '60863', cliente_codigo_oficial: '9704', quantidade: 1, valor: 50, data_implantacao: `${mesISO(20)}-05`, data_faturamento: `${mesISO(20)}-06`, status: 'faturado', nota_fiscal: '9704001' }] });
+      res = await req('POST', '/api/reativacao/contas-salesforce', lidoSf);
+      const novo = mockDb.__getClientes().find(c => c.codigo_oficial === '9701');
+      assert(res.status === 200 && res.body.principal === 'SERGIO LUIZ' && res.body.criados === 2 && res.body.deOutroVendedor === 2
+        && novo && novo.nome === 'LOJA DO RODRIGO PARADA' && novo.classificatorio_tipo === 'Varejo Exclusive' && Number(novo.classificatorio_desconto) === 15
+        && !mockDb.__getClientes().some(c => c.codigo_oficial === '9702'),
+        `contas do Salesforce: cria só o inativo fora do app, com classificatório pela política: ${JSON.stringify(res.body)}`);
+      res = await getComoOutro('/api/clientes/classificatorio/alertas');
+      assert(res.status === 200 && !res.body.riscoDeQueda.some(c => c.id === novo.id),
+        `contas do Salesforce: cliente criado de conta inativa (com classificatório, sem compra) não entra em "risco de queda": ${JSON.stringify(res.body.riscoDeQueda.map(c => c.id))}`);
+      {
+        const { documentoNormalizado, situacaoDaConta } = require('../routes/contasSalesforce');
+        assert(documentoNormalizado(1234567000190) === '01.234.567/0001-90' && documentoNormalizado('012.345.678-90') === '012.345.678-90'
+          && documentoNormalizado('123') === null && situacaoDaConta(' inativo ') === 'Inativo' && situacaoDaConta('Prospect') === null && situacaoDaConta('') === null,
+          'contas do Salesforce: CNPJ que veio como número volta com o zero; situação só Ativo/Inativo');
+        const antes = mockDb.__getClientes().length;
+        res = await req('POST', '/api/reativacao/contas-salesforce', { contas: [...lidoSf.contas, { codigo_oficial: '9799', nome: 'LOJA PROSPECT', situacao: 'Prospect', proprietario: 'SERGIO LUIZ' }] });
+        assert(res.status === 200 && mockDb.__getClientes().length === antes && res.body.principal === 'SERGIO LUIZ' && res.body.inativos === 3,
+          `contas do Salesforce: situação desconhecida não cria cliente: ${JSON.stringify(res.body)}`);
+      }
+      res = await getComoOutro('/api/clientes/sync');
+      {
+        const porId = (id) => res.body.clientes.find(c => c.id === id);
+        assert(porId(9605).outro_vendedor === 'Rodrigo' && !porId(9601).outro_vendedor && !porId(novo.id).outro_vendedor
+          && porId(9704).outro_vendedor === 'Representação',
+          `contas do Salesforce: /sync marca o cliente ativo de outro vendedor: ${JSON.stringify([porId(9605), porId(9601)].map(c => c && c.outro_vendedor))}`);
+      }
+      res = await getComoOutro('/api/reativacao');
+      {
+        const lista = res.body.clientes || [];
+        const por = (id) => lista.find(c => c.cliente_id === id);
+        const r = por(novo.id);
+        assert(!por(9605) && !por(9704) && r && r.base === 'Rodrigo' && r.mes_ultima_compra === mesISO(30) && r.telefone === '4436641112' && r.email === 'loja@example.com'
+          && por(9606) && por(9606).mes_ultima_compra === mesISO(20) && por(9606).base === null
+          && lista.some(c => c.codigo_oficial === '9703' && c.mes_ultima_compra === mesISO(8) && c.base === 'Telemarketing'),
+          `contas do Salesforce: Para reativar sem o ativo de outro vendedor, com o inativo novo ("Base Rodrigo"; vendas internas = "Base Telemarketing") e a última compra do Salesforce: ${JSON.stringify(lista)}`);
+        // sem valor conhecido, quem parou há menos tempo vem antes
+        const ids = lista.map(c => c.cliente_id);
+        assert(ids.indexOf(9606) < ids.indexOf(novo.id), `contas do Salesforce: sem valor, quem parou há menos tempo primeiro: ${JSON.stringify(ids)}`);
+        assert(res.body.recuperados && res.body.recuperados.alvos === 3 && res.body.recuperados.clientes.length === 0,
+          `placar: os 3 inativos viram alvo, ninguém recuperado ainda: ${JSON.stringify(res.body.recuperados)}`);
+      }
+      // reimportar não muda o "desde" do placar; pedido depois dele = recuperado
+      for (const a of mockDb.__getReativacaoAlvos()) a.desde = antesBr(10);
+      res = await req('POST', '/api/reativacao/contas-salesforce', lidoSf);
+      assert(res.status === 200 && res.body.criados === 0 && mockDb.__getReativacaoAlvos().every(a => a.desde === antesBr(10)),
+        `contas do Salesforce: reimportar não duplica cliente nem muda o "desde": ${JSON.stringify(res.body)}`);
+      mockDb.__seed({ pedidosOficiaisItens: [
+        { nr_pedido: '697011', codigo_sku: '60863', cliente_codigo_oficial: '9701', quantidade: 2, valor: 1500, data_implantacao: antesBr(2), data_faturamento: null, status: 'carteira' },
+      ] });
+      res = await getComoOutro('/api/reativacao');
+      {
+        const rec = res.body.recuperados.clientes;
+        assert(rec.length === 1 && rec[0].cliente_id === novo.id && rec[0].dia === antesBr(2) && rec[0].valor === 1500 && rec[0].base === 'Rodrigo'
+          && !res.body.clientes.some(c => c.cliente_id === novo.id),
+          `placar: quem pediu depois de entrar na lista conta como recuperado e sai do Para reativar: ${JSON.stringify(res.body.recuperados)}`);
+      }
+      const { primeiroTelefone } = require('../routes/lib/contasSalesforce');
+      assert(primeiroTelefone('(43) 98433-0757') === '43984330757' && primeiroTelefone('044 3367-8707') === '4433678707'
+        && primeiroTelefone('43 3675 2564; 9 9116 0316') === '4336752564' && primeiroTelefone('43 536.1374') === null,
+        'contas do Salesforce: primeiro telefone com DDD do campo livre');
+    }
+
+    // 31b1) Registro de visita (routes/visitas.js): visita = levantamento salvo,
+    // só as do usuário logado, um por cliente por dia; última compra pela entrada
+    // do pedido (sem a série de 7 dígitos) ou pedido do app; faturado em 12 meses.
+    {
+      const eu = (await req('GET', '/api/auth/me')).body;
+      const outro = mockDb.__getUsuarios().find(u => u.email === 'outro@example.com');
+      const meioDia = (iso) => `${iso}T15:00:00.000Z`;
+      mockDb.__seed({
+        clientes: [
+          { id: 9651, nome: 'VISITEI E COMPROU', documento: '96510000000101', codigo_oficial: '9651' },
+          { id: 9652, nome: 'VISITEI SEM COMPRA', documento: '96520000000102', codigo_oficial: '9652' },
+          { id: 9653, nome: 'COMPRA SEM VISITA', documento: '96530000000103', codigo_oficial: '9653' },
+          { id: 9654, nome: 'SO O OUTRO VISITOU', documento: '96540000000104', codigo_oficial: '9654' },
+          { id: 9655, nome: 'NEM VISITA NEM COMPRA', documento: '96550000000105', codigo_oficial: '9655' },
+        ],
+        levantamentos: [
+          { id: 96511, cliente_id: 9651, usuario_id: eu.id, data_visita: meioDia(antesBr(10)) },
+          { id: 96521, cliente_id: 9652, usuario_id: eu.id, data_visita: meioDia(antesBr(20)) },
+          { id: 96522, cliente_id: 9652, usuario_id: eu.id, data_visita: `${antesBr(20)}T18:00:00.000Z` },
+          { id: 96523, cliente_id: 9652, usuario_id: eu.id, data_visita: meioDia(antesBr(40)) },
+          { id: 96541, cliente_id: 9654, usuario_id: outro.id, data_visita: meioDia(antesBr(3)) },
+        ],
+        pedidosOficiaisItens: [
+          { nr_pedido: '696511', codigo_sku: '60863', cliente_codigo_oficial: '9651', quantidade: 1, valor: 300, data_implantacao: antesBr(5), data_faturamento: null, status: 'carteira' },
+          // série de 7 dígitos depois da visita não conta como compra
+          { nr_pedido: '1096521', codigo_sku: '60863', cliente_codigo_oficial: '9652', quantidade: 1, valor: 5, data_implantacao: antesBr(2), data_faturamento: null, status: 'carteira' },
+          { nr_pedido: '696531', codigo_sku: '60863', cliente_codigo_oficial: '9653', quantidade: 10, valor: 5000, data_implantacao: antesBr(35), data_faturamento: antesBr(30), status: 'faturado', nota_fiscal: '9653001' },
+          { nr_pedido: '696551', codigo_sku: '60863', cliente_codigo_oficial: '9655', quantidade: 1, valor: 900, data_implantacao: antesBr(500), data_faturamento: antesBr(495), status: 'faturado', nota_fiscal: '9655001' },
+        ],
+      });
+      res = await req('GET', '/api/visitas');
+      const lista = (res.body && res.body.clientes) || [];
+      const por = (id) => lista.find(c => c.cliente_id === id);
+      assert(res.status === 200 && res.body.hoje === hojeBr && res.body.janelaDias === 60
+        && por(9651) && por(9651).ultima_visita === antesBr(10) && por(9651).ultima_compra === antesBr(5)
+        && por(9652) && por(9652).ultima_visita === antesBr(20) && por(9652).visitas === 2 && por(9652).ultima_compra === null
+        && por(9653) && por(9653).ultima_visita === null && por(9653).fat_12m === 5000 && por(9653).ultima_compra === antesBr(35)
+        && !por(9654) && !por(9655),
+        `visitas: última visita só do usuário, um por dia, compra sem a série de 7 dígitos, 12 meses: ${JSON.stringify(lista.filter(c => c.cliente_id >= 9651 && c.cliente_id <= 9655))}`);
+      const tokenEu = authToken;
+      authToken = tokenOutro;
+      res = await req('GET', '/api/visitas');
+      authToken = tokenEu;
+      const doOutro = (res.body.clientes || []).find(c => c.cliente_id === 9654);
+      assert(res.status === 200 && doOutro && doOutro.ultima_visita === antesBr(3) && !(res.body.clientes || []).some(c => c.cliente_id === 9652 && c.ultima_visita),
+        `visitas: cada vendedor vê só as dele: ${JSON.stringify(doOutro)}`);
+    }
+
+    // 31b2) Fotos dos produtos (routes/produtoFotos.js): qualquer vendedor salva,
+    // só JPEG até 600 KB, cópia só pras variações sem foto, imagem só com login
+    {
+      mockDb.__seed({ produtos: [
+        { id: 9701, codigo_sku: 'FT1', nome: 'VENTOSA DUPLA ALUMINIO 120 KG', categoria: null },
+        { id: 9702, codigo_sku: 'FT2', nome: 'VENTOSA DUPLA ALUMINIO 150 KG', categoria: null },
+        { id: 9703, codigo_sku: 'FT3', nome: 'VENTOSA DUPLA ALUMINIO 200 KG - COM ESTOJO', categoria: null },
+        { id: 9704, codigo_sku: 'FT4', nome: 'CORTADOR DE PISO BRIC 75', categoria: null },
+      ] });
+      const jpeg = (n, marca) => Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(n, marca)]).toString('base64');
+      let rf = await req('GET', '/api/produto-fotos');
+      assert(rf.status === 200 && rf.body && Object.keys(rf.body.fotos).length === 0, 'fotos: lista começa vazia');
+      rf = await req('PUT', '/api/produto-fotos/FT1', { imagem: Buffer.from('não é imagem nenhuma, só texto comprido o bastante pra passar do mínimo'.repeat(30)).toString('base64') });
+      assert(rf.status === 422, 'fotos: recusa arquivo que não é JPEG (422)');
+      rf = await req('PUT', '/api/produto-fotos/FT1', { imagem: jpeg(700 * 1024, 1) });
+      assert(rf.status === 422 || rf.status === 413, `fotos: recusa foto acima do limite (${rf.status})`);
+      rf = await req('PUT', '/api/produto-fotos/NAO-EXISTE', { imagem: jpeg(4000, 1) });
+      assert(rf.status === 404, 'fotos: produto fora do catálogo responde 404');
+      rf = await req('GET', '/api/produto-fotos/FT2/variacoes');
+      assert(rf.status === 200 && JSON.stringify(rf.body.variacoes.map(v => v.codigo_sku)) === '["FT1","FT3"]',
+        `fotos: variações pelo grupo do nome (sem o cortador): ${JSON.stringify(rf.body)}`);
+      rf = await req('PUT', '/api/produto-fotos/FT3', { imagem: jpeg(3000, 3) });
+      assert(rf.status === 200 && rf.body.versao > 0, 'fotos: salva foto da variação FT3 antes');
+      rf = await req('PUT', '/api/produto-fotos/FT1', { imagem: 'data:image/jpeg;base64,' + jpeg(5000, 7), variacoes: ['FT2', 'FT3', 'FT4', 'FT4-NAO'] });
+      assert(rf.status === 200 && JSON.stringify(rf.body.variacoes) === '["FT2"]',
+        `fotos: copia só pra variação sem foto, do catálogo e do mesmo produto (FT4 é outro): ${JSON.stringify(rf.body)}`);
+      assert(!mockDb.__getProdutoFotos().FT4, 'fotos: o cortador (outro grupo) não ganhou a foto da ventosa');
+      const fotos = mockDb.__getProdutoFotos();
+      assert(fotos.FT3.imagem[4] === 3 && fotos.FT2.imagem[4] === 7, 'fotos: a foto que FT3 já tinha não foi trocada');
+      rf = await req('GET', '/api/produto-fotos');
+      assert(rf.status === 200 && ['FT1', 'FT2', 'FT3'].every(c => rf.body.fotos[c] > 0), `fotos: lista traz a versão de cada foto: ${JSON.stringify(rf.body)}`);
+      rf = await req('GET', '/api/produto-fotos/FT1');
+      assert(rf.status === 200 && /image\/jpeg/.test(rf.headers['content-type']), 'fotos: devolve a imagem como JPEG');
+      const tokenGuardado = authToken;
+      authToken = '';
+      rf = await req('GET', '/api/produto-fotos/FT1');
+      authToken = tokenGuardado;
+      assert(rf.status === 401, 'fotos: imagem só sai com login');
+      rf = await req('DELETE', '/api/produto-fotos/FT1');
+      assert(rf.status === 200 && !mockDb.__getProdutoFotos().FT1 && mockDb.__getProdutoFotos().FT2, 'fotos: tirar a foto de um não mexe nas variações');
+      rf = await req('GET', '/api/produto-fotos/FT1');
+      assert(rf.status === 404, 'fotos: produto sem foto responde 404');
+
+      // Miniaturas pro catálogo sem internet: geradas na 1ª vez, guardadas, zeradas ao trocar a foto
+      const jpegJs = require('jpeg-js');
+      const jpegReal = (w, h, semente) => {
+        const d = Buffer.alloc(w * h * 4);
+        for (let i = 0; i < d.length; i += 4) { d[i] = (i * semente) % 251; d[i + 1] = (i >> 3) % 253; d[i + 2] = 90; d[i + 3] = 255; }
+        return jpegJs.encode({ data: d, width: w, height: h }, 80).data;
+      };
+      rf = await req('PUT', '/api/produto-fotos/FT3', { imagem: jpegReal(600, 400, 7).toString('base64') });
+      assert(rf.status === 200, `miniatura: salva foto de verdade (${rf.status} ${JSON.stringify(rf.body)})`);
+      rf = await req('POST', '/api/produto-fotos/miniaturas', { codigos: ['FT2', 'FT3', 'SEM-FOTO'] });
+      const miniFt3 = rf.body && rf.body.miniaturas && rf.body.miniaturas.FT3;
+      const lidaFt3 = miniFt3 && jpegJs.decode(Buffer.from(miniFt3.img, 'base64'));
+      assert(rf.status === 200 && lidaFt3 && lidaFt3.width === 300 && lidaFt3.height === 200 && !rf.body.miniaturas.FT2 && rf.body.faltam === 0,
+        `miniatura: 300 px no lado maior, foto ilegível e sem foto ficam de fora: ${JSON.stringify(rf.body && { ...rf.body, miniaturas: Object.keys(rf.body.miniaturas || {}) })} ${lidaFt3 && lidaFt3.width}x${lidaFt3 && lidaFt3.height}`);
+      assert(miniFt3.v === mockDb.__getProdutoFotos().FT3.versao && mockDb.__getProdutoFotos().FT3.miniatura, 'miniatura: fica guardada com a versão da foto');
+      const ft2Mini = mockDb.__getProdutoFotos().FT2.miniatura;
+      assert(ft2Mini && ft2Mini.length === 0, 'miniatura: foto ilegível grava miniatura vazia (não decodifica de novo a cada pedido)');
+      rf = await req('GET', '/api/produto-fotos/FT2/mini');
+      assert(rf.status === 404, 'miniatura: foto ilegível responde 404 na rota de uma só');
+      rf = await req('GET', '/api/produto-fotos/FT3/mini');
+      assert(rf.status === 200 && /image\/jpeg/.test(rf.headers['content-type']), 'miniatura: rota de uma só devolve JPEG');
+      rf = await req('PUT', '/api/produto-fotos/FT3', { imagem: jpegReal(500, 500, 3).toString('base64') });
+      assert(rf.status === 200 && !mockDb.__getProdutoFotos().FT3.miniatura, 'miniatura: trocar a foto apaga a miniatura velha');
+      rf = await req('POST', '/api/produto-fotos/miniaturas', { codigos: Array.from({ length: 101 }, (_, i) => 'C' + i) });
+      assert(rf.status === 422, 'miniatura: mais de 100 códigos por pedido responde 422');
+      mockDb.__seed({ produtos: Array.from({ length: 17 }, (_, i) => ({ id: 9710 + i, codigo_sku: 'MN' + i, nome: 'PRODUTO MINI ' + i, categoria: null })) });
+      for (let i = 0; i < 17; i++) await req('PUT', '/api/produto-fotos/MN' + i, { imagem: jpegReal(320, 320, i + 2).toString('base64') });
+      rf = await req('POST', '/api/produto-fotos/miniaturas', { codigos: Array.from({ length: 17 }, (_, i) => 'MN' + i) });
+      assert(rf.status === 200 && Object.keys(rf.body.miniaturas).length === 15 && rf.body.faltam === 2,
+        `miniatura: gera no máximo 15 por pedido e diz quantas faltam: ${rf.body && Object.keys(rf.body.miniaturas || {}).length} / ${rf.body && rf.body.faltam}`);
+      rf = await req('POST', '/api/produto-fotos/miniaturas', { codigos: Array.from({ length: 17 }, (_, i) => 'MN' + i) });
+      assert(rf.status === 200 && Object.keys(rf.body.miniaturas).length === 17 && rf.body.faltam === 0, 'miniatura: o pedido seguinte completa (as já geradas vêm do banco)');
+    }
+
+    // 31c) Inadimplência (routes/inadimplencia.js): "Previa Relatório de
+    // Inadimplência", aba "Resumo" no layout do arquivo real de 31/08/2026
+    {
+      const cabInad = ['Título', 'Parc', 'Cliente', 'UF', 'Cidade', 'Dt Emissão', 'Vencimento', 'Saldo Título', 'Vl Líquido', '% Comissão', 'Vr.Abat.Comissão', null, null];
+      const xlsInad = (fim, linhas) => planilha({ Resumo: [
+        [null, null, 'Cortag Industria e Comercio LTDA'], [], [null, null, 'Relatório de Inadimplência '], [], [],
+        ['Periodo:', `01/01/2026 a ${br(fim)}`], [], ['Representante: ', null, "20 - RUSSO'S REPRESENTACOES COMERCIAIS LTDA"], [],
+        cabInad, [],
+        ...linhas,
+        [], [null, null, null, null, 'Total:', null, null, 999, 999],
+      ] });
+      const lin = (tit, parc, cli, venc, saldo, terc) => [tit, parc, cli, 'PR', 'Maringa', dia(2026, 6, 1), venc, saldo, saldo, 5, 1, dia(2026, 7, 27), terc ? 'COBR.TERCZ' : null];
+      const bufInad = xlsInad(antesBr(5), [
+        lin('0807943', '05', '9601 LOJA AMARELA', dia(2026, 3, 11), 1346.6000000000001, true),
+        lin('RN807943', '04', '9601 LOJA AMARELA', dia(2026, 3, 21), 969.3, true),
+        lin('0900294', '01', '777777 CLIENTE FORA DO APP', dia(2026, 8, 28), 5330.56, false),
+      ]);
+      assert(Importadores.detectarTipoPlanilha(XLSXt, bufInad) === 'inadimplencia', 'importadores: reconhece o Relatório de Inadimplência');
+      const li = Importadores.lerInadimplencia(XLSXt, bufInad);
+      assert(li.periodoInicio === '2026-01-01' && li.periodoFim === antesBr(5) && li.titulos.length === 3
+        && li.titulos[0].codigo_oficial === '9601' && li.titulos[0].cliente_nome === 'LOJA AMARELA' && li.titulos[0].vencimento === '2026-03-11'
+        && Math.abs(li.titulos[0].saldo - 1346.6) < 1e-9 && li.titulos[0].cobranca_terceirizada === true && li.titulos[2].cobranca_terceirizada === false,
+        `importadores: lê o Relatório de Inadimplência (período, código do cliente, sem a linha Total): ${JSON.stringify(li).slice(0, 500)}`);
+
+      res = await enviarArquivo(`Inadimplencia_${hojeBr}.xlsx`, bufInad, CHAVE_EMAIL, { assunto: 'Previa Relatório de Inadimplência Período', mensagemId: 'minad1' });
+      assert(res.status === 200 && res.body.tipo === 'inadimplencia' && res.body.resultado.titulos === 3 && res.body.resultado.clientes === 2
+        && res.body.resultado.semCliente === 1 && res.body.resultado.total === 7646.46
+        && mockDb.__getNovidades().some(n => n.tipo === 'inadimplencia' && n.texto === '2 clientes · R$ 7.646,46 em atraso'),
+        `inadimplência: relatório pelo e-mail entra e gera a novidade: ${JSON.stringify(res.body)}`);
+      res = await req('GET', '/api/inadimplencia');
+      {
+        const a = (res.body.clientes || []).find(c => c.cliente_id === 9601);
+        const fora = (res.body.clientes || []).find(c => c.codigo_oficial === '777777');
+        assert(res.status === 200 && res.body.relatorio.periodo_fim === antesBr(5) && res.body.clientes.length === 2
+          && res.body.clientes[0].codigo_oficial === '777777'
+          && a && a.total === 2315.9 && a.titulos.some(t => t.saldo === 1346.6) && a.mais_antigo === '2026-03-11' && a.cobranca_terceirizada === true && a.titulos.length === 2
+          && fora && fora.cliente_id === null && fora.nome === 'CLIENTE FORA DO APP',
+          `inadimplência: lista por cliente, maior valor primeiro, com os títulos (saldo gravado em centavos): ${JSON.stringify(res.body).slice(0, 700)}`);
+      }
+      // o mesmo relatório de novo (e-mail repetido, arquivo regerado) não avisa outra vez
+      {
+        const antes = mockDb.__getNovidades().filter(n => n.tipo === 'inadimplencia').length;
+        res = await req('POST', '/api/inadimplencia/importar', li);
+        assert(res.status === 200 && res.body.titulos === 3
+          && mockDb.__getNovidades().filter(n => n.tipo === 'inadimplencia').length === antes
+          && mockDb.__getNovidades().filter(n => n.tipo === 'inadimplencia').slice(-1)[0].texto === '2 clientes · R$ 7.646,46 em atraso',
+          `inadimplência: relatório repetido não gera outro aviso: ${JSON.stringify(res.body)}`);
+      }
+      // cliente que ganha o código depois da importação passa a abrir
+      mockDb.__seed({ clientes: [{ id: 9777, nome: 'CLIENTE NOVO NO APP', documento: '97770000000177', codigo_oficial: '777777' }] });
+      res = await req('GET', '/api/inadimplencia');
+      assert((res.body.clientes || []).some(c => c.codigo_oficial === '777777' && c.cliente_id === 9777 && c.nome === 'CLIENTE NOVO NO APP'),
+        `inadimplência: cliente com o código gravado depois aparece no app: ${JSON.stringify(res.body.clientes)}`);
+      // aba "Resumo" depois de outra aba também é reconhecida
+      {
+        const wb = XLSXt.read(bufInad, { type: 'buffer' });
+        const novo = XLSXt.utils.book_new();
+        XLSXt.utils.book_append_sheet(novo, XLSXt.utils.aoa_to_sheet([['Capa']]), 'Capa');
+        XLSXt.utils.book_append_sheet(novo, wb.Sheets.Resumo, 'Resumo');
+        assert(Importadores.detectarTipoPlanilha(XLSXt, XLSXt.write(novo, { type: 'buffer', bookType: 'xlsx' })) === 'inadimplencia',
+          'importadores: inadimplência reconhecida mesmo com a aba Resumo depois de outra');
+      }
+      // relatório mais antigo não troca a foto; mais novo sem ninguém em atraso esvazia
+      res = await req('POST', '/api/inadimplencia/importar', Importadores.lerInadimplencia(XLSXt, xlsInad(antesBr(40), [lin('1', '01', '9602 LOJA VERMELHA', dia(2026, 1, 1), 10, false)])));
+      assert(res.status === 200 && res.body.ignorado === true, `inadimplência: relatório mais antigo é ignorado: ${JSON.stringify(res.body)}`);
+      {
+        const tokenAdmin = authToken;
+        authToken = tokenOutro;
+        res = await req('POST', '/api/inadimplencia/importar', li);
+        authToken = tokenAdmin;
+        assert(res.status === 403, `inadimplência: só admin importa pelo Painel: ${res.status}`);
+      }
+      res = await req('POST', '/api/inadimplencia/importar', Importadores.lerInadimplencia(XLSXt, xlsInad(hojeBr, [])));
+      const vazio = await req('GET', '/api/inadimplencia');
+      assert(res.status === 200 && res.body.titulos === 0 && vazio.body.clientes.length === 0 && vazio.body.relatorio.periodo_fim === hojeBr,
+        `inadimplência: relatório novo sem títulos = ninguém em atraso: ${JSON.stringify(res.body)}`);
+    }
+
+    // script do Gmail: o anexo vem como "02_10_2026_RUSSO"'S_..._Clientes_s" (sem extensão) - vale o assunto
+    const codigoGs = require('fs').readFileSync(require('path').join(__dirname, '../scripts/gmail-importacao/Codigo.gs'), 'utf8');
+    const gs = require('vm').runInNewContext(codigoGs + '\n;({ CONFIG, nomePeloAssunto_ })',
+      { Utilities: { formatDate: (d, tz, fmt) => d.toISOString().slice(0, 10) } });
+    const regra = gs.CONFIG.porAssunto[0];
+    const msg = { getDate: () => new Date('2026-10-02T06:04:24Z') };
+    assert(regra.assunto.test('Relatório de Clientes Sem Compra') && regra.assunto.test("Cortag - Base de Clientes x Compra - Representante RUSSO'S")
+      && !regra.assunto.test('Pedido Bloqueado 00677375') && regra.remetente === 'noreply@cortag.com.br'
+      && gs.nomePeloAssunto_(regra, msg, 0, 1) === 'ClientesSemCompra_2026-10-02.xlsx' && gs.nomePeloAssunto_(regra, msg, 1, 2) === 'ClientesSemCompra_2026-10-02_2.xlsx'
+      && gs.CONFIG.porAssunto[1].assunto.test('Previa Relatório de Inadimplência Período 01/01/2026 a 28/08/2026')
+      && !gs.CONFIG.porAssunto[1].assunto.test('Relatório de Clientes Sem Compra'),
+      'script do Gmail: reconhece o relatório de clientes sem compra pelo assunto e manda com nome .xlsx');
+  }
+  {
+    // script do Gmail (scripts/gmail-importacao/Codigo.gs, roda no Google): só manda
+    // e-mail do endereço exato que o Gmail autenticou (DKIM/DMARC). Cabeçalhos no
+    // formato do e-mail real da vendas@cortag.com de 16/09/2026.
+    const codigoGs = require('fs').readFileSync(require('path').join(__dirname, '../scripts/gmail-importacao/Codigo.gs'), 'utf8');
+    const gs = require('vm').runInNewContext(codigoGs + '\n;({ enderecoDe_, cabecalhos_, autenticadoPeloGmail_ })', {});
+    const bruto = (autenticacao, resto = '') => ['Delivered-To: russo2055@gmail.com',
+      'Received: by 2002:a05:6000:118e with SMTP id g14;\r\n        Wed, 16 Sep 2026 07:11:09 -0700 (PDT)',
+      'ARC-Authentication-Results: i=2; mx.google.com;\r\n       dkim=pass header.i=@cortag.com',
+      ...(autenticacao ? ['Authentication-Results: mx.google.com;\r\n       ' + autenticacao.join(';\r\n       ')] : []),
+      'From: Vendas <vendas@cortag.com>', 'Subject: LISTA', resto].filter(Boolean).join('\r\n') + '\r\n\r\ncorpo\r\nAuthentication-Results: mx.google.com; dmarc=pass header.from=cortag.com';
+    const cab = (autenticacao, resto) => gs.cabecalhos_({ getRawContent: () => bruto(autenticacao, resto) });
+    const real = ['dkim=pass header.i=@cortag.com header.s=selector1 header.b=C49PC7Nx',
+      'arc=pass (i=1 spf=pass spfdomain=cortag.com dkim=pass dkdomain=cortag.com dmarc=pass fromdomain=cortag.com)',
+      'spf=pass (google.com: domain of vendas@cortag.com designates 2a01:111:f403:c111::5 as permitted sender) smtp.mailfrom=vendas@cortag.com',
+      'dmarc=pass (p=QUARANTINE sp=QUARANTINE dis=NONE) header.from=cortag.com'];
+    const internoDaCortag = 'authentication-results: dkim=none (message not signed)\r\n header.d=none;dmarc=none action=none header.from=cortag.com;';
+    const falsoAbaixo = 'Authentication-Results: mx.google.com; dkim=pass header.i=@cortag.com; dmarc=pass header.from=cortag.com';
+    const reprovado = ['dkim=none', 'spf=pass smtp.mailfrom=golpe@outro-dominio.com', 'dmarc=fail (p=QUARANTINE) header.from=cortag.com'];
+    assert(gs.enderecoDe_('Vendas <VENDAS@cortag.com>') === 'vendas@cortag.com' && gs.enderecoDe_('noreply@cortag.com.br') === 'noreply@cortag.com.br'
+      && gs.enderecoDe_('"vendas@cortag.com" <golpe@outro-dominio.com>') === 'golpe@outro-dominio.com',
+      'script do Gmail: o remetente é o endereço dentro de <...>, não o nome de exibição');
+    assert(gs.autenticadoPeloGmail_(cab(real, internoDaCortag), 'vendas@cortag.com') === true
+      && gs.autenticadoPeloGmail_(cab(['dkim=pass header.i=@cortag.com.br header.s=s1', 'spf=pass smtp.mailfrom=noreply@cortag.com.br']), 'noreply@cortag.com.br') === true
+      && gs.autenticadoPeloGmail_(cab(['dkim=pass header.d=cortag.com.br']), 'noreply@cortag.com.br') === true,
+      'script do Gmail: e-mail com DMARC ou DKIM "pass" do domínio do remetente vale');
+    assert(gs.autenticadoPeloGmail_(cab(reprovado, falsoAbaixo), 'vendas@cortag.com') === false
+      && gs.autenticadoPeloGmail_(cab(real), 'noreply@cortag.com.br') === false
+      && gs.autenticadoPeloGmail_(cab(['dkim=pass header.d=cortag.com.golpe.com', 'dmarc=fail header.from=cortag.com']), 'vendas@cortag.com') === false
+      && gs.autenticadoPeloGmail_(cab(['dkim=pass header.i=@cortag.com']), 'noreply@cortag.com.br') === false
+      && gs.autenticadoPeloGmail_(cab(['spf=pass smtp.mailfrom=vendas@cortag.com', 'dmarc=none header.from=cortag.com']), 'vendas@cortag.com') === false
+      && gs.autenticadoPeloGmail_('From: vendas@cortag.com', 'vendas@cortag.com') === false,
+      'script do Gmail: não vale "pass" escrito por quem mandou (abaixo do do Gmail), de outro domínio/subdomínio, só SPF ou sem Authentication-Results');
+    // formatos reais do log do conferirAutenticacao (05/10/2026): a noreply passa SÓ pelo
+    // DMARC (DKIM de cortagind.onmicrosoft.com, não alinhado); a vendas@ às vezes traz
+    // header.b entre aspas
+    const realNoreply = ['dkim=pass header.i=@cortagind.onmicrosoft.com header.s=selector2-cortagind-onmicrosoft-com header.b=e3BvrIva',
+      'arc=pass (i=1 spf=pass spfdomain=cortag.com.br dkim=pass dkdomain=cortag.com.br dmarc=pass fromdomain=cortag.com.br)',
+      'spf=pass (google.com: domain of noreply@cortag.com.br designates 2a01:111:f403:c10d::1 as permitted sender) smtp.mailfrom=noreply@cortag.com.br',
+      'dmarc=pass (p=QUARANTINE sp=QUARANTINE dis=NONE) header.from=cortag.com.br'];
+    const realVendasAspas = ['dkim=pass header.i=@cortag.com header.s=selector1 header.b="ALsKnD/O"',
+      'spf=pass (google.com: domain of vendas@cortag.com designates 2a01:111:f403:c10d::3 as permitted sender) smtp.mailfrom=vendas@cortag.com',
+      'dmarc=pass (p=QUARANTINE sp=QUARANTINE dis=NONE) header.from=cortag.com'];
+    assert(gs.autenticadoPeloGmail_(cab(realNoreply), 'noreply@cortag.com.br') === true
+      && gs.autenticadoPeloGmail_(cab(realVendasAspas), 'vendas@cortag.com') === true
+      && gs.autenticadoPeloGmail_(cab(realNoreply.filter(r => !r.startsWith('dmarc='))), 'noreply@cortag.com.br') === false,
+      'script do Gmail: formato real da noreply (só DMARC) e da vendas@ (header.b entre aspas) passam; noreply sem o DMARC não');
+    // endereço de envio escolhido por quem manda, repetido pelo Gmail no comentário do spf e
+    // no smtp.mailfrom: um ";dmarc=pass header.from=..." dentro dele não vira resultado
+    const envelope = (texto) => ['dkim=none', `spf=pass (google.com: domain of ${texto}@golpe.com designates 1.2.3.4 as permitted sender) smtp.mailfrom=${texto}@golpe.com`,
+      'dmarc=fail (p=NONE sp=NONE dis=NONE) header.from=cortag.com.br'];
+    assert(gs.autenticadoPeloGmail_(cab(envelope('"x;dmarc=pass header.from=cortag.com.br y"')), 'noreply@cortag.com.br') === false
+      && gs.autenticadoPeloGmail_(cab(envelope('"x;dkim=pass header.i=@cortag.com y"')), 'vendas@cortag.com') === false
+      && gs.autenticadoPeloGmail_(cab(envelope('"x(;dmarc=pass header.from=cortag.com.br"')), 'noreply@cortag.com.br') === false,
+      'script do Gmail: "pass" escondido no endereço de envio (entre aspas/parênteses) não vale');
+    // cada resultado tem que estar inteiro no formato "metodo=resultado chave.sub=valor":
+    // pedaço solto no meio ou chave repetida descarta o resultado
+    assert(gs.autenticadoPeloGmail_(cab(['dmarc=pass golpe header.from=cortag.com.br']), 'noreply@cortag.com.br') === false
+      && gs.autenticadoPeloGmail_(cab(['dmarc=pass header.from=golpe.com header.from=cortag.com.br']), 'noreply@cortag.com.br') === false
+      && gs.autenticadoPeloGmail_(cab(['dmarc=pass header.from=cortag.com.br=x']), 'noreply@cortag.com.br') === false
+      && gs.autenticadoPeloGmail_(cab(['dkim=pass x=y header.i=@cortag.com']), 'vendas@cortag.com') === false
+      && gs.autenticadoPeloGmail_(cab(['dmarc=pass header.from=cortag.com.br.golpe.com']), 'noreply@cortag.com.br') === false
+      && gs.autenticadoPeloGmail_(cab(['dkim=pass header.i=@cortag.com header.d=cortag.com header.b=""']), 'vendas@cortag.com') === true
+      && gs.autenticadoPeloGmail_(cab(['DMARC=Pass header.from=Cortag.com.br']), 'noreply@cortag.com.br') === true,
+      'script do Gmail: resultado de autenticação só vale inteiro no formato (sem pedaço solto nem chave repetida)');
+    // verificarEmails de ponta a ponta, com Gmail/servidor falsos: e-mail com erro do
+    // servidor (503) não trava a fila pra sempre - na 4ª rodada vira "Falhou" e o
+    // seguinte entra; remetente falso nunca é mandado (endereço de fora: nem é
+    // considerado; endereço da Cortag sem autenticação: "Cortag/Nao autenticado").
+    // "autenticado" guardado pela checagem antiga (chave sem versão) não vale mais:
+    // o golpe-endereco é conferido de novo e marcado
+    const props = { CHAVE: 'chave-teste', AUTENTICADOS: JSON.stringify({ 'golpe-endereco': 'noreply@cortag.com.br' }) };
+    const marcadores = {};
+    const leiturasCompletas = {};
+    const logs = [];
+    const enviados = [];
+    const autenticado = 'Authentication-Results: mx.google.com;\r\n dkim=pass header.i=@cortag.com.br;\r\n dmarc=pass header.from=cortag.com.br';
+    const emailFalso = (id, de, nomeAnexo, data, cab) => {
+      const thread = { addLabel: (l) => { marcadores[id] = marcadores[id] ? marcadores[id] + '+' + l.nome : l.nome; }, getMessages: () => [msg] };
+      const msg = {
+        getId: () => id, getDate: () => data, getFrom: () => de, getSubject: () => 'Relatório ' + id,
+        getAttachments: () => [].concat(nomeAnexo).map(n => ({ getName: () => n, getBytes: () => [1, 2, 3] })),
+        getRawContent: () => { leiturasCompletas[id] = (leiturasCompletas[id] || 0) + 1; return cab + '\r\nFrom: ' + de + '\r\n\r\ncorpo'; },
+      };
+      return thread;
+    };
+    const agora = Date.now();
+    let bancoFora = false;
+    const threads = [
+      emailFalso('velho-503', 'noreply@cortag.com.br', 'Repres-1.xlsx', new Date(agora - 3 * 3600000), autenticado),
+      emailFalso('novo-ok', 'noreply@cortag.com.br', 'Repres-2.xlsx', new Date(agora - 3600000), autenticado),
+      emailFalso('golpe-nome', '"noreply@cortag.com.br" <golpe@outro.com>', 'Repres-3.xlsx', new Date(agora - 7200000),
+        'Authentication-Results: mx.google.com; dmarc=fail header.from=outro.com'),
+      emailFalso('golpe-endereco', 'noreply@cortag.com.br', 'Repres-4.xlsx', new Date(agora - 5400000),
+        'Authentication-Results: mx.google.com; spf=softfail; dmarc=fail header.from=cortag.com.br'),
+      // dois anexos: um entra, outro é recusado (422) -> os dois marcadores
+      emailFalso('dois-anexos', 'noreply@cortag.com.br', ['Repres-5.xlsx', 'Repres-6-ruim.xlsx'], new Date(agora - 1800000), autenticado),
+      // "De:" com comentário em vez de <...>: fica de fora, mas avisa no log
+      emailFalso('outro-formato', 'noreply@cortag.com.br (Cortag)', 'Repres-7.xlsx', new Date(agora - 1700000), autenticado),
+    ];
+    const ctx = {
+      Logger: { log: (...a) => { logs.push(a.join(' ')); } },
+      Utilities: { base64Encode: () => 'AQID', sleep: () => {} },
+      PropertiesService: { getScriptProperties: () => ({ getProperty: k => (k in props ? props[k] : null), setProperty: (k, v) => { props[k] = v; }, deleteProperty: k => { delete props[k]; } }) },
+      GmailApp: { search: () => threads, getUserLabelByName: n => ({ nome: n }), createLabel: n => ({ nome: n }) },
+      UrlFetchApp: { fetch: (url, opts) => {
+        if (url.endsWith('/health')) return { getResponseCode: () => 200 };
+        if (url.endsWith('/health/banco')) return { getResponseCode: () => (bancoFora ? 503 : 200) };
+        const corpo = JSON.parse(opts.payload);
+        enviados.push(corpo.nome);
+        const codigo = corpo.nome === 'Repres-1.xlsx' ? 503 : corpo.nome === 'Repres-6-ruim.xlsx' ? 422 : 200;
+        return { getResponseCode: () => codigo, getContentText: () => '{}' };
+      } },
+    };
+    require('vm').runInNewContext(codigoGs, ctx);
+    // banco do app fora do ar por 5 rodadas (/health no ar, /health/banco 503): nada é
+    // mandado nem conta tentativa - senão uma queda longa do banco fazia desistir de e-mail bom
+    bancoFora = true;
+    for (let i = 0; i < 5; i++) ctx.verificarEmails();
+    const comBancoFora = { enviados: enviados.splice(0).length, marcadores: Object.keys(marcadores).filter(k => k !== 'golpe-endereco').length,
+      tentativas: props.TENTATIVAS || '{}' };
+    bancoFora = false;
+    const rodadas = [];
+    for (let i = 0; i < 4; i++) {
+      ctx.verificarEmails();
+      rodadas.push({ velho: marcadores['velho-503'] || null, novo: marcadores['novo-ok'] || null, enviados: enviados.splice(0).join(',') });
+    }
+    assert(rodadas.slice(0, 3).every(r => !r.velho && !r.novo && r.enviados === 'Repres-1.xlsx')
+      && rodadas[3].velho === 'Cortag/Falhou' && rodadas[3].novo === 'Cortag/Importado'
+      && rodadas[3].enviados === 'Repres-1.xlsx,Repres-2.xlsx,Repres-5.xlsx,Repres-6-ruim.xlsx'
+      && !marcadores['golpe-nome'] && marcadores['golpe-endereco'] === 'Cortag/Nao autenticado'
+      && !('velho-503' in JSON.parse(props.TENTATIVAS || '{}'))
+      && comBancoFora.enviados === 0 && comBancoFora.marcadores === 0 && comBancoFora.tentativas === '{}'
+      // o e-mail que esperou na fila 9 rodadas (5 de banco fora + 4 de erro) foi lido inteiro 1 vez só
+      && leiturasCompletas['velho-503'] === 1 && leiturasCompletas['novo-ok'] === 1
+      && JSON.parse(props.AUTENTICADOS_v2 || '{}')['velho-503'] === undefined && !('AUTENTICADOS' in props)
+      && marcadores['dois-anexos'] === 'Cortag/Importado+Cortag/Falhou'
+      && !marcadores['outro-formato'] && !leiturasCompletas['outro-formato']
+      && logs.some(l => l.includes('não é exatamente o da Cortag') && l.includes('(Cortag)')),
+      `script do Gmail: erro do servidor tenta 4 rodadas e desiste sem travar a fila; banco fora não conta tentativa; remetente falso não é mandado; e-mail na fila lido 1 vez; 2 anexos = 2 marcadores; "De:" fora do padrão avisa: ${JSON.stringify([comBancoFora, rodadas, marcadores, leiturasCompletas])}`);
+  }
+  {
+    // relatório diário do fim de semana: na segunda sai um push só, o do mais novo
+    const idSab = await nov.avisarImportacao('objetivos-trimestrais', 'sábado');
+    mockDb.__getNovidades().forEach(x => { if (x.id === idSab) { x.atualizado_em = new Date(Date.now() - 3600000); x.push_pendente = true; x.push_enviar_em = new Date(Date.now() + 86400000); } });
+    const idDom = await nov.avisarImportacao('objetivos-trimestrais', 'domingo');
+    const sab = mockDb.__getNovidades().find(x => x.id === idSab);
+    assert(idSab !== idDom && sab.push_pendente === false, 'aviso: novidade nova do mesmo tipo tira da fila o push que ainda esperava o horário');
+  }
+
+  {
+    // Desativar vendedor em vez de excluir (routes/auth.js, middleware/auth.js):
+    // inativo não entra, a sessão de 90 dias que ele tinha deixa de valer, sessões e
+    // push dele são apagados; excluir quem tem pedido gravado responde 409.
+    const usuarios = mockDb.__getUsuarios();
+    const admin = usuarios.find(u => u.email === 'michel@example.com');
+    const criarComSessao = async (nome, email, sub, isAdmin) => {
+      const u = await mockDb.pool.query(`INSERT INTO usuarios (nome, email, google_sub, is_admin) VALUES ($1, $2, $3, ${isAdmin ? 'true' : 'false'}) RETURNING id, nome, email, is_admin`, [nome, email, sub]);
+      const token = generateToken();
+      await mockDb.pool.query('INSERT INTO sessoes (token, usuario_id, expira_em) VALUES ($1, $2, $3)', [hashToken(token), u.rows[0].id, '90']);
+      return { id: u.rows[0].id, token };
+    };
+    const saiu = await criarComSessao('Vendedor Que Saiu', 'saiu@example.com', 'sub-saiu', false);
+    mockDb.__getPushInscricoes().push({ id: 9901, usuario_id: saiu.id, endpoint: 'https://fcm.googleapis.com/fcm/send/saiu', p256dh: 'x', auth: 'y' });
+    mockDb.__getPedidos().push({ id: 99901, cliente_id: null, usuario_id: saiu.id, origem: 'app', data_pedido: new Date().toISOString() });
+    const tokenAdmin = authToken;
+
+    authToken = saiu.token;
+    const antes = await req('GET', '/api/clientes');
+    // vendedor comum não desativa ninguém
+    const naoAdmin = await req('PATCH', `/api/auth/usuarios/${admin.id}`, { ativo: false });
+    authToken = tokenAdmin;
+    const excluir = await req('DELETE', `/api/auth/usuarios/${saiu.id}`);
+    const semCampo = await req('PATCH', `/api/auth/usuarios/${saiu.id}`, { ativo: 'nao' });
+    const desativa = await req('PATCH', `/api/auth/usuarios/${saiu.id}`, { ativo: false });
+    const lista = await req('GET', '/api/auth/usuarios');
+    authToken = saiu.token;
+    const depois = await req('GET', '/api/clientes');
+    const me = await req('GET', '/api/auth/me');
+    authToken = '';
+    googleFalso = (t) => (t === 'tok-saiu' ? { sub: 'sub-saiu', email: 'saiu@example.com', nome: 'Vendedor Que Saiu' } : null);
+    const login = await req('POST', '/api/auth/google', { id_token: 'tok-saiu' });
+    authToken = tokenAdmin;
+    assert(antes.status === 200 && naoAdmin.status === 403
+      && excluir.status === 409 && /desative em vez de excluir/.test(excluir.body.erro) && usuarios.some(u => u.id === saiu.id)
+      && semCampo.status === 400 && desativa.status === 200 && desativa.body.ativo === false
+      && lista.body.find(u => u.id === saiu.id).ativo === false
+      && depois.status === 401 && me.status === 401
+      && login.status === 403 && /desativado/.test(login.body.erro) && !login.body.token
+      && !mockDb.__getSessoes().some(se => se.usuario_id === saiu.id)
+      && !mockDb.__getPushInscricoes().some(i => i.usuario_id === saiu.id),
+      `desativar usuário: excluir com pedido = 409, inativo não passa no requireAuth/me nem no login Google, sessões e push apagados: ${JSON.stringify([antes.status, naoAdmin.status, excluir.status, semCampo.status, desativa.status, depois.status, me.status, login.status, login.body])}`);
+
+    // reativar: entra de novo pelo Google
+    const reativa = await req('PATCH', `/api/auth/usuarios/${saiu.id}`, { ativo: true });
+    authToken = '';
+    const login2 = await req('POST', '/api/auth/google', { id_token: 'tok-saiu' });
+    authToken = login2.body && login2.body.token;
+    const comNovaSessao = await req('GET', '/api/clientes');
+    authToken = tokenAdmin;
+    assert(reativa.status === 200 && reativa.body.ativo === true && login2.status === 200 && comNovaSessao.status === 200,
+      `reativar usuário: volta a entrar pelo Google: ${JSON.stringify([reativa.status, login2.status, comNovaSessao.status])}`);
+
+    // travas: não desativa a si mesmo; outro admin desativa (e a sessão dele cai na hora).
+    // A trava do "último admin ativo" só pega corrida (quem pede é sempre outro admin ativo).
+    const proprio = await req('PATCH', `/api/auth/usuarios/${admin.id}`, { ativo: false });
+    const outroAdmin = await criarComSessao('Outro Admin', 'admin2@example.com', 'sub-admin2', true);
+    authToken = outroAdmin.token;
+    const desativaPrimeiro = await req('PATCH', `/api/auth/usuarios/${admin.id}`, { ativo: false });
+    authToken = tokenAdmin;
+    const adminDesativadoBarrado = await req('GET', '/api/clientes');
+    authToken = outroAdmin.token;
+    const reativaPrimeiro = await req('PATCH', `/api/auth/usuarios/${admin.id}`, { ativo: true });
+    const excluiOutro = await req('DELETE', `/api/auth/usuarios/${saiu.id}`); // ainda tem pedido
+    authToken = tokenAdmin;
+    const sessaoNaoVolta = await req('GET', '/api/clientes');
+    assert(proprio.status === 400 && desativaPrimeiro.status === 200 && adminDesativadoBarrado.status === 401
+      && reativaPrimeiro.status === 200 && excluiOutro.status === 409 && sessaoNaoVolta.status === 401,
+      `desativar usuário: não desativa a si mesmo; desativado perde a sessão (reativar não a devolve): ${JSON.stringify([proprio.status, desativaPrimeiro.status, adminDesativadoBarrado.status, reativaPrimeiro.status, excluiOutro.status, sessaoNaoVolta.status])}`);
+    // admin 1 perdeu a sessão ao ser desativado: nova sessão pra ele seguir nos testes
+    authToken = generateToken();
+    await mockDb.pool.query('INSERT INTO sessoes (token, usuario_id, expira_em) VALUES ($1, $2, $3)', [hashToken(authToken), admin.id, '90']);
+    const excluiAdmin2 = await req('DELETE', `/api/auth/usuarios/${outroAdmin.id}`);
+    assert(excluiAdmin2.status === 200 && !mockDb.__getUsuarios().some(u => u.id === outroAdmin.id), 'excluir usuário sem pedido nem importação continua funcionando');
+    googleFalso = null;
+  }
+
+  {
+    // Links de planilha/configuração (vídeo, site do produto, transportadora) só com
+    // https:// (index.html urlHttpsOuVazio): escapeHtml não barra href="javascript:..."
+    const fs = require('fs');
+    const vm = require('vm');
+    const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+    const fonte = html.match(/function urlHttpsOuVazio\(valor\) \{[\s\S]*?\r?\n      \}/);
+    const ctx = { URL };
+    vm.createContext(ctx);
+    vm.runInContext(fonte ? fonte[0] : '', ctx);
+    const f = ctx.urlHttpsOuVazio;
+    const ruins = ['javascript:alert(1)', ' JaVaScRiPt:alert(1)', 'java\tscript:alert(1)', 'data:text/html,<script>alert(1)</script>',
+      'vbscript:x', 'http://exemplo.com', '//exemplo.com', 'www.youtube.com/x', '\x01javascript:alert(1)', 'https:/x', '', null, undefined];
+    const bons = ['https://youtu.be/abc', ' https://www.instagram.com/reel/x ', 'HTTPS://cortag.com.br/p?x=1',
+      'https://portal.transp.com.br/rastreio?cnpj={cnpj}&nf={nf}'];
+    const passouRuim = f ? ruins.filter(u => f(u) !== '') : ['sem função'];
+    const recusouBom = f ? bons.filter(u => f(u) !== u.trim()) : ['sem função'];
+    // e quem monta link a partir desses dados usa a função
+    const usos = ['const youtube = urlHttpsOuVazio(v.youtube)', 'urlHttpsOuVazio(SITE_LINK_MAP[cod])', 'urlHttpsOuVazio(transp.url)',
+      'const youtube = urlHttpsOuVazio(ytTexto)', 'const link = urlHttpsOuVazio(texto)', '!urlHttpsOuVazio(url)'].filter(u => !html.includes(u));
+    assert(passouRuim.length === 0 && recusouBom.length === 0 && usos.length === 0,
+      `links de vídeo/site/transportadora só aceitam https://: ${JSON.stringify({ passouRuim, recusouBom, usos })}`);
+  }
+
+  {
+    // Busca do catálogo (index.html, trecho <motor-busca>): relato de 10/2026, "Serra
+    // copo 50 mm" não achava nada na aba Produtos (que fazia busca por trecho exato).
+    {
+      const fsB = require('fs');
+      const vmB = require('vm');
+      const htmlB = fsB.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+      const iniB = htmlB.indexOf('// <motor-busca>');
+      const fimB = htmlB.indexOf('// </motor-busca>');
+      const prods = [
+        { c: '60882', n: 'SERRA COPO DIAMANTADA PORCELANATO 50 mm' },
+        { c: '60883', n: 'SERRA COPO DIAMANTADA PORCELANATO 150 mm' },
+        { c: '60884', n: 'SERRA COPO DIAMANTADA PORCELANATO 51 mm' },
+        { c: '61420', n: 'SERRA COPO DIAMANTA. P/ ALVENARIA C/ HASTE 50mm' },
+        { c: '62857', n: 'ESPAÇADOR NIVELADOR 1,5 mm SUPRA - PCT C/ 50 UN.' },
+        { c: '62438', n: 'BROCA DE AÇO RAPIDO 4,5 mm' },
+        { c: '60876', n: 'BATEDOR ARGAMASSA' },
+      ];
+      const ctxB = { DB: { products: prods }, normalize: (s) => (s || '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase() };
+      vmB.createContext(ctxB);
+      vmB.runInContext(iniB >= 0 && fimB > iniB ? htmlB.slice(iniB, fimB) : '', ctxB);
+      if (!ctxB.searchProducts) {
+        assert(false, 'busca: trecho <motor-busca> não encontrado no index.html');
+      } else {
+        const cods = (q) => ctxB.searchProducts(q).map(p => p.c).sort().join(','); // quais, não a ordem
+        assert(cods('Serra copo 50 mm') === '60882,61420' && cods('copo serra 50mm') === '60882,61420',
+          'busca: palavras em qualquer ordem, "50mm" = "50 mm", medida exata (sem 150/51 e sem o pacote com 50 un.)');
+        assert(cods('sera copo 50') === '60882,61420', 'busca: aceita erro de digitação');
+        assert(cods('broca 4.5') === '62438' && cods('broca 4,5mm') === '62438', 'busca: vírgula e ponto decimal iguais');
+        assert(cods('argamasa') === '60876' && cods('60882') === '60882', 'busca: erro de digitação numa palavra só e código exato');
+        // busca pela ficha técnica: "mármore"/"pedras naturais" acham o que a ficha diz que corta
+        const fichas = {
+          '60882': { nome: 'Serra Copo', desc: 'Furos precisos em porcelanato e mármore.', specs: { diametro: '50 mm' } },
+          '62438': { nome: 'Broca', desc: 'Furação em aço.', specs: {} },
+          '62857': { nome: 'Supra', desc: 'Espaçadores para granitos, mármores e pedras naturais.', specs: {} },
+        };
+        const ficha = (q, ja) => ctxB.searchProductsPelaFicha(q, fichas, ja || []).map(p => p.c).sort().join(',');
+        assert(ficha('marmore') === '60882,62857' && ficha('pedra natural') === '62857' && ficha('serra copo marmore') === '60882',
+          'busca pela ficha: acha pela descrição, com plural/singular e palavras do nome junto');
+        assert(ficha('serra copo') === '' && ficha('marmore 51') === '' && ficha('marmore', [{ c: '60882' }]) === '62857',
+          'busca pela ficha: nada quando tudo está no nome, medida só no nome, e sem repetir o que a busca normal achou');
+      }
+    }
+
+    // Motor de campanhas do Painel (index.html, trecho <motor-campanhas>): campos
+    // opcionais do Trade News de 10/2026 (classificatório, estado, validade, teto do
+    // alvo no pedido, itens diferentes com exclusões, exigência de lançamentos) e
+    // regra antiga, sem eles, valendo exatamente como antes.
+    const fs = require('fs');
+    const vm = require('vm');
+    const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+    const ini = html.indexOf('// <motor-campanhas>');
+    const fim = html.indexOf('// </motor-campanhas>');
+    const ctxVm = { DB: { categories: [] }, state: { canal: 'VAREJO' }, productByCod: () => null };
+    vm.createContext(ctxVm);
+    vm.runInContext(ini >= 0 && fim > ini ? html.slice(ini, fim) : '', ctxVm);
+    const { avaliarCampanhas, bestBonusForProduct, bonusDaCampanhaNoItem, proximaFaixaCampanha, campanhasDoItem } = ctxVm;
+    if (!avaliarCampanhas || !bestBonusForProduct || !bonusDaCampanhaNoItem) {
+      assert(false, 'motor de campanhas: trecho <motor-campanhas> não encontrado no index.html');
+    } else {
+      const linha = (c, familia, qty, lineTotal) => ({ p: { c, n: c, familia }, it: { qty }, lineTotal });
+      const ctx = (extra) => Object.assign({ canal: 'VAREJO', uf: 'PR', classiTipos: ['Varejo Exclusive'], hoje: '2026-10-09' }, extra || {});
+      const avaliar = (regras, rows, extra) => avaliarCampanhas(regras, rows, ctx(extra));
+      const discos = [linha('60001', 'Discos', 40, 400), linha('70001', 'Brocas', 1, 100)];
+
+      // 1) regra antiga: mesma chave, mesmo %, em qualquer estado/classificatório/data; só Varejo
+      const antiga = { id: 'r1', name: 'Discos', active: true, targetType: 'category', targetValue: 'Discos', basis: 'self', selfMetric: 'qty', tiers: [{ min: 20, pct: 3 }, { min: 40, pct: 5 }], stacks: false };
+      const contextos = [{}, { uf: 'SP' }, { classiTipos: [] }, { classiTipos: ['Varejo Master'] }, { hoje: '2030-01-01' }];
+      const iguais = contextos.every(c => {
+        const r = avaliar([antiga], discos, c);
+        return Object.keys(r.bonuses).join() === 'category|Discos' && r.bonuses['category|Discos'].pct === 5
+          && r.bonuses['category|Discos'].stacks === false && r.avisos.length === 0;
+      });
+      const r19 = avaliar([antiga], [linha('60001', 'Discos', 19, 190)]);
+      const atacado = avaliar([antiga], discos, { canal: 'ATACADO' });
+      const b = avaliar([antiga], discos).bonuses;
+      assert(iguais && Object.keys(r19.bonuses).length === 0 && Object.keys(atacado.bonuses).length === 0
+        && bestBonusForProduct(b, discos[0].p).pct === 5 && bestBonusForProduct(b, discos[1].p) === null,
+        'campanha: regra antiga (sem os campos novos) vale como antes - mesma chave e %, ignora estado/classificatório/data, só no Varejo');
+      // 1a) fita do card (Pedido/Levantamento): campanhas do item no contexto, sem
+      // olhar a quantidade; "pedido todo", exclusão, outro canal/estado e Preço Fixo ×
+      // soNoPrecoFixo ficam de fora; maior % primeiro
+      if (!campanhasDoItem) {
+        assert(false, 'campanha: campanhasDoItem não está no trecho <motor-campanhas>');
+      } else {
+        const disco = { c: '60001', n: '60001', familia: 'Discos' };
+        const regras = [
+          antiga,
+          { id: 'r2', name: 'Lista', active: true, targetType: 'skuList', targetValue: '60001,60002', basis: 'self', selfMetric: 'qty', tiers: [{ min: 6, pct: 10 }] },
+          { id: 'r3', name: 'Pedido todo', active: true, targetType: 'all', targetValue: '', basis: 'self', selfMetric: 'skus', tiers: [{ min: 3, pct: 2 }] },
+          { id: 'r4', name: 'Sem 60001', active: true, targetType: 'category', targetValue: 'Discos', basis: 'self', selfMetric: 'qty', tiers: [{ min: 1, pct: 20 }], excluirCodigos: ['60001'] },
+          { id: 'r5', name: 'Só SP', active: true, targetType: 'product', targetValue: '60001', basis: 'self', selfMetric: 'qty', tiers: [{ min: 1, pct: 30 }], ufs: ['SP'] },
+          { id: 'r6', name: 'BF fixo', active: true, targetType: 'product', targetValue: '60001', basis: 'self', selfMetric: 'qty', tiers: [{ min: 1, pct: 15 }], soNoPrecoFixo: true },
+          { id: 'r7', name: 'Inativa', active: false, targetType: 'product', targetValue: '60001', basis: 'self', selfMetric: 'qty', tiers: [{ min: 1, pct: 40 }] },
+        ];
+        const nomes = (fixo, extra) => campanhasDoItem(regras, disco, ctx(extra), fixo).map(r => r.name).join();
+        assert(nomes(false) === 'Lista,Discos' && nomes(true) === 'BF fixo' && nomes(false, { uf: 'SP' }) === 'Só SP,Lista,Discos'
+          && nomes(false, { canal: 'ATACADO' }) === '' && campanhasDoItem(regras, { c: '70001', n: '70001', familia: 'Brocas' }, ctx(), false).length === 0,
+          'campanha: fita do card lista as campanhas do item no contexto (sem pedido todo, exclusão, inativa; Preço Fixo só com soNoPrecoFixo), maior % primeiro');
+      }
+      // 1b) barra do orçamento: próxima faixa da campanha mais perto (só com item do
+      // alvo no orçamento, faltando até metade da faixa; cesta fica de fora)
+      const prox = (regras, rows, extra) => proximaFaixaCampanha(regras, rows, ctx(extra));
+      const p30 = prox([antiga], [linha('60001', 'Discos', 30, 300)]);
+      const p20 = prox([antiga], [linha('60001', 'Discos', 15, 150)]);
+      const pFim = prox([antiga], [linha('60001', 'Discos', 45, 450)]);
+      const pLonge = prox([antiga], [linha('60001', 'Discos', 5, 50)]);
+      const pSemAlvo = prox([antiga], [linha('70001', 'Brocas', 30, 300)]);
+      const pAtacado = prox([antiga], [linha('60001', 'Discos', 30, 300)], { canal: 'ATACADO' });
+      const porSkus = { ...antiga, id: 's', targetType: 'all', targetValue: '', selfMetric: 'skus', tiers: [{ min: '4', pct: '2' }] };
+      const pSkus = prox([porSkus], [linha('60001', 'Discos', 1, 10), linha('70001', 'Brocas', 1, 10), linha('70002', 'Brocas', 1, 10)]);
+      const cesta = { id: 'c', name: 'Cesta', active: true, basis: 'combo', basketItems: [{ type: 'category', value: 'Discos', minQty: 50 }], comboPct: 5 };
+      assert(p30 && p30.falta === 10 && p30.pct === 5 && p30.metrica === 'qtd'
+        && p20 && p20.falta === 5 && p20.pct === 3
+        && pFim === null && pLonge === null && pSemAlvo === null && pAtacado === null
+        && pSkus && pSkus.falta === 1 && pSkus.pct === 2 && pSkus.metrica === 'skus'
+        && prox([cesta], discos) === null,
+        'campanha: próxima faixa pra barra do orçamento (mais perto, só com item do alvo, até metade da faixa, sem cesta)');
+      // não promete faixa que o item não ganharia: Preço Fixo só recebe "soNoPrecoFixo"
+      // (e vice-versa), e regra bloqueada (teto do pedido) fica de fora
+      const fixa = (c, qty) => Object.assign(linha(c, 'Discos', qty, qty * 10), { fixo: true });
+      const soFixo = { ...antiga, id: 'bf', soNoPrecoFixo: true };
+      const comTeto = { ...antiga, id: 't', maxPctDoPedido: 30 };
+      assert(prox([antiga], [fixa('60001', 30)]) === null
+        && prox([antiga], [fixa('60001', 20), linha('60002', 'Discos', 10, 100)]).falta === 10
+        && prox([soFixo], [linha('60001', 'Discos', 30, 300)]) === null
+        && prox([soFixo], [fixa('60001', 30)]).pct === 5
+        && prox([comTeto], [linha('60001', 'Discos', 30, 300)]) === null,
+        'campanha: próxima faixa só quando algum item do alvo ganharia o desconto (Preço Fixo, soNoPrecoFixo, regra bloqueada)');
+
+      // 2) classificatório (ignora acento/maiúscula); sem classificatório no orçamento não vale
+      const porClassi = { ...antiga, classificatorios: ['Varejo Exclusive', 'varejo PREMIUM'] };
+      const vale = c => Object.keys(avaliar([porClassi], discos, c).bonuses).length === 1;
+      assert(vale({ classiTipos: ['Varejo Exclusive'] }) && vale({ classiTipos: ['Varejo Prêmium'] })
+        && !vale({ classiTipos: ['Varejo Master'] }) && !vale({ classiTipos: [] }),
+        'campanha: filtro por classificatório do orçamento');
+      // mesma promoção com limites por grupo: Exclusive 20 un. x Master 40 un.
+      const exclusive = { ...antiga, id: 'e', classificatorios: ['Varejo Exclusive'], tiers: [{ min: 20, pct: 10 }] };
+      const master = { ...antiga, id: 'm', classificatorios: ['Varejo Master'], tiers: [{ min: 40, pct: 10 }] };
+      const trinta = [linha('60001', 'Discos', 30, 300)];
+      assert(Object.keys(avaliar([exclusive, master], trinta).bonuses).length === 1
+        && Object.keys(avaliar([exclusive, master], trinta, { classiTipos: ['Varejo Master'] }).bonuses).length === 0,
+        'campanha: limite diferente por classificatório (Exclusive 20 un. vale com 30; Master 40 un. não)');
+
+      // 3) estado e validade (texto AAAA-MM-DD, dia de Brasília inclusive)
+      const tradeNews = { ...antiga, ufsExcluidas: ['SP'], validoAte: '2026-10-31' };
+      const valeTn = c => Object.keys(avaliar([tradeNews], discos, c).bonuses).length === 1;
+      const soPr = { ...antiga, ufs: 'PR, SC' };
+      assert(valeTn({}) && !valeTn({ uf: 'SP' }) && valeTn({ hoje: '2026-10-31' }) && !valeTn({ hoje: '2026-11-01' })
+        && Object.keys(avaliar([soPr], discos, { uf: 'SC' }).bonuses).length === 1
+        && Object.keys(avaliar([soPr], discos, { uf: 'RS' }).bonuses).length === 0,
+        'campanha: filtro por estado (só/exceto) e validade até o último dia');
+
+      // 4) teto do alvo no pedido (protetor de piso: até 50% e com outros produtos)
+      const protetor = { id: 'pp', name: 'Protetor', active: true, targetType: 'product', targetValue: '50001', basis: 'self', selfMetric: 'qty', tiers: [{ min: 1, pct: 12 }], maxPctDoPedido: 50 };
+      const so = avaliar([protetor], [linha('50001', 'Protetores', 10, 500)]);
+      const muito = avaliar([protetor], [linha('50001', 'Protetores', 10, 600), linha('70001', 'Brocas', 1, 400)]);
+      const ok = avaliar([protetor], [linha('50001', 'Protetores', 10, 500), linha('70001', 'Brocas', 1, 500)]);
+      assert(Object.keys(so.bonuses).length === 0 && /outros produtos/.test(so.avisos[0]?.motivo || '')
+        && Object.keys(muito.bonuses).length === 0 && /60% do valor do pedido \(máximo 50%\)/.test(muito.avisos[0]?.motivo || '')
+        && ok.bonuses['product|50001']?.pct === 12 && ok.avisos.length === 0,
+        `campanha: teto do alvo no pedido bloqueia com motivo: ${JSON.stringify([so.avisos, muito.avisos, ok.avisos])}`);
+
+      // 5) "Mais Cortag": itens diferentes no pedido; Nivelamento, 60863 e item com
+      // outra campanha contam na quantidade mas não ganham o desconto
+      const maisCortag = { id: 'mc', name: 'Mais Cortag', active: true, targetType: 'all', targetValue: '', basis: 'self', selfMetric: 'skus', tiers: [{ min: 30, pct: 5 }],
+        excluirFamilias: ['nivelamento'], excluirCodigos: ['60863'], excluirOutraCampanha: true, stacks: true };
+      const outra = { id: 'o', name: 'Trade News discos', active: true, targetType: 'product', targetValue: '61000', basis: 'self', selfMetric: 'qty', tiers: [{ min: 1, pct: 8 }] };
+      const itens = n => {
+        const rows = [linha('80000', 'Nivelamento', 5, 50), linha('P60863', 'Discos', 5, 50), linha('61000', 'Discos', 1, 10)];
+        for (let i = 0; rows.length < n; i++) rows.push(linha(String(90000 + i), 'Brocas', 1, 10));
+        return rows;
+      };
+      const r30 = avaliar([maisCortag, outra], itens(30));
+      const comum = bestBonusForProduct(r30.bonuses, { c: '90000', familia: 'Brocas' });
+      const r29 = avaliar([maisCortag, outra], itens(29));
+      assert(comum?.pct === 5 && comum.ruleName === 'Mais Cortag'
+        && bestBonusForProduct(r30.bonuses, { c: '80000', familia: 'Nivelamento' }) === null
+        && bestBonusForProduct(r30.bonuses, { c: 'P60863', familia: 'Discos' }) === null
+        && bestBonusForProduct(r30.bonuses, { c: '61000', familia: 'Discos' })?.ruleName === 'Trade News discos'
+        && bestBonusForProduct(r29.bonuses, { c: '90000', familia: 'Brocas' }) === null,
+        'campanha: itens diferentes no pedido, com exclusões que contam mas não ganham o desconto');
+
+      // 6) exigência de 10% dos itens em lançamentos/família foco
+      const comExige = { ...maisCortag, exigeItens: { pct: 10, codigos: ['90000', '90001', '90002'], familias: [] } };
+      const doisLanc = itens(30).filter(r => r.p.c !== '90002');
+      doisLanc.push(linha('99999', 'Brocas', 1, 10));
+      const falta = avaliar([comExige], doisLanc);
+      const basta = avaliar([comExige], itens(30));
+      assert(Object.keys(falta.bonuses).length === 0 && /falta 1 item de lançamento/.test(falta.avisos[0]?.motivo || '')
+        && Object.keys(basta.bonuses).length === 1 && basta.avisos.length === 0,
+        `campanha: exige 10% dos itens em lançamentos/família foco: ${JSON.stringify(falta.avisos)}`);
+
+      // 7) Preço Fixo (campanha "já aplicada no preço") não ganha bônus nenhum
+      assert(bonusDaCampanhaNoItem(b, discos[0].p, true) === null && bonusDaCampanhaNoItem(b, discos[0].p, false)?.pct === 5
+        && bonusDaCampanhaNoItem(r30.bonuses, { c: '90000', familia: 'Brocas' }, true) === null
+        && /bonusDaCampanhaNoItem\(bonuses, r\.p, isPrecoFixoParaCanal\(r\.p\)\)/.test(html),
+        'campanha: item de Preço Fixo no canal não recebe desconto de campanha (cartTotals usa bonusDaCampanhaNoItem)');
+
+      // 8) "soNoPrecoFixo" (Black Friday, cortadores 15% no preço fixo): vale só no item de Preço Fixo
+      {
+        const regraFixo = { id: 'bf', name: 'BF cortadores', active: true, stacks: true, basis: 'self', selfMetric: 'qty',
+          targetType: 'skuList', targetValue: '61366,61539', tiers: [{ min: 1, pct: 15 }], soNoPrecoFixo: true, validoAte: '2026-10-31' };
+        const regraComum = { id: 'v', name: 'Ventosas', active: true, stacks: true, basis: 'self', selfMetric: 'qty',
+          targetType: 'skuList', targetValue: '61366,63085', tiers: [{ min: 1, pct: 20 }] };
+        const rowsBf = [linha('61366', 'Cortadores', 1, 100), linha('63085', 'Ventosas', 1, 100)];
+        const rbf = avaliar([regraFixo, regraComum], rowsBf);
+        const cortador = rowsBf[0].p, ventosa = rowsBf[1].p;
+        assert(bonusDaCampanhaNoItem(rbf.bonuses, cortador, true)?.pct === 15
+          && bonusDaCampanhaNoItem(rbf.bonuses, cortador, true)?.soNoPrecoFixo === true
+          && bonusDaCampanhaNoItem(rbf.bonuses, cortador, false)?.pct === 20
+          && bonusDaCampanhaNoItem(rbf.bonuses, ventosa, true) === null
+          && bonusDaCampanhaNoItem(avaliar([regraFixo], rowsBf).bonuses, cortador, false) === null
+          && /bonus\.stacks \|\| bonus\.soNoPrecoFixo/.test(html),
+          'campanha: soNoPrecoFixo vale só no item de Preço Fixo, sem mexer nas regras comuns');
+      }
+    }
+  }
+
+  {
+    // RLS ligado em toda tabela do schema.sql (verificador do Supabase acusa
+    // rls_disabled_in_public), depois de ela existir num banco novo, e nunca FORCE
+    // (o app conecta como dono das tabelas e seria barrado junto).
+    const fs = require('fs');
+    const schema = fs.readFileSync(path.join(__dirname, '..', 'schema.sql'), 'utf8').replace(/--.*$/gm, '');
+    const tabelas = [...schema.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)].map(m => m[1].toLowerCase());
+    const semRls = tabelas.filter(t => {
+      const criada = schema.search(new RegExp(`CREATE TABLE IF NOT EXISTS\\s+${t}\\b`, 'i'));
+      const rls = schema.search(new RegExp(`ALTER TABLE\\s+${t}\\s+ENABLE ROW LEVEL SECURITY`, 'i'));
+      return rls < 0 || rls < criada;
+    });
+    assert(tabelas.length >= 27 && semRls.length === 0 && !/FORCE\s+ROW\s+LEVEL/i.test(schema),
+      `schema.sql: RLS ligado (sem FORCE) em todas as ${tabelas.length} tabelas: ${JSON.stringify(semRls)}`);
+    // Coluna nova em tabela que já existe em produção precisa de ALTER ... ADD COLUMN
+    // IF NOT EXISTS: só no CREATE TABLE, o banco antigo fica sem ela (quantidade_pedido,
+    // 10/2026: todo levantamento salvo dava "Erro ao gravar levantamento").
+    assert(/ALTER TABLE\s+levantamento_itens\s+ADD COLUMN IF NOT EXISTS\s+quantidade_pedido\b/i.test(schema),
+      'schema.sql: levantamento_itens.quantidade_pedido tem ALTER TABLE ... ADD COLUMN IF NOT EXISTS');
+    // Idem pra restrição que um ON CONFLICT usa: só no CREATE TABLE, o banco antigo fica sem ela.
+    assert(/CREATE UNIQUE INDEX IF NOT EXISTS\s+\w+\s+ON\s+vendedores\s*\(\s*nome\s*\)/i.test(schema),
+      'schema.sql: índice único em vendedores(nome) fora do CREATE TABLE (ON CONFLICT de acharOuCriarVendedor)');
+    // Importação em lote: o relatório oficial fazia ~3 consultas por cliente (ida de
+    // Oregon a São Paulo cada uma) - ~860 pra 250 clientes. Agora é um número fixo.
+    mockDb.__setConfiguracao('relatorio_oficial_mais_novo', null);
+    const pad = (i) => String(i).padStart(3, '0');
+    mockDb.__seed({ clientes: [
+      ...Array.from({ length: 200 }, (_, i) => ({ id: 30001 + i, nome: `LOTE ${pad(i)} LTDA`, codigo_oficial: `QL${pad(i)}`, classificatorio_atualizado_em: i % 2 ? '2027-01-01' : null })),
+      ...Array.from({ length: 30 }, (_, i) => ({ id: 30301 + i, nome: i % 2 ? `LOTE SEM CODIGO ${pad(i)}, LTDA` : `LOTE  SEM CODIGO  ${pad(i)} LTDA`, codigo_oficial: null })),
+    ] });
+    const itens = [], classificacoes = [];
+    const cods = [...Array.from({ length: 200 }, (_, i) => [`QL${pad(i)}`, `LOTE ${pad(i)} LTDA`]),
+      ...Array.from({ length: 30 }, (_, i) => [`QN${pad(i)}`, `LOTE SEM CODIGO ${pad(i)} LTDA`]),
+      ...Array.from({ length: 20 }, (_, i) => [`QX${pad(i)}`, `LOTE NOVO ${pad(i)}`])];
+    cods.forEach(([cod, nome], k) => {
+      itens.push({ nr_pedido: String(690000 + k), codigo_sku: '60863', cliente_codigo_oficial: cod, cliente_nome: nome, status: 'faturado', quantidade: 1, valor: 10,
+        data_implantacao: '2026-09-20', data_faturamento: '2026-09-25', nota_fiscal: String(990000 + k), situacao_pedido: 'Atendido Total' });
+      if (k < 200 || k >= 240) classificacoes.push({ nome, codigo_oficial: cod, tipo: 'Varejo Premium', desconto: 15, data_referencia: '2026-09-20' });
+    });
+    const antes = mockDb.__queryLog.length;
+    res = await req('POST', '/api/pedidos-oficiais/importar', { itens, classificacoes });
+    const consultas = mockDb.__queryLog.length - antes;
+    const cli = mockDb.__getClientes();
+    assert(res.status === 200 && res.body.clientesClassificados === 110 && res.body.clientesClassifIgnorados === 100 && res.body.clientesVinculados === 30
+      && res.body.clientesNaoEncontrados.length === 10 && res.body.clientesNaoEncontrados[0].codigo === 'QX000'
+      && cli.find(c => c.id === 30301).codigo_oficial === 'QN000' && cli.find(c => c.id === 30002).classificatorio_tipo == null
+      && cli.find(c => c.id === 30001).classificatorio_tipo === 'Varejo Premium' && Number(cli.find(c => c.id === 30001).classificatorio_desconto) === 17
+      && cli.some(c => c.codigo_oficial === 'QX015' && c.classificatorio_tipo === 'Varejo Premium') && !cli.some(c => c.codigo_oficial === 'QX005')
+      && consultas <= 25,
+      `importação do relatório oficial em lote: 250 clientes em ${consultas} consultas (antes ~860), mesmas regras: ${JSON.stringify({ ...res.body, clientesNaoEncontrados: res.body.clientesNaoEncontrados.length })}`);
+    mockDb.__setConfiguracao('relatorio_oficial_mais_novo', null);
+  }
+  {
+    // planilha Classificatório em lote: antes ~3 consultas por linha (~730 pra 244 linhas)
+    const pad = (i) => String(i).padStart(3, '0');
+    const linhas = Array.from({ length: 200 }, (_, i) => ({ codigoOficial: `QL${pad(i)}`, classificatorioTipo: 'Varejo Master', classificatorioDesconto: 20,
+      pic: i === 2, vlAcordo: i === 2 ? 7000 : null, matrizGrupo: i === 4 ? 'MATRIZ LOTE' : null, fat12mCliente: 100 + i, gestor: 'G' }));
+    linhas.push({ codigoOficial: 'NAO-EXISTE-LOTE', fat12mCliente: 1 }, { codigoOficial: 'QL002', classificatorioTipo: 'Varejo Premium', classificatorioDesconto: 17, fat12mCliente: 999 });
+    const antes = mockDb.__queryLog.length;
+    res = await req('POST', '/api/clientes/classificatorio/importar', { dataRelatorio: '2026-10-02', apuradoAte: '2026-08-31', itens: linhas });
+    const consultas = mockDb.__queryLog.length - antes;
+    const c3 = mockDb.__getClientes().find(c => c.id === 30003);
+    assert(res.status === 200 && res.body.atualizados === 201 && res.body.naoEncontrados === 1 && c3.classificatorio_pic === false && Number(c3.classificatorio_vl_acordo) === 7000
+      && c3.classificatorio_tipo === 'Varejo Premium' && mockDb.__getClientes().find(c => c.id === 30005).matriz_grupo === 'MATRIZ LOTE' && consultas <= 20,
+      `importação do Classificatório em lote: 202 linhas em ${consultas} consultas, o mesmo cliente duas vezes vale a 2ª: ${JSON.stringify([res.body, c3, mockDb.__getClientes().find(c => c.id === 30005)])}`);
+    res = await req('GET', '/api/clientes/30003/classificatorio/status');
+    assert(res.body.erp && res.body.erp.fat12mCliente === 999, `importação do Classificatório em lote: a foto do cliente repetido é a da 2ª linha: ${JSON.stringify(res.body.erp)}`);
+  }
+
+  {
+    // objetivos trimestrais e Curva ABC: uma consulta no lugar de uma por matriz / por grupo de códigos
+    const pad = (i) => String(i).padStart(3, '0');
+    let antes = mockDb.__queryLog.length;
+    res = await req('POST', '/api/clientes/classificatorio/objetivos-trimestrais/importar', { periodoInicio: '2026-10-01', periodoFim: '2026-12-31',
+      itens: [...Array.from({ length: 60 }, (_, i) => ({ matriz: `LOTE ${pad(i)} LTDA`, objetivo: 1000 + i })), { matriz: 'NAO EXISTE LOTE', objetivo: 1 }] });
+    const consultasObj = mockDb.__queryLog.length - antes;
+    assert(res.status === 200 && res.body.importados === 59 && res.body.naoReconhecidos.join() === 'LOTE 004 LTDA,NAO EXISTE LOTE' && consultasObj <= 10,
+      `objetivos trimestrais: 61 matrizes em ${consultasObj} consultas (antes uma por matriz): ${JSON.stringify(res.body)}`);
+    mockDb.__seed({ clientes: [{ id: 30500, nome: 'LOJA ABC LOTE', codigo_oficial: 'QABC' }] });
+    mockDb.__seed({ pedidosOficiaisItens: ['60863', 'P60863', 'P160863', '61362', 'P61362'].flatMap((sku, k) => [1, 2].map(n => ({
+      nr_pedido: `AB${n}${k % 2}`, codigo_sku: sku, cliente_codigo_oficial: 'QABC', quantidade: 1, valor: 5, data_implantacao: '2026-09-01', data_faturamento: '2026-09-02', status: 'faturado' }))) });
+    antes = mockDb.__queryLog.length;
+    res = await req('GET', '/api/clientes/30500/produtos-abc');
+    const sqlsAbc = mockDb.__queryLog.slice(antes).map(q => q.sql);
+    const disco = (res.body || []).find(r => r.codigo_sku === '60863'), cortador = (res.body || []).find(r => r.codigo_sku === '61362');
+    assert(res.status === 200 && disco && disco.num_pedidos === 4 && cortador && cortador.num_pedidos === 4 && !sqlsAbc.some(q => q.startsWith("SELECT COUNT(DISTINCT nr_pedido)"))
+      && sqlsAbc.filter(q => q.includes('curva-abc:pedidos-por-grupo')).length === 1,
+      `Curva ABC: pedidos distintos dos códigos promocionais mesclados numa consulta só: ${JSON.stringify([res.body, sqlsAbc.length])}`);
+  }
+
+  {
+    // Service Worker: toda biblioteca de CDN que as páginas carregam está na lista
+    // do sw.js (senão quebra sem internet - imagem/PDF do orçamento, câmera no
+    // iPhone); e página/script do app guardados sem os parâmetros (?cliente=…).
+    const fs = require('fs');
+    const raiz = path.join(__dirname, '..');
+    const sw = fs.readFileSync(path.join(raiz, 'sw.js'), 'utf8');
+    const usadas = new Set();
+    for (const f of ['index.html', 'curva-abc.html', 'calculadora-materiais.html', 'ficha-cnpj.html', 'tela-cliente.html', 'importadores.js']) {
+      // sem os parâmetros: o SW atende pelo endereço puro (?tentativa=N do pdf.js)
+      for (const m of fs.readFileSync(path.join(raiz, f), 'utf8').matchAll(/https:\/\/(?:cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net)\/[^'"`\s)?]+/g)) usadas.add(m[0]);
+    }
+    const faltando = [...usadas].filter(u => !sw.includes(`'${u}'`));
+    // SheetJS do cdnjs parou na 0.18.5 (CVE-2023-30533, CVE-2024-22363): só a do pacote @e965/xlsx
+    const xlsxVelho = [...usadas].filter(u => /\/xlsx\/0\.1\d\./.test(u) || (/xlsx/.test(u) && !/@e965\/xlsx@0\.2/.test(u)));
+    assert(xlsxVelho.length === 0 && [...usadas].some(u => u.includes('@e965/xlsx@0.20.3')), `páginas carregam o SheetJS 0.20.3 (@e965/xlsx), não o 0.18.5 vulnerável: ${JSON.stringify(xlsxVelho)}`);
+    // versão fixa no endereço: o SW guarda pelo endereço e não busca de novo (@latest ficaria preso)
+    assert(usadas.size >= 5 && faltando.length === 0 && ![...usadas].some(u => u.includes('@latest')) && /cache\.put\(chave,/.test(sw) && !/ignoreSearch:\s*true/.test(sw),
+      `service worker guarda offline todas as bibliotecas de CDN das páginas e as páginas sem parâmetro: ${JSON.stringify(faltando)}`);
+    // sinal fraco: página/script não espera a rede sem limite - abre com a cópia
+    // guardada depois do prazo e a rede termina em segundo plano
+    const prazo = Number((sw.match(/PRAZO_REDE_PAGINA_MS\s*=\s*(\d+)/) || [])[1]);
+    assert(prazo >= 2000 && prazo <= 8000 && /setTimeout\([\s\S]{0,200}daCopia\(\)/.test(sw) && /event\.waitUntil\(/.test(sw),
+      `service worker abre a página guardada se a rede não responder em ${prazo} ms (e guarda a nova em segundo plano)`);
+
+    // Integridade (SRI) das bibliotecas de CDN: toda biblioteca usada tem hash no
+    // sw.js, e o index.html (INTEGRIDADE_CDN, import map do pdf.js, tags fixas) e a
+    // tela-cliente.html usam o mesmo hash. O SW baixa conferindo o hash e não cai
+    // pra uma busca sem conferência. (Hash x arquivo real: scripts/conferir-integridade.js)
+    const blocoLibs = (sw.match(/const LIBS = new Map\(\[([\s\S]*?)\]\);/) || [])[1] || '';
+    const hashSw = new Map([...blocoLibs.matchAll(/'(https:\/\/[^']+)',\s*'(sha384-[A-Za-z0-9+/=]{64})'/g)].map(m => [m[1], m[2]]));
+    const index = fs.readFileSync(path.join(raiz, 'index.html'), 'utf8');
+    const blocoIndex = (index.match(/const INTEGRIDADE_CDN = \{([\s\S]*?)\};/) || [])[1] || '';
+    const hashIndex = new Map([...blocoIndex.matchAll(/'(https:\/\/[^']+)':\s*'(sha384-[A-Za-z0-9+/=]{64})'/g)].map(m => [m[1], m[2]]));
+    const semHash = [...usadas].filter(u => !hashSw.has(u));
+    const diferentes = [...new Set([...hashSw.keys(), ...hashIndex.keys()])].filter(u => hashSw.get(u) !== hashIndex.get(u));
+    // tags <script src> e import map: o hash de cada endereço = o da LIBS
+    const problemasTag = [];
+    for (const f of ['index.html', 'curva-abc.html', 'calculadora-materiais.html', 'ficha-cnpj.html', 'tela-cliente.html']) {
+      const html = fs.readFileSync(path.join(raiz, f), 'utf8');
+      for (const m of html.matchAll(/<script\b[^>]*\bsrc="(https:\/\/(?:cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net)\/[^"]+)"[^>]*>/g)) {
+        const integ = (m[0].match(/\bintegrity="([^"]+)"/) || [])[1];
+        if (integ !== hashSw.get(m[1]) || !/\bcrossorigin="anonymous"/.test(m[0])) problemasTag.push(`${f}: ${m[1]}`);
+      }
+      // carregador dinâmico que cria o <script> na mão (sem scriptDaCdn) e aponta pra CDN
+      for (const m of html.matchAll(/createElement\('script'\);\s*\n?\s*s\.src = ([^;]+);/g)) {
+        if (/cdnjs|jsdelivr|_CDN\b|^src$/.test(m[1].trim())) problemasTag.push(`${f}: <script> da CDN sem scriptDaCdn (${m[1].trim()})`);
+      }
+    }
+    const importMap = (index.match(/<script type="importmap">([\s\S]*?)<\/script>/) || [])[1];
+    let integMap = {};
+    try { integMap = JSON.parse(importMap).integrity || {}; } catch (e) { problemasTag.push('import map inválido'); }
+    for (const u of [...usadas].filter(x => x.endsWith('.mjs'))) {
+      if (integMap[u] !== hashSw.get(u)) problemasTag.push(`import map sem o hash de ${u}`);
+    }
+    // cada chave do import map com o hash do endereço sem parâmetro, e as novas
+    // tentativas do pdf.js (?tentativa=1..PDFJS_MAX_TENTATIVAS) todas listadas
+    for (const [u, h] of Object.entries(integMap)) {
+      if (h !== hashSw.get(u.split('?')[0])) problemasTag.push(`import map com hash errado: ${u}`);
+    }
+    const maxTentativas = Number((index.match(/PDFJS_MAX_TENTATIVAS = (\d+)/) || [])[1]);
+    const pdfMin = [...usadas].find(u => u.endsWith('/pdf.min.mjs'));
+    for (let i = 1; i <= maxTentativas; i++) {
+      if (!integMap[`${pdfMin}?tentativa=${i}`]) problemasTag.push(`import map sem ?tentativa=${i}`);
+    }
+    if (!(maxTentativas >= 1) || !/Math\.min\(loadPdfJs\.falhas, PDFJS_MAX_TENTATIVAS\)/.test(index)) problemasTag.push('loadPdfJs sem limite de tentativas');
+    assert(hashSw.size === usadas.size && semHash.length === 0 && diferentes.length === 0 && problemasTag.length === 0,
+      `bibliotecas de CDN com o mesmo hash (SRI) no sw.js e nas páginas: ${JSON.stringify({ semHash, diferentes, problemasTag })}`);
+    assert(/integrity: LIBS\.get\(url\)/.test(sw) && !/\(\) => fetch\(req\)/.test(sw) && /CACHE_LIBS = 'cortag-libs-v2'/.test(sw)
+      && /migrarLibsAnteriores\(cache\)/.test(sw) && /hashSri\(velha\.clone\(\)\)\) === LIBS\.get\(url\)/.test(sw),
+      'service worker baixa as bibliotecas conferindo o hash, sem busca sem conferência, em cache novo (trazendo do anterior só o que bate)');
+  }
+
+  {
+    // Tablet como tela do cliente (routes/segundaTela.js): o tablet cria a sala e
+    // mostra o código; o celular da MESMA conta entra com ele e manda o orçamento;
+    // o tablet espera a próxima versão (long-poll) e recebe o estado.
+    const tokenAntes = authToken;
+    const novoUsuario = async (nome, email) => {
+      const u = await mockDb.pool.query(
+        'INSERT INTO usuarios (nome, email, google_sub, is_admin) VALUES ($1, $2, $3, false) RETURNING id',
+        [nome, email, 'sub-' + email]
+      );
+      const tok = generateToken();
+      await mockDb.pool.query('INSERT INTO sessoes (token, usuario_id, expira_em) VALUES ($1, $2, $3)', [hashToken(tok), u.rows[0].id, '90']);
+      return tok;
+    };
+    const tokTela = await novoUsuario('Vendedor Tela', 'vend.tela@example.com');
+    const tokOutraConta = await novoUsuario('Outra Conta Tela', 'outra.tela@example.com');
+    authToken = tokTela;
+    let res = await req('POST', '/api/segunda-tela/salas', { modo: 'qualquer' });
+    assert(res.status === 400, `segunda tela: modo desconhecido é recusado: ${res.status}`);
+    res = await req('POST', '/api/segunda-tela/salas', { modo: 'cliente' });
+    const sala = res.body || {};
+    assert(res.status === 200 && /^[a-f0-9]{32}$/.test(sala.id) && /^\d{4}$/.test(sala.codigo) && sala.valido_por_ms === 300000,
+      `segunda tela: tablet cria a sala com id e código de 4 dígitos: ${JSON.stringify(res.body)}`);
+
+    // outra conta não acha o código nem a sala
+    authToken = tokOutraConta;
+    res = await req('POST', '/api/segunda-tela/entrar', { codigo: sala.codigo });
+    const outraEntrar = res.status;
+    res = await req('GET', `/api/segunda-tela/salas/${sala.id}`);
+    assert(outraEntrar === 404 && res.status === 404, `segunda tela: outra conta não entra pelo código nem vê a sala: ${outraEntrar}/${res.status}`);
+
+    // tablet esperando: o celular entrar acorda a espera com pareada = true
+    authToken = tokTela;
+    const espera1 = req('GET', `/api/segunda-tela/salas/${sala.id}?papel=tablet&esperar=1&versao=0&pareada=0`);
+    await new Promise(r => setTimeout(r, 60));
+    res = await req('POST', '/api/segunda-tela/entrar', { codigo: 'ab' });
+    assert(res.status === 400, `segunda tela: código fora do formato: 400: ${res.status}`);
+    res = await req('POST', '/api/segunda-tela/entrar', { codigo: sala.codigo });
+    assert(res.status === 200 && res.body.id === sala.id && res.body.modo === 'cliente' && res.body.tablet_conectado === true,
+      `segunda tela: celular entra pelo código e vê o tablet conectado: ${JSON.stringify(res.body)}`);
+    const r1 = await espera1;
+    assert(r1.status === 200 && r1.body.pareada === true && r1.body.versao === 0, `segunda tela: a espera do tablet volta quando o celular entra: ${JSON.stringify(r1.body)}`);
+    res = await req('POST', '/api/segunda-tela/entrar', { codigo: sala.codigo });
+    assert(res.status === 404, `segunda tela: o código vale uma vez só: ${res.status}`);
+
+    // estado: inválido recusado; válido acorda a espera do tablet com o estado
+    res = await req('PUT', `/api/segunda-tela/salas/${sala.id}/estado`, { estado: [1, 2] });
+    assert(res.status === 400, `segunda tela: estado que não é objeto: 400: ${res.status}`);
+    res = await req('PUT', `/api/segunda-tela/salas/${sala.id}/estado`, { estado: { itens: [], x: 'a'.repeat(210 * 1024) } });
+    assert(res.status === 413, `segunda tela: estado grande demais: 413: ${res.status}`);
+    const espera2 = req('GET', `/api/segunda-tela/salas/${sala.id}?papel=tablet&esperar=1&versao=0&pareada=1`);
+    await new Promise(r => setTimeout(r, 60));
+    res = await req('PUT', `/api/segunda-tela/salas/${sala.id}/estado`, { estado: { cliente: 'LOJA TESTE', itens: [{ cod: '60863', qtd: 3 }] } });
+    assert(res.status === 200 && res.body.versao === 1 && res.body.tablet_conectado === true, `segunda tela: celular manda o orçamento: ${JSON.stringify(res.body)}`);
+    const r2 = await espera2;
+    assert(r2.status === 200 && r2.body.versao === 1 && r2.body.estado && r2.body.estado.itens[0].qtd === 3,
+      `segunda tela: a espera do tablet volta com o orçamento novo: ${JSON.stringify(r2.body)}`);
+
+    // sem mudança, a espera termina sozinha no prazo, sem estado
+    const t0 = Date.now();
+    res = await req('GET', `/api/segunda-tela/salas/${sala.id}?papel=tablet&esperar=1&versao=1&pareada=1`);
+    assert(res.status === 200 && res.body.versao === 1 && res.body.estado === undefined && Date.now() - t0 >= 350,
+      `segunda tela: sem mudança a espera volta no prazo e sem estado: ${JSON.stringify(res.body)} em ${Date.now() - t0} ms`);
+    // o celular consulta sem esperar (e não recebe o estado de volta)
+    res = await req('GET', `/api/segunda-tela/salas/${sala.id}`);
+    assert(res.status === 200 && res.body.estado === undefined && res.body.tablet_conectado === true, `segunda tela: celular confere se o tablet está lá: ${JSON.stringify(res.body)}`);
+
+    // desconectar: a espera do tablet volta com 404 e a sala some
+    const espera3 = req('GET', `/api/segunda-tela/salas/${sala.id}?papel=tablet&esperar=1&versao=1&pareada=1`);
+    await new Promise(r => setTimeout(r, 60));
+    res = await req('DELETE', `/api/segunda-tela/salas/${sala.id}`);
+    const r3 = await espera3;
+    res = await req('PUT', `/api/segunda-tela/salas/${sala.id}/estado`, { estado: { itens: [] } });
+    assert(r3.status === 404 && res.status === 404, `segunda tela: desconectar encerra a espera e a sala: ${r3.status}/${res.status}`);
+
+    // modo leitor: o celular manda leituras com id; reenvio não conta de novo; o
+    // tablet recebe o que veio depois do último seq que aplicou
+    res = await req('POST', '/api/segunda-tela/salas', { modo: 'leitor' });
+    const leitor = res.body || {};
+    res = await req('POST', `/api/segunda-tela/salas/${leitor.id}/eventos`, { eventos: [{ id: 'a1', tipo: 'leitura', cod: '60863', qtd: 1, campo: 'qty' }] });
+    assert(res.status === 409, `leitor: antes do celular entrar não aceita leitura: ${res.status}`);
+    res = await req('POST', '/api/segunda-tela/entrar', { codigo: leitor.codigo });
+    assert(res.status === 200 && res.body.modo === 'leitor', `leitor: celular entra e sabe que é o modo leitor: ${JSON.stringify(res.body)}`);
+    res = await req('POST', `/api/segunda-tela/salas/${leitor.id}/eventos`, { eventos: [{ id: 'x y', tipo: 'leitura' }] });
+    const idRuim = res.status;
+    res = await req('POST', `/api/segunda-tela/salas/${leitor.id}/eventos`, { eventos: [{ id: 'b1', tipo: 'apagar-tudo' }] });
+    assert(idRuim === 400 && res.status === 400, `leitor: id ou tipo de evento inválido: 400: ${idRuim}/${res.status}`);
+    const esperaLeitor = req('GET', `/api/segunda-tela/salas/${leitor.id}?papel=tablet&esperar=1&versao=0&pareada=1&seq=0`);
+    await new Promise(r => setTimeout(r, 60));
+    res = await req('POST', `/api/segunda-tela/salas/${leitor.id}/eventos`, { eventos: [
+      { id: 'a1', tipo: 'leitura', cod: '60863', qtd: 1, campo: 'qty' },
+      { id: 'a2', tipo: 'leitura', cod: '60863', qtd: 1, campo: 'qty' },
+    ] });
+    assert(res.status === 200 && res.body.aceitos === 2 && res.body.seq === 2, `leitor: duas leituras aceitas: ${JSON.stringify(res.body)}`);
+    const rl = await esperaLeitor;
+    assert(rl.status === 200 && rl.body.eventos.length === 2 && rl.body.eventos[1].seq === 2 && rl.body.eventos[0].cod === '60863',
+      `leitor: a espera do tablet volta com as leituras: ${JSON.stringify(rl.body)}`);
+    res = await req('POST', `/api/segunda-tela/salas/${leitor.id}/eventos`, { eventos: [
+      { id: 'a2', tipo: 'leitura', cod: '60863', qtd: 1, campo: 'qty' },
+      { id: 'a3', tipo: 'desfazer', ref: 'a2' },
+    ] });
+    assert(res.status === 200 && res.body.aceitos === 1 && res.body.seq === 3, `leitor: reenvio da mesma leitura não conta de novo: ${JSON.stringify(res.body)}`);
+    res = await req('GET', `/api/segunda-tela/salas/${leitor.id}?papel=tablet&esperar=1&versao=0&pareada=1&seq=2`);
+    assert(res.status === 200 && res.body.eventos.length === 1 && res.body.eventos[0].tipo === 'desfazer' && res.body.perdeu_eventos === false,
+      `leitor: o tablet recebe só o que veio depois do seq dele: ${JSON.stringify(res.body)}`);
+    res = await req('POST', `/api/segunda-tela/salas/${sala.id}/eventos`, { eventos: [{ id: 'c1', tipo: 'leitura' }] });
+    assert(res.status === 404, `leitor: sala encerrada não recebe leitura: ${res.status}`);
+    await req('DELETE', `/api/segunda-tela/salas/${leitor.id}`);
+
+    // no máximo 4 salas por conta: a mais antiga sai
+    const ids = [];
+    for (let i = 0; i < 5; i++) ids.push((await req('POST', '/api/segunda-tela/salas', { modo: 'cliente' })).body.id);
+    res = await req('GET', `/api/segunda-tela/salas/${ids[0]}`);
+    const ultima = await req('GET', `/api/segunda-tela/salas/${ids[4]}`);
+    assert(res.status === 404 && ultima.status === 200, `segunda tela: a 5ª sala da conta tira a mais antiga: ${res.status}/${ultima.status}`);
+
+    // limpeza: sala sem par com código vencido sai; com o tablet esperando, fica
+    const segundaTela = require('../routes/segundaTela');
+    const salaVencida = segundaTela._salas.get(ids[3]);
+    const salaOuvindo = segundaTela._salas.get(ids[4]);
+    salaVencida.codigoExpiraEm = Date.now() - 120000;
+    salaOuvindo.codigoExpiraEm = Date.now() - 120000;
+    salaOuvindo.tabletEsperando = 1;
+    segundaTela.limparSalas();
+    assert(!segundaTela._salas.has(ids[3]) && segundaTela._salas.has(ids[4]),
+      'segunda tela: limpeza tira a sala sem par com código vencido e mantém a que tem o tablet esperando');
+    salaOuvindo.tabletEsperando = 0;
+
+    // desligamento do servidor: a espera aberta volta na hora (503, o tablet tenta de
+    // novo em seguida) e a próxima não espera - o deploy não fica preso 25 s
+    const espera4 = req('GET', `/api/segunda-tela/salas/${ids[4]}?papel=tablet&esperar=1&versao=0&pareada=0`);
+    await new Promise(r => setTimeout(r, 60));
+    const t1 = Date.now();
+    segundaTela.acordarTodas();
+    const r4 = await espera4;
+    res = await req('GET', `/api/segunda-tela/salas/${ids[4]}?papel=tablet&esperar=1&versao=0&pareada=0`);
+    assert(r4.status === 503 && res.status === 503 && Date.now() - t1 < 300,
+      `segunda tela: no desligamento as esperas respondem na hora: ${r4.status}/${res.status} em ${Date.now() - t1} ms`);
+    authToken = tokenAntes;
+  }
+
+  // Rotas destrutivas ou de administração que não tinham teste (auditoria de
+  // 10/2026): mesclar clientes, corrigir documento, apagar carteira antiga e o
+  // relatório inteiro, rascunho do levantamento, logout e gerar promocionais.
+  // Fica no fim da suíte porque /tudo/limpar apaga o relatório oficial inteiro.
+  {
+    const tokenAntes = authToken;
+    const novoUsuario = async (nome, email, admin) => {
+      const u = await mockDb.pool.query(
+        `INSERT INTO usuarios (nome, email, google_sub, is_admin) VALUES ($1, $2, $3, ${admin ? 'true' : 'false'}) RETURNING id, nome, email, is_admin`,
+        [nome, email, 'sub-' + email]
+      );
+      const tok = generateToken();
+      await mockDb.pool.query('INSERT INTO sessoes (token, usuario_id, expira_em) VALUES ($1, $2, $3)', [hashToken(tok), u.rows[0].id, '90']);
+      return { id: u.rows[0].id, tok };
+    };
+    const admin = await novoUsuario('Admin Destrutivas', 'admin.destrutivas@example.com', true);
+    const vend = await novoUsuario('Vendedor Destrutivas', 'vend.destrutivas@example.com', false);
+    const diasAtrasISO = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+    mockDb.__seed({
+      clientes: [
+        { id: 99701, nome: 'MESCLA MANTER LTDA', documento: null, contato: null, codigo_oficial: 'COD99701' },
+        { id: 99702, nome: 'MESCLA REMOVER LTDA', documento: '22.333.444/0001-55', contato: 'Fulano', codigo_oficial: 'COD99702',
+          classificatorio_tipo: 'Varejo Master', classificatorio_desconto: 20, classificatorio_atualizado_em: '2026-09-01' },
+        { id: 99703, nome: 'DOCUMENTO ERRADO LTDA', documento: '00.000.000/0001-00', contato: null, codigo_oficial: null },
+      ],
+      pedidos: [{ id: 99801, cliente_id: 99702, vendedor_id: null, usuario_id: null, origem: 'app', data_pedido: new Date().toISOString() }],
+      levantamentos: [{ id: 99911, cliente_id: 99702, vendedor_id: null, data_visita: new Date().toISOString() }],
+      pedidosOficiaisItens: [
+        { nr_pedido: 'CARANT1', codigo_sku: '60863', cliente_codigo_oficial: 'COD99701', quantidade: 1, valor: 10, data_implantacao: diasAtrasISO(70), status: 'carteira', nota_chave: '' },
+        { nr_pedido: 'CARANT2', codigo_sku: '60863', cliente_codigo_oficial: 'COD99701', quantidade: 1, valor: 10, data_implantacao: diasAtrasISO(10), status: 'carteira', nota_chave: '' },
+        { nr_pedido: 'CARANT3', codigo_sku: '60863', cliente_codigo_oficial: 'COD99701', quantidade: 1, valor: 10, data_implantacao: diasAtrasISO(100), data_faturamento: diasAtrasISO(95), status: 'faturado', nota_chave: '1' },
+      ],
+      catalogoPrecos: [{ codigo_sku: '97001', nome: 'BASE TESTE PROMO', emb: 1, ipi: 0, familia: 'TESTE', precos_sem_imposto: { VAREJO: { SP: 100, RJ: 110, BA: 120 } } }],
+    });
+    const oficiais = () => mockDb.__getPedidosOficiaisItens();
+    const cliente = (id) => mockDb.__getClientes().find(c => Number(c.id) === id);
+
+    // vendedor comum: tudo isso é só de admin, e nada muda
+    authToken = vend.tok;
+    const antesOficiais = oficiais().length;
+    const negadas = [
+      ['POST', '/api/clientes/mesclar', { manter_id: 99701, remover_id: 99702, confirmar_codigo_oficial_diferente: true }],
+      ['PATCH', '/api/clientes/99703/documento', { documento: '33.444.555/0001-66' }],
+      ['GET', '/api/pedidos-oficiais/carteira-antiga/contagem'],
+      ['POST', '/api/pedidos-oficiais/carteira-antiga/limpar'],
+      ['GET', '/api/pedidos-oficiais/tudo/contagem'],
+      ['POST', '/api/pedidos-oficiais/tudo/limpar'],
+      ['POST', '/api/produtos-promocionais/gerar-por-desconto', { itens: [{ baseCode: '97001', novoCodigo: 'PV97001', descontoPct: 5 }] }],
+    ];
+    for (const [m, p, b] of negadas) {
+      res = await req(m, p, b);
+      assert(res.status === 403, `vendedor comum recebe 403 em ${m} ${p}: ${res.status}`);
+    }
+    assert(oficiais().length === antesOficiais && cliente(99702) && cliente(99703).documento === '00.000.000/0001-00',
+      'chamadas negadas ao vendedor não mexeram em cliente nem no relatório oficial');
+
+    authToken = admin.tok;
+    // corrigir documento
+    res = await req('PATCH', '/api/clientes/99703/documento', {});
+    assert(res.status === 400, `corrigir documento sem documento: 400: ${res.status}`);
+    res = await req('PATCH', '/api/clientes/999999/documento', { documento: '33444555000166' });
+    assert(res.status === 404, `corrigir documento de cliente que não existe: 404: ${res.status}`);
+    res = await req('PATCH', '/api/clientes/99703/documento', { documento: '33444555000166' });
+    assert(res.status === 200 && cliente(99703).documento === '33.444.555/0001-66',
+      `admin corrige o documento (formatado): ${res.status} ${cliente(99703) && cliente(99703).documento}`);
+
+    // mesclar clientes
+    res = await req('POST', '/api/clientes/mesclar', { manter_id: 99701 });
+    assert(res.status === 400, `mesclar sem os dois ids: 400: ${res.status}`);
+    res = await req('POST', '/api/clientes/mesclar', { manter_id: 99701, remover_id: 99701 });
+    assert(res.status === 400, `mesclar o cliente com ele mesmo: 400: ${res.status}`);
+    res = await req('POST', '/api/clientes/mesclar', { manter_id: 99701, remover_id: 999999 });
+    assert(res.status === 404, `mesclar com cliente que não existe: 404: ${res.status}`);
+    res = await req('POST', '/api/clientes/mesclar', { manter_id: 99701, remover_id: 99702 });
+    assert(res.status === 409 && res.body && res.body.codigoOficialRemover === 'COD99702' && cliente(99702),
+      `códigos oficiais diferentes pedem confirmação (409) e não mesclam: ${res.status}`);
+    res = await req('POST', '/api/clientes/mesclar', { manter_id: 99701, remover_id: 99702, confirmar_codigo_oficial_diferente: true });
+    const mantido = cliente(99701);
+    assert(res.status === 200 && !cliente(99702), `mescla confirmada remove o duplicado: ${res.status}`);
+    assert(mockDb.__getPedidos().find(p => p.id === 99801).cliente_id === 99701 && mockDb.__getLevantamentos().find(l => l.id === 99911).cliente_id === 99701,
+      'pedido e levantamento do duplicado passam pro cliente mantido');
+    assert(mantido.codigo_oficial === 'COD99701' && mantido.documento === '22.333.444/0001-55' && mantido.contato === 'Fulano'
+      && mantido.classificatorio_tipo === 'Varejo Master' && Number(mantido.classificatorio_desconto) === 20,
+      `mescla mantém o código do mantido e completa só os campos vazios (CNPJ, contato, classificatório): ${JSON.stringify(mantido)}`);
+    assert(Array.isArray(res.body.camposCompletados) && ['CNPJ/CPF', 'contato', 'classificatório'].every(c => res.body.camposCompletados.includes(c)),
+      `mescla informa os campos completados: ${JSON.stringify(res.body && res.body.camposCompletados)}`);
+
+    // carteira antiga (60+ dias, nunca faturado)
+    const corte = diasAtrasISO(60);
+    const esperadoAntiga = oficiais().filter(i => i.status === 'carteira' && i.data_implantacao && i.data_implantacao < corte).length;
+    res = await req('GET', '/api/pedidos-oficiais/carteira-antiga/contagem');
+    assert(res.status === 200 && res.body.total === esperadoAntiga && esperadoAntiga >= 1, `contagem da carteira antiga: ${JSON.stringify(res.body)} (esperado ${esperadoAntiga})`);
+    res = await req('POST', '/api/pedidos-oficiais/carteira-antiga/limpar');
+    const nrs = oficiais().map(i => i.nr_pedido);
+    assert(res.status === 200 && !nrs.includes('CARANT1') && nrs.includes('CARANT2') && nrs.includes('CARANT3'),
+      `limpar carteira antiga apaga só o item em carteira com mais de 60 dias (faturado antigo e carteira recente ficam): ${res.status}`);
+
+    // apagar o relatório oficial inteiro
+    mockDb.__setConfiguracao('relatorio_oficial_mais_novo', diasAtrasISO(1));
+    const total = oficiais().length;
+    res = await req('GET', '/api/pedidos-oficiais/tudo/contagem');
+    assert(res.status === 200 && res.body.total === total, `contagem do relatório inteiro: ${JSON.stringify(res.body)} (esperado ${total})`);
+    res = await req('POST', '/api/pedidos-oficiais/tudo/limpar');
+    assert(res.status === 200 && res.body.excluidos === total && oficiais().length === 0,
+      `apagar o relatório inteiro remove todas as linhas: ${JSON.stringify(res.body)}`);
+    assert(mockDb.__getConfiguracao('relatorio_oficial_mais_novo') === undefined,
+      'apagar o relatório zera a data do mais novo (o próximo importado não sai "antigo")');
+
+    // gerar produtos promocionais por desconto
+    res = await req('POST', '/api/produtos-promocionais/gerar-por-desconto', { itens: [] });
+    assert(res.status === 400, `gerar promocionais sem itens: 400: ${res.status}`);
+    res = await req('POST', '/api/produtos-promocionais/gerar-por-desconto', { itens: [
+      { baseCode: '97001', novoCodigo: 'P97001', descontoPct: 10 },
+      { baseCode: '97001', novoCodigo: 'P97001', descontoPct: 5 },
+      { baseCode: 'NAOEXISTE', novoCodigo: 'PNAOEXISTE', descontoPct: 5 },
+      { baseCode: '97001', novoCodigo: 'P297001', descontoPct: 100 },
+    ] });
+    const promo = (mockDb.__getConfiguracao('produtos_promocionais') || []).find(p => p.c === 'P97001');
+    assert(res.status === 200 && JSON.stringify(res.body.criados) === '["P97001"]' && res.body.erros.length === 3,
+      `gera só o válido e recusa repetido no lote, base inexistente e desconto de 100%: ${JSON.stringify(res.body)}`);
+    assert(promo && promo.lsp === 90 && promo.lss === 99 && promo.lnc === 108 && promo.fx === 1 && promo.origemCodigo === '97001',
+      `promocional gerado com 10% sobre o preço líquido do Varejo: ${JSON.stringify(promo)}`);
+    res = await req('POST', '/api/produtos-promocionais/gerar-por-desconto', { itens: [{ baseCode: '97001', novoCodigo: 'P97001', descontoPct: 20 }] });
+    assert(res.status === 200 && res.body.criados.length === 0 && (mockDb.__getConfiguracao('produtos_promocionais') || []).filter(p => p.c === 'P97001').length === 1,
+      'código promocional que já existe não é sobrescrito');
+
+    // rascunho do levantamento: de cada usuário
+    authToken = vend.tok;
+    res = await req('GET', '/api/levantamentos/rascunho');
+    assert(res.status === 404, `sem rascunho salvo: 404: ${res.status}`);
+    res = await req('POST', '/api/levantamentos/rascunho', {});
+    assert(res.status === 400, `rascunho sem valor: 400: ${res.status}`);
+    res = await req('POST', '/api/levantamentos/rascunho', { valor: { cliente: 'X', itens: [{ cod: '60863', qtd: 2 }] } });
+    assert(res.status === 200, `salva o rascunho: ${res.status}`);
+    res = await req('GET', '/api/levantamentos/rascunho');
+    const rasc = res.body && (typeof res.body.rascunho === 'string' ? JSON.parse(res.body.rascunho) : res.body.rascunho);
+    assert(res.status === 200 && rasc && rasc.itens && rasc.itens[0].qtd === 2, `devolve o rascunho salvo: ${JSON.stringify(res.body)}`);
+    authToken = admin.tok;
+    res = await req('GET', '/api/levantamentos/rascunho');
+    assert(res.status === 404, `rascunho de um usuário não aparece pra outro: ${res.status}`);
+    authToken = vend.tok;
+    res = await req('DELETE', '/api/levantamentos/rascunho');
+    assert(res.status === 200, `apaga o rascunho: ${res.status}`);
+    res = await req('GET', '/api/levantamentos/rascunho');
+    assert(res.status === 404, `depois de apagar não há rascunho: ${res.status}`);
+
+    // logout: encerra só a sessão usada
+    const outraSessao = generateToken();
+    await mockDb.pool.query('INSERT INTO sessoes (token, usuario_id, expira_em) VALUES ($1, $2, $3)', [hashToken(outraSessao), vend.id, '90']);
+    res = await req('POST', '/api/auth/logout');
+    assert(res.status === 200, `logout: ${res.status}`);
+    res = await req('GET', '/api/auth/me');
+    assert(res.status === 401, `token usado no logout deixa de valer: ${res.status}`);
+    authToken = outraSessao;
+    res = await req('GET', '/api/auth/me');
+    assert(res.status === 200, `outra sessão do mesmo usuário continua valendo: ${res.status}`);
+    authToken = '';
+    res = await req('POST', '/api/auth/logout');
+    assert(res.status === 200, `logout sem token não quebra: ${res.status}`);
+
+    authToken = tokenAntes;
+  }
+
+  {
+    // Limite de requisições nas rotas de leitura pesadas (middleware/limiteRotasPesadas.js):
+    // por usuário, só GET, contado uma vez mesmo passando por vários app.use('/api…')
+    const { grupoDaRota, LIMITE_CARTEIRA, LIMITE_CLIENTE } = require('../middleware/limiteRotasPesadas');
+    const carteira = grupoDaRota('/api/recompra');
+    const cliente = grupoDaRota('/api/clientes/12/historico');
+    const classificados = ['/api/dashboard/resumo', '/api/produtos-abc-geral', '/api/clientes/classificatorio/alertas', '/api/clientes/sync',
+      '/api/visitas', '/api/reativacao', '/api/inadimplencia', '/api/pedidos/exportar', '/api/produtos/61366/clientes', '/api/levantamentos/recentes', '/api/recompra/']
+      .every(c => grupoDaRota(c) === carteira)
+      && ['/api/clientes/12/rotatividade', '/api/clientes/12/classificatorio/status', '/api/clientes/12/produtos-abc', '/api/pedidos-oficiais/12',
+        '/api/pedidos-oficiais/12/resumo', '/api/clientes/12/consumo-estimado/5'].every(c => grupoDaRota(c) === cliente)
+      && ['/api/clientes', '/api/pedidos', '/api/pedidos/salvos', '/api/produtos', '/api/configuracoes/promocoes', '/api/pedidos-oficiais/status',
+        '/api/recompra/12/adiar', '/api/novidades'].every(c => grupoDaRota(c) === null)
+      && carteira && cliente && carteira !== cliente;
+    assert(classificados, 'limite de rotas pesadas: rotas da carteira, de um cliente e livres classificadas certo');
+
+    const tokenAntes = authToken;
+    const novaSessao = async (email) => {
+      const u = await mockDb.pool.query(
+        'INSERT INTO usuarios (nome, email, google_sub, is_admin) VALUES ($1, $2, $3, false) RETURNING id', ['Limite ' + email, email, 'sub-' + email]);
+      const tok = generateToken();
+      await mockDb.pool.query('INSERT INTO sessoes (token, usuario_id, expira_em) VALUES ($1, $2, $3)', [hashToken(tok), u.rows[0].id, '90']);
+      return tok;
+    };
+    const tokA = await novaSessao('limite.a@example.com');
+    const tokB = await novaSessao('limite.b@example.com');
+
+    // passa por 3 app.use (clientes, clientesClassificatorio, relatorios): conta 1
+    authToken = tokA;
+    res = await req('GET', '/api/clientes/1/historico');
+    const restanteCliente = Number(res.headers['ratelimit-remaining']);
+    assert(restanteCliente === LIMITE_CLIENTE - 1, `rota de cliente contada uma vez só: restam ${restanteCliente} de ${LIMITE_CLIENTE}`);
+
+    let bloqueadoEm = 0;
+    for (let i = 1; i <= LIMITE_CARTEIRA + 1; i++) {
+      res = await req('GET', '/api/recompra');
+      if (res.status === 429) { bloqueadoEm = i; break; }
+    }
+    const msg = res.body && res.body.erro;
+    // gravação do mesmo usuário continua passando; outro usuário tem a conta dele
+    const adiar = await req('POST', '/api/recompra/1/adiar', {});
+    authToken = tokB;
+    const outro = await req('GET', '/api/recompra');
+    assert(bloqueadoEm === LIMITE_CARTEIRA + 1 && /espera um minuto/.test(msg || '') && adiar.status !== 429 && outro.status !== 429,
+      `limite de rotas pesadas: ${LIMITE_CARTEIRA} por minuto por usuário, depois 429 (gravação e outro usuário passam): ${JSON.stringify({ bloqueadoEm, msg, adiar: adiar.status, outro: outro.status })}`);
+    authToken = tokenAntes;
+  }
 
   console.log();
   console.log(process.exitCode === 1 ? 'ALGUNS TESTES FALHARAM' : 'TODOS OS TESTES PASSARAM');

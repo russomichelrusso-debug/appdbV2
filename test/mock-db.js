@@ -17,9 +17,38 @@ let sessoes = [];
 let rascunhos = {}; // usuario_id -> { rascunho, atualizado_em }
 let codigosProduto = {}; // codigo_sku -> { ean13, dun14 }
 let clienteCnpjFicha = {}; // cliente_id -> linha de cliente_cnpj_ficha
+let clienteGeocodificacao = {}; // cliente_id -> linha de cliente_geocodificacao (posição pelo endereço)
+let titulosAvistaPendentes = []; // aba Pendentes à Vista (títulos em aberto)
+let classificatorioErp = {}; // cliente_id -> foto financeira da planilha Classificatório (cliente_classificatorio_erp)
+let pedidosPendentesPagamento = []; // aba de pedidos à vista aguardando pagamento
 let pedidosOficiaisItens = []; // relatório oficial de Faturamento (curva ABC de produtos/clientes)
 let configuracoes = {}; // chave -> valor (routes/configuracoes.js)
+let novidades = []; // routes/lib/novidades.js
+let importacoesEmail = []; // routes/importacaoEmail.js
+let pedidosBloqueados = []; // pedidos_bloqueados
+let avisosCancelamento = []; // avisos_cancelamento_saldo
+let importLog = []; // import_log (rota, criado_em)
+let previsaoEstoque = []; // previsao_estoque
+let nextNovidadeId = 1;
+let pushInscricoes = []; // push_inscricoes
+let nextPushId = 1;
+let recompraAdiamentos = []; // routes/recompra.js ("Já falei")
+let ocorrencias = []; // ocorrencias_pos_venda (routes/ocorrencias.js)
+let nextOcorrenciaId = 1;
+let clientesSemCompra = []; // routes/reativacao.js (foto do Relatório de Clientes Sem Compra)
+let reativacaoAdiamentos = []; // routes/reativacao.js ("Já falei"/"Não reativar")
+let contasSalesforce = []; // routes/contasSalesforce.js (foto do relatório "Todas Contas")
+let reativacaoAlvos = []; // placar "Recuperados" (reativacao_alvos)
+let titulosInadimplentes = []; // routes/inadimplencia.js
+let produtoFotos = {}; // codigo_sku -> { imagem, tamanho, versao } (routes/produtoFotos.js)
+let produtoFotosRelogio = 1760000000000;
 let catalogoPrecos = []; // {codigo_sku, nome, emb, ipi, familia, precos_sem_imposto} (routes/catalogoPrecos.js)
+let fichasTecnicas = {}; // codigo_sku -> { nome, descricao, foto, specs } (routes/fichasTecnicas.js)
+// Versão das tabelas (routes/lib/cacheTabela.js, pg_stat_user_tables): por
+// padrão muda a cada consulta - o cache nunca acerta e os outros testes podem
+// mexer nos arrays direto. __fixarVersaoTabelas(n) fixa (teste do próprio cache).
+let versaoTabelas = null;
+let versaoTabelasContador = 0;
 let nextId = { clientes: 1, vendedores: 1, produtos: 3, pedidos: 1, pedido_itens: 1, levantamentos: 1, levantamento_itens: 1, usuarios: 1, sessoes: 1 };
 
 function reset() {
@@ -34,10 +63,34 @@ function reset() {
   sessoes = [];
   rascunhos = {};
   codigosProduto = {};
+  fichasTecnicas = {};
+  versaoTabelas = null;
   clienteCnpjFicha = {};
+  clienteGeocodificacao = {};
   pedidosOficiaisItens = [];
+  pedidosPendentesPagamento = [];
+  titulosAvistaPendentes = [];
+  classificatorioErp = {};
   configuracoes = {};
   catalogoPrecos = [];
+  recompraAdiamentos = [];
+  ocorrencias = [];
+  nextOcorrenciaId = 1;
+  clientesSemCompra = [];
+  reativacaoAdiamentos = [];
+  contasSalesforce = [];
+  reativacaoAlvos = [];
+  titulosInadimplentes = [];
+  produtoFotos = {};
+  novidades = [];
+  importacoesEmail = [];
+  pedidosBloqueados = [];
+  avisosCancelamento = [];
+  importLog = [];
+  previsaoEstoque = [];
+  nextNovidadeId = 1;
+  pushInscricoes = [];
+  nextPushId = 1;
   nextId = { clientes: 1, vendedores: 1, produtos: 3, pedidos: 1, pedido_itens: 1, levantamentos: 1, levantamento_itens: 1, usuarios: 1, sessoes: 1 };
 }
 
@@ -54,6 +107,57 @@ function seed(partial) {
   if (partial.levantamentos) levantamentos.push(...partial.levantamentos);
   if (partial.levantamentoItens) levantamentoItens.push(...partial.levantamentoItens);
   if (partial.fichasCnpj) Object.assign(clienteCnpjFicha, partial.fichasCnpj);
+  if (partial.geocodificacao) Object.assign(clienteGeocodificacao, partial.geocodificacao);
+  if (partial.avisosCancelamento) avisosCancelamento.push(...partial.avisosCancelamento);
+}
+
+// Reproduz sqlChaveEndereco (routes/lib/geocodificacao.js)
+function chaveEnderecoFicha(f) {
+  const t = (v) => String(v == null ? '' : v).trim().toUpperCase();
+  const bruto = (f.dados_brutos && f.dados_brutos.endereco) || {};
+  return [t(bruto.tipoLogradouro), t(f.logradouro), t(f.numero), t(f.municipio), t(f.uf)].join('|');
+}
+
+// Reproduz sqlBloqueioAtivo (routes/lib/pedidosBloqueados.js): menos de 30
+// dias e o pedido ainda não apareceu faturado
+function bloqueiosAtivos() {
+  const limite = Date.now() - 30 * 86400000;
+  return pedidosBloqueados.filter(b => new Date(b.recebido_em).getTime() > limite
+    && !pedidosOficiaisItens.some(i => i.nr_pedido === b.nr_pedido && i.status === 'faturado'));
+}
+
+// Reproduz sqlAvisoCancelamentoAtivo (routes/lib/cancelamentoSaldo.js): menos
+// de 15 dias e o item não apareceu faturado depois do aviso
+// - e some quando um relatório importado depois do aviso não traz mais o item em carteira
+function avisosCancelamentoAtivos() {
+  const limite = Date.now() - 15 * 86400000;
+  return avisosCancelamento.filter(a => new Date(a.recebido_em).getTime() > limite
+    && !pedidosOficiaisItens.some(i => i.nr_pedido === a.nr_pedido && i.codigo_sku === a.codigo_sku && i.status === 'faturado'
+      && i.data_faturamento && String(i.data_faturamento).slice(0, 10) > a.data_aviso)
+    && (pedidosOficiaisItens.some(i => i.nr_pedido === a.nr_pedido && i.codigo_sku === a.codigo_sku && i.status === 'carteira')
+      || !importLog.some(l => l.rota === 'pedidos-oficiais/importar' && new Date(l.criado_em).getTime() > new Date(a.recebido_em).getTime())));
+}
+function camposAviso(a) {
+  return { nr_pedido: a.nr_pedido, codigo_sku: a.codigo_sku, descricao: a.descricao, motivo: a.motivo,
+    minimo: a.minimo == null ? null : Number(a.minimo), quantidade: a.quantidade == null ? null : Number(a.quantidade),
+    valor: a.valor == null ? null : Number(a.valor), data_aviso: a.data_aviso, remetente: a.remetente };
+}
+
+// Reproduz sqlFaturadoDeFato (routes/lib/faturadoDeFato.js): item faturado cujo
+// título à vista (nota fiscal) ainda está pendente não conta no faturamento.
+// sqlDiaDoPedido (routes/lib/comprasApp.js): meia-noite UTC exata = "só a data"
+// (pedido de PDF/faturamento), o resto vai pro dia de Brasília
+const DIA_BR = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' });
+function diaDoPedidoBr(dataPedido) {
+  const t = new Date(dataPedido);
+  if (t.getTime() % 86400000 === 0) return t.toISOString().slice(0, 10);
+  return DIA_BR.format(t);
+}
+function hojeBr() { return DIA_BR.format(new Date()); }
+function diasAntes(iso, n) { return new Date(new Date(`${iso}T00:00:00Z`).getTime() - n * 86400000).toISOString().slice(0, 10); }
+
+function faturadoDeFato(it) {
+  return it.status === 'faturado' && !titulosAvistaPendentes.some(t => t.titulo === it.nota_fiscal);
 }
 
 async function query(sql, params = []) {
@@ -62,9 +166,439 @@ async function query(sql, params = []) {
   // template literals multi-linha, então um substring de match precisa ficar
   // igual independente de indentação/quebra de linha.
   const s = sql.replace(/\s+/g, ' ').toUpperCase();
+  if (s.includes('HEALTH:BANCO')) return { rows: [{ '?column?': 1 }], rowCount: 1 };
+  if (s.includes('/* CACHE-TABELA:VERSAO */')) {
+    return { rows: [{ versao: String(versaoTabelas ?? ++versaoTabelasContador) }] };
+  }
+  if (s.includes('/* PRODUTOS:CONTAGEM */')) {
+    const noCadastro = new Set(produtos.map(p => String(p.codigo_sku)));
+    return { rows: [{ total: produtos.length, catalogo: catalogoPrecos.length,
+      fora_do_cadastro: catalogoPrecos.filter(c => !noCadastro.has(String(c.codigo_sku))).length }] };
+  }
 
   if (s.startsWith('BEGIN') || s.startsWith('COMMIT') || s.startsWith('ROLLBACK')) return { rows: [] };
   if (s.includes('CREATE TABLE')) return { rows: [] };
+
+  // Importação por e-mail - routes/importacaoEmail.js
+  if (s.includes('/* IMPORTACAO-EMAIL:BLOQUEADO */')) {
+    const [nr, cod, nome, motivo, recebido] = params;
+    const atual = pedidosBloqueados.find(b => b.nr_pedido === nr);
+    if (atual) Object.assign(atual, { cliente_codigo_oficial: cod || atual.cliente_codigo_oficial, cliente_nome: nome || atual.cliente_nome, motivo,
+      recebido_em: new Date(recebido) > new Date(atual.recebido_em) ? recebido : atual.recebido_em });
+    else pedidosBloqueados.push({ nr_pedido: nr, cliente_codigo_oficial: cod, cliente_nome: nome, motivo, recebido_em: recebido });
+    return { rows: [] };
+  }
+  if (s.includes('/* IMPORTACAO-EMAIL:CANCELAMENTO-ANTES */')) {
+    const a = avisosCancelamento.find(x => x.nr_pedido === params[0] && x.codigo_sku === params[1]);
+    return { rows: a ? [{ data_aviso: a.data_aviso }] : [] };
+  }
+  if (s.includes('/* IMPORTACAO-EMAIL:CANCELAMENTO */')) {
+    const [nr, sku, cod, nome, descricao, oc, motivo, minimo, quantidade, valor, dataAviso, remetente, recebido] = params;
+    const atual = avisosCancelamento.find(x => x.nr_pedido === nr && x.codigo_sku === sku);
+    const novo = { nr_pedido: nr, codigo_sku: sku, cliente_codigo_oficial: cod, cliente_nome: nome, descricao, ordem_compra: oc,
+      motivo, minimo, quantidade, valor, data_aviso: dataAviso, remetente, recebido_em: recebido };
+    if (!atual) avisosCancelamento.push(novo);
+    else if (dataAviso >= atual.data_aviso) {
+      Object.assign(atual, { ...novo, cliente_codigo_oficial: cod || atual.cliente_codigo_oficial, cliente_nome: nome || atual.cliente_nome,
+        recebido_em: new Date(recebido) > new Date(atual.recebido_em) ? recebido : atual.recebido_em });
+    }
+    return { rows: [] };
+  }
+  if (s.includes('/* PEDIDOS-OFICIAIS:CANCELAMENTOS */')) {
+    return { rows: avisosCancelamentoAtivos().filter(a => a.cliente_codigo_oficial === params[0]).map(a => ({ aviso: camposAviso(a) })) };
+  }
+  if (s.includes('/* IMPORTACAO-EMAIL:BLOQUEIO-ATIVO */')) {
+    return { rows: bloqueiosAtivos().filter(b => b.nr_pedido === params[0]).map(() => ({ '?column?': 1 })) };
+  }
+  if (s.includes('/* PEDIDOS-OFICIAIS:OCORRENCIAS */')) {
+    const limite = Date.now() - 120 * 86400000;
+    return { rows: ocorrencias.filter(o => String(o.cliente_id) === String(params[0]) && (!o.resolvida_em || Date.parse(o.resolvida_em) > limite))
+      .sort((a, b) => String(b.enviado_em).localeCompare(String(a.enviado_em)))
+      .map(o => ({ ...o, usuario: (usuarios.find(u => u.id === o.usuario_id) || {}).nome || null })) };
+  }
+  if (s.includes('/* OCORRENCIAS:GRAVAR */')) {
+    const [clienteId, nr, nf, tipo, resumo, enviado, usuarioId, idEnvio] = params;
+    if (!ocorrencias.some(o => o.id_envio === idEnvio)) {
+      ocorrencias.push({ id: nextOcorrenciaId++, cliente_id: clienteId, nr_pedido: nr, nota_fiscal: nf, tipo, resumo, enviado_em: enviado,
+        resolvida_em: null, usuario_id: usuarioId, id_envio: idEnvio });
+    }
+    return { rows: [] };
+  }
+  if (s.includes('/* OCORRENCIAS:POR-ENVIO */')) {
+    return { rows: ocorrencias.filter(o => o.id_envio === params[0]).map(o => { const { usuario_id, ...r } = o; return r; }) };
+  }
+  if (s.includes('/* OCORRENCIAS:RESOLVER */')) {
+    const o = ocorrencias.find(x => x.id === params[0]);
+    if (!o) return { rows: [] };
+    o.resolvida_em = params[1] ? (o.resolvida_em || new Date().toISOString()) : null;
+    const { usuario_id, ...r } = o;
+    return { rows: [r] };
+  }
+  if (s.includes('/* PEDIDOS-OFICIAIS:BLOQUEADOS */')) {
+    return { rows: bloqueiosAtivos().filter(b => b.cliente_codigo_oficial === params[0]).map(b => ({ nr_pedido: b.nr_pedido, motivo: b.motivo, recebido_em: b.recebido_em })) };
+  }
+  if (s.includes('/* CLIENTE:MESMO-NOME */')) {
+    const norm = (n) => String(n || '').toUpperCase().trim().replace(/[.,\s]+/g, ' ');
+    return { rows: clientes.filter(c => norm(c.nome) === norm(params[0])).slice(0, 2).map(c => ({ id: c.id })) };
+  }
+  if (s.includes('/* CLIENTE:EXISTE */')) {
+    return { rows: clientes.filter(c => Number(c.id) === Number(params[0])).map(c => ({ id: c.id })) };
+  }
+  if (s.includes('/* IMPORTACAO-EMAIL:CLIENTE-POR-CODIGO */')) {
+    return { rows: clientes.filter(c => c.codigo_oficial === params[0]).map(c => ({ nome: c.nome })) };
+  }
+  if (s.includes('/* IMPORTACAO-EMAIL:RELATORIO-MAIS-NOVO */')) {
+    return { rows: importacoesEmail.filter(i => i.tipo === 'relatorio' && i.status === 'ok' && i.recebido_em && new Date(i.recebido_em) > new Date(params[0])).slice(0, 1).map(() => ({ '?column?': 1 })) };
+  }
+  if (s.includes('/* IMPORTACAO-EMAIL:CLIENTE-DO-PEDIDO */')) {
+    return { rows: pedidosOficiaisItens.filter(i => i.nr_pedido === params[0]).slice(0, 1).map(i => ({ cliente_codigo_oficial: i.cliente_codigo_oficial })) };
+  }
+  if (s.includes('/* IMPORTACAO-EMAIL:CODIGO-DO-CLIENTE */')) {
+    return { rows: clientes.filter(c => String(c.id) === String(params[0])).map(c => ({ codigo_oficial: c.codigo_oficial || null })) };
+  }
+  if (s.includes('/* IMPORTACAO-EMAIL:AVISTA */')) {
+    const [nr, cod, nome, valor, data] = params;
+    const atual = pedidosPendentesPagamento.find(p => p.nr_pedido === nr);
+    if (atual) Object.assign(atual, { cliente_codigo_oficial: cod || atual.cliente_codigo_oficial, cliente_nome: nome || atual.cliente_nome, valor });
+    else pedidosPendentesPagamento.push({ nr_pedido: nr, cliente_codigo_oficial: cod, cliente_nome: nome, valor, data_implantacao: data });
+    return { rows: [] };
+  }
+  if (s.includes('/* IMPORTACAO-EMAIL:JA-IMPORTADO */')) {
+    return { rows: importacoesEmail.filter(i => i.hash === params[0] && i.status === 'ok').map(i => ({ tipo: i.tipo })) };
+  }
+  if (s.includes('/* IMPORTACAO-EMAIL:REGISTRAR */')) {
+    const [hash, nome_arquivo, tipo, remetente, assunto, mensagem_id, recebido_em, status, erro, resultado] = params;
+    const linha = { hash, nome_arquivo, tipo, remetente, assunto, mensagem_id, recebido_em, status, erro, resultado, atualizado_em: new Date() };
+    const i = importacoesEmail.findIndex(x => x.hash === hash);
+    if (i === -1) importacoesEmail.push(linha); else importacoesEmail[i] = linha;
+    return { rows: [] };
+  }
+  if (s.includes('/* IMPORTACAO-EMAIL:STATUS */')) {
+    const porTipo = new Map();
+    for (const l of importacoesEmail) {
+      if (!l.tipo) continue;
+      const atual = porTipo.get(l.tipo);
+      if (!atual || l.atualizado_em >= atual.atualizado_em) porTipo.set(l.tipo, l);
+    }
+    return { rows: [...porTipo.values()].map(l => ({ tipo: l.tipo, nome_arquivo: l.nome_arquivo, status: l.status, erro: l.erro, recebido_em: l.recebido_em, atualizado_em: l.atualizado_em })) };
+  }
+  // previsão de estoque (routes/previsaoEstoque.js)
+  if (s.startsWith('DELETE FROM PREVISAO_ESTOQUE')) { previsaoEstoque = []; return { rows: [] }; }
+  if (s.includes('INSERT INTO PREVISAO_ESTOQUE')) {
+    const [cods, disp, cart, compra, prev, saldo] = params;
+    cods.forEach((c, i) => previsaoEstoque.push({ codigo_sku: c, qt_disponivel: disp[i], qt_carteira: cart[i], qt_compra: compra[i], previsao: prev[i], saldo: saldo[i] }));
+    return { rows: [] };
+  }
+  // relatório oficial: clientes que podem casar pelo código ou pelo nome, em lote
+  // (classificarEVincularClientes, routes/pedidosOficiais.js) - mesma
+  // normalização dos handlers de acharClientePorNome abaixo
+  if (s.includes('/* RELATORIO-OFICIAL:CLIENTES */')) {
+    const exato = (n) => String(n || '').trim().toUpperCase().replace(/\s+/g, ' ');
+    const tolerante = (n) => String(n || '').trim().toUpperCase().replace(/[.,\s]+/g, ' ');
+    const [codigos, nomes] = params;
+    const ex = new Set(nomes.map(exato)), tol = new Set(nomes.map(tolerante));
+    const rows = clientes.filter(c => (c.codigo_oficial && codigos.includes(c.codigo_oficial)) || ex.has(exato(c.nome)) || tol.has(tolerante(c.nome)))
+      .map(c => ({ fonte: 'cliente', id: c.id, nome: null, codigo_oficial: c.codigo_oficial || null, exato: exato(c.nome), tolerante: tolerante(c.nome) }));
+    nomes.forEach(n => rows.push({ fonte: 'entrada', id: null, nome: n, codigo_oficial: null, exato: exato(n), tolerante: tolerante(n) }));
+    return { rows };
+  }
+  if (s.includes('/* RELATORIO-OFICIAL:CRIAR-CLIENTES */')) {
+    const rows = [];
+    params[0].forEach((nome, i) => {
+      if (clientes.some(c => c.codigo_oficial === params[1][i])) return; // ON CONFLICT DO NOTHING
+      const c = { id: nextId.clientes++, nome, documento: null, codigo_oficial: params[1][i], contato: null, classificatorio_tipo: null, classificatorio_desconto: null };
+      clientes.push(c);
+      rows.push({ id: c.id, codigo_oficial: c.codigo_oficial });
+    });
+    return { rows, rowCount: rows.length };
+  }
+  if (s.includes('/* RELATORIO-OFICIAL:CLIENTES-POR-CODIGO */')) {
+    return { rows: clientes.filter(c => c.codigo_oficial && params[0].includes(c.codigo_oficial)).map(c => ({ id: c.id, codigo_oficial: c.codigo_oficial })) };
+  }
+  if (s.includes('/* RELATORIO-OFICIAL:CLASSIFICAR */')) {
+    const [ids, tipos, descontos, datas] = params;
+    const rows = [];
+    ids.forEach((id, i) => {
+      const c = clientes.find(x => Number(x.id) === Number(id));
+      const dataRef = datas[i];
+      if (c && (!c.classificatorio_atualizado_em || !dataRef || c.classificatorio_atualizado_em <= dataRef)) {
+        c.classificatorio_tipo = tipos[i];
+        c.classificatorio_desconto = descontos[i];
+        c.classificatorio_atualizado_em = dataRef || c.classificatorio_atualizado_em || new Date().toISOString().slice(0, 10);
+        rows.push({ id: c.id });
+      }
+    });
+    return { rows, rowCount: rows.length };
+  }
+  if (s.includes('/* RELATORIO-OFICIAL:VINCULAR-CODIGOS */')) {
+    params[0].forEach((id, i) => { const c = clientes.find(x => Number(x.id) === Number(id)); if (c) c.codigo_oficial = params[1][i]; });
+    return { rows: [], rowCount: params[0].length };
+  }
+  // relatório oficial: data do mais novo já importado (routes/pedidosOficiais.js)
+  if (s.includes('/* RELATORIO-OFICIAL:DATA-MAIS-NOVA */')) {
+    if (!configuracoes[params[0]]) configuracoes[params[0]] = { valor: null, atualizado_em: new Date().toISOString() };
+    const v = configuracoes[params[0]].valor;
+    return { rows: [{ data: v == null ? null : String(v) }] };
+  }
+  if (s.includes('/* RELATORIO-OFICIAL:DATA-PELOS-ITENS */')) {
+    const limite = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+    const datas = pedidosOficiaisItens.flatMap(i => [i.data_implantacao, i.data_faturamento]).filter(Boolean).map(d => String(d).slice(0, 10)).filter(d => d <= limite).sort();
+    return { rows: [{ data: datas.length ? datas[datas.length - 1] : null }] };
+  }
+  if (s.includes('/* RELATORIO-OFICIAL:GRAVAR-DATA */')) {
+    configuracoes[params[0]] = { valor: params[1], atualizado_em: new Date().toISOString() };
+    return { rows: [], rowCount: 1 };
+  }
+  if (s.includes('/* RELATORIO-OFICIAL:DESCRICOES */')) {
+    let n = 0;
+    params[0].forEach((nr, i) => pedidosOficiaisItens.forEach(it => {
+      if (it.nr_pedido === nr && it.codigo_sku === params[1][i] && it.descricao == null) { it.descricao = params[2][i]; n++; }
+    }));
+    return { rows: [], rowCount: n };
+  }
+  // catálogo de preços (routes/catalogoPrecos.js)
+  // produto novo da Lista de Preços entra em produtos (só os que não existem)
+  if (s.includes('/* CATALOGO-PRECOS:PRODUTOS-NOVOS */')) {
+    let n = 0;
+    params[0].forEach((c, i) => {
+      if (produtos.some(p => p.codigo_sku === c)) return;
+      produtos.push({ id: nextId.produtos++, codigo_sku: c, nome: (params[1][i] || '').trim() || c, categoria: params[2][i] ?? null });
+      n++;
+    });
+    return { rows: [], rowCount: n };
+  }
+  // pedido/levantamento com produto que ainda não está em produtos: cria do catálogo (routes/lib/produtoPorSku.js)
+  if (s.includes('/* PRODUTO:DO-CATALOGO */')) {
+    const cat = catalogoPrecos.find(p => p.codigo_sku === params[0]);
+    if (!cat || produtos.some(p => p.codigo_sku === params[0])) return { rows: [] };
+    const novo = { id: nextId.produtos++, codigo_sku: cat.codigo_sku, nome: (cat.nome || '').trim() || cat.codigo_sku, categoria: cat.familia ?? null };
+    produtos.push(novo);
+    return { rows: [{ id: novo.id }] };
+  }
+  if (s.includes('/* PRODUTO:DO-PROMOCIONAL */')) {
+    const cfg = configuracoes.produtos_promocionais;
+    const lista = cfg && Array.isArray(cfg.valor) ? cfg.valor : [];
+    const promo = lista.find(p => p && p.c === params[0]);
+    if (!promo || produtos.some(p => p.codigo_sku === params[0])) return { rows: [] };
+    const novo = { id: nextId.produtos++, codigo_sku: promo.c, nome: (promo.n || '').trim() || promo.c, categoria: promo.familia ?? null };
+    produtos.push(novo);
+    return { rows: [{ id: novo.id }] };
+  }
+  if (s.includes('/* RELATORIO-OFICIAL:ZERAR-DATA */')) {
+    delete configuracoes[params[0]];
+    return { rows: [], rowCount: 1 };
+  }
+  if (s.includes('/* CATALOGO-PRECOS:CONFERIR-REMOCAO */')) {
+    return { rows: [{ total: catalogoPrecos.length, sairiam: catalogoPrecos.filter(p => !params[0].includes(p.codigo_sku)).length }] };
+  }
+  if (s.includes('INSERT INTO CATALOGO_PRECOS')) {
+    const [cods, nomes, embs, ncms, ipis, familias, fixos, canaisFx, precos, semImposto] = params;
+    cods.forEach((c, i) => {
+      const linha = { codigo_sku: c, nome: nomes[i], emb: embs[i], ncm: ncms[i], ipi: ipis[i], familia: familias[i], preco_fixo: fixos[i],
+        canais_fx: JSON.parse(canaisFx[i]), precos: JSON.parse(precos[i]), precos_sem_imposto: JSON.parse(semImposto[i]) };
+      const j = catalogoPrecos.findIndex(p => p.codigo_sku === c);
+      if (j === -1) catalogoPrecos.push(linha); else catalogoPrecos[j] = linha;
+    });
+    return { rows: [] };
+  }
+  if (s.startsWith('DELETE FROM CATALOGO_PRECOS WHERE CODIGO_SKU <> ALL')) {
+    const removidos = catalogoPrecos.filter(p => !params[0].includes(p.codigo_sku));
+    catalogoPrecos = catalogoPrecos.filter(p => params[0].includes(p.codigo_sku));
+    return { rows: removidos.map(p => ({ codigo_sku: p.codigo_sku })), rowCount: removidos.length };
+  }
+
+  // Novidades / avisos no celular - routes/lib/novidades.js e routes/novidades.js
+  if (s.includes('/* NOVIDADES:RECENTE */')) {
+    const limite = Date.now() - Number(params[1]) * 60000;
+    const n = novidades.filter(x => x.tipo === params[0] && x.atualizado_em.getTime() > limite)
+      .sort((a, b) => b.atualizado_em - a.atualizado_em)[0];
+    return { rows: n ? [{ id: n.id }] : [] };
+  }
+  if (s.includes('/* NOVIDADES:ATUALIZAR */')) {
+    const n = novidades.find(x => x.id === params[0]);
+    if (n) Object.assign(n, { texto: params[1], atualizado_em: new Date(), push_pendente: true, push_enviar_em: new Date(params[2]) });
+    return { rows: [], rowCount: n ? 1 : 0 };
+  }
+  if (s.includes('/* NOVIDADES:INSERIR */')) {
+    const agora = new Date();
+    const n = { id: nextNovidadeId++, tipo: params[0], titulo: params[1], texto: params[2], criado_em: agora, atualizado_em: agora,
+      push_enviar_em: new Date(params[3]), push_pendente: true, push_enviado_em: null };
+    novidades.push(n);
+    return { rows: [{ id: n.id }] };
+  }
+  if (s.includes('/* NOVIDADES:SUBSTITUIR-PENDENTES */')) {
+    let n = 0;
+    novidades.forEach(x => { if (x.tipo === params[0] && x.push_pendente && x.id !== params[1]) { x.push_pendente = false; n++; } });
+    return { rows: [], rowCount: n };
+  }
+  if (s.includes('/* NOVIDADES:RESERVAR-PUSH */')) {
+    const agora = new Date();
+    const prontas = novidades.filter(n => n.push_pendente && n.push_enviar_em <= agora);
+    prontas.forEach(n => { n.push_pendente = false; n.push_enviado_em = agora; });
+    return { rows: prontas.map(n => ({ id: n.id, tipo: n.tipo, titulo: n.titulo, texto: n.texto })) };
+  }
+  if (s.includes('/* NOVIDADES:LISTA */')) {
+    const limite = Date.now() - Number(params[0]) * 86400000;
+    return { rows: novidades.filter(n => n.atualizado_em.getTime() > limite)
+      .sort((a, b) => b.atualizado_em - a.atualizado_em).slice(0, Number(params[1]))
+      .map(n => ({ id: n.id, tipo: n.tipo, titulo: n.titulo, texto: n.texto, criado_em: n.criado_em, atualizado_em: n.atualizado_em })) };
+  }
+  if (s.includes('/* NOVIDADES:VISTAS */')) {
+    const u = usuarios.find(x => x.id === params[0]);
+    return { rows: u ? [{ novidades_vistas_ate: u.novidades_vistas_ate || null }] : [] };
+  }
+  if (s.includes('/* NOVIDADES:MARCAR-VISTAS */')) {
+    const u = usuarios.find(x => x.id === params[0]);
+    if (!u) return { rows: [] };
+    const nova = new Date(params[1]);
+    if (!u.novidades_vistas_ate || nova > u.novidades_vistas_ate) u.novidades_vistas_ate = nova;
+    return { rows: [{ novidades_vistas_ate: u.novidades_vistas_ate }] };
+  }
+  if (s.includes('/* NOVIDADES:PEDIDOS-ATE */')) {
+    const datas = pedidosOficiaisItens.map(it => it.data_implantacao).filter(Boolean).map(d => String(d).slice(0, 10)).sort();
+    return { rows: [{ ate: datas.length ? datas[datas.length - 1] : null }] };
+  }
+  if (s.includes('/* PUSH:INSCREVER */')) {
+    const atual = pushInscricoes.find(i => i.endpoint === params[1]);
+    if (atual) Object.assign(atual, { usuario_id: params[0], p256dh: params[2], auth: params[3] });
+    else pushInscricoes.push({ id: nextPushId++, usuario_id: params[0], endpoint: params[1], p256dh: params[2], auth: params[3] });
+    return { rows: [] };
+  }
+  if (s.includes('/* PUSH:CANCELAR */')) {
+    const antes = pushInscricoes.length;
+    pushInscricoes = pushInscricoes.filter(i => !(i.endpoint === params[0] && i.usuario_id === params[1]));
+    return { rows: [], rowCount: antes - pushInscricoes.length };
+  }
+  if (s.includes('/* PUSH:INSCRICOES-USUARIO */')) {
+    return { rows: pushInscricoes.filter(i => i.usuario_id === params[0]) };
+  }
+  if (s.includes('/* PUSH:INSCRICOES */')) {
+    return { rows: pushInscricoes.slice() };
+  }
+  if (s.includes('/* PUSH:ENVIADO */')) {
+    const i = pushInscricoes.find(x => x.id === params[0]);
+    if (i) i.ultimo_envio_em = new Date();
+    return { rows: [] };
+  }
+  if (s.includes('/* PUSH:APAGAR */')) {
+    pushInscricoes = pushInscricoes.filter(i => i.id !== params[0]);
+    return { rows: [] };
+  }
+
+  // GET /api/pedidos/salvos (routes/pedidos.js) - pedidos do app do próprio
+  // usuário, com os itens e os dados do cliente, mais recente primeiro
+  if (s.includes("WHERE PED.ORIGEM = 'APP' AND PED.USUARIO_ID = $1")) {
+    const limite = Date.now() - params[1] * 86400000;
+    const quando = (p) => new Date(p.atualizado_em || p.data_pedido).getTime();
+    return { rows: pedidos
+      .filter(p => p.origem === 'app' && p.usuario_id === params[0] && quando(p) >= limite)
+      .sort((a, b) => quando(b) - quando(a))
+      .slice(0, params[2])
+      .map(p => {
+        const c = clientes.find(x => String(x.id) === String(p.cliente_id)) || {};
+        return {
+          id: p.id, data_pedido: p.data_pedido, atualizado_em: p.atualizado_em || null, id_envio: p.id_envio || null,
+          contexto: p.contexto ? JSON.parse(p.contexto) : null,
+          cliente_id: c.id, cliente_nome: c.nome, cliente_documento: c.documento || null,
+          classificatorio_tipo: c.classificatorio_tipo || null, classificatorio_desconto: c.classificatorio_desconto ?? null,
+          codigo_oficial: c.codigo_oficial || null,
+          itens: pedidoItens.filter(i => String(i.pedido_id) === String(p.id)).map(i => ({
+            codigo_sku: (produtos.find(pr => pr.id === i.produto_id) || {}).codigo_sku,
+            quantidade: i.quantidade, preco_unitario: i.preco_unitario,
+          })),
+        };
+      })
+      .filter(p => p.itens.length > 0) };
+  }
+  // PATCH /api/pedidos/:id: pedido travado pra edição...
+  if (s.includes('SELECT ID, CLIENTE_ID, ORIGEM, USUARIO_ID, DATA_PEDIDO, ATUALIZADO_EM, VERSAO_APP, CONTEXTO FROM PEDIDOS WHERE ID = $1 FOR UPDATE')) {
+    return { rows: pedidos.filter(p => String(p.id) === String(params[0]))
+      .map(p => ({ id: p.id, cliente_id: p.cliente_id, origem: p.origem, usuario_id: p.usuario_id, data_pedido: p.data_pedido, atualizado_em: p.atualizado_em || null, versao_app: p.versao_app || null, contexto: p.contexto ? JSON.parse(p.contexto) : null })) };
+  }
+  // itens do pedido com o código (POST com o mesmo id_envio: os itens mudaram?)
+  if (s.includes('/* ITENS-DO-PEDIDO */')) {
+    return { rows: pedidoItens.filter(i => String(i.pedido_id) === String(params[0])).map(i => {
+      const prod = produtos.find(p => p.id === i.produto_id);
+      return { codigo_sku: prod ? prod.codigo_sku : null, quantidade: i.quantidade, preco_unitario: i.preco_unitario };
+    }) };
+  }
+  // reenvio com os mesmos itens: a versão gravada só sobe (GREATEST ignora NULL)
+  if (s.includes('/* VERSAO-APP */')) {
+    const p = pedidos.find(x => String(x.id) === String(params[1]));
+    if (p && (!p.versao_app || new Date(params[0]) > new Date(p.versao_app))) p.versao_app = new Date(params[0]).toISOString();
+    return { rows: [] };
+  }
+  // POST com o mesmo id_envio e itens novos: cabeçalho da alteração
+  if (s.includes('UPDATE PEDIDOS SET CONTEXTO = $1::JSONB, ATUALIZADO_EM = COALESCE($2::TIMESTAMPTZ, NOW())')) {
+    const p = pedidos.find(x => String(x.id) === String(params[4]));
+    if (!p) return { rows: [] };
+    p.contexto = params[0];
+    p.atualizado_em = params[1] ? new Date(params[1]).toISOString() : new Date().toISOString();
+    if (params[2] != null) p.vendedor_id = params[2];
+    if (params[3]) p.versao_app = params[3];
+    return { rows: [] };
+  }
+  // ...e a atualização do cabeçalho (itens são trocados pelo DELETE/INSERT de pedido_itens)
+  if (s.includes('UPDATE PEDIDOS SET CONTEXTO = $1::JSONB, ATUALIZADO_EM = COALESCE($5::TIMESTAMPTZ, NOW())')) {
+    const p = pedidos.find(x => String(x.id) === String(params[3]));
+    if (!p) return { rows: [] };
+    p.contexto = params[0];
+    p.atualizado_em = params[4] ? new Date(params[4]).toISOString() : new Date().toISOString();
+    if (params[1] != null) p.vendedor_id = params[1];
+    if (params[2] != null) p.observacao = params[2];
+    if (params[5]) p.versao_app = params[5];
+    return { rows: [{ id: p.id, cliente_id: p.cliente_id, data_pedido: p.data_pedido, atualizado_em: p.atualizado_em }] };
+  }
+
+  // Pedidos à vista aguardando pagamento (routes/pedidosOficiais.js) - no
+  // topo porque os casos genéricos de INSERT INTO PEDIDOS / FROM
+  // PEDIDOS_OFICIAIS_ITENS POI mais abaixo também casariam com estes SQLs.
+  if (s.startsWith('DELETE FROM TITULOS_AVISTA_PENDENTES')) {
+    titulosAvistaPendentes = [];
+    return { rows: [] };
+  }
+  if (s.startsWith('INSERT INTO TITULOS_AVISTA_PENDENTES')) {
+    const [tits, parcs, clis, nomes, vencs, valores] = params;
+    tits.forEach((t, i) => titulosAvistaPendentes.push({
+      titulo: t, parcela: parcs[i], cliente_codigo_oficial: clis[i], cliente_nome: nomes[i], vencimento: vencs[i], valor: valores[i],
+    }));
+    return { rows: [] };
+  }
+  if (s.includes('FROM TITULOS_AVISTA_PENDENTES TAP')) {
+    const cod = params[0];
+    return { rows: titulosAvistaPendentes
+      .filter(t => t.cliente_codigo_oficial === cod
+        || pedidosOficiaisItens.some(it => it.nota_fiscal === t.titulo && it.cliente_codigo_oficial === cod))
+      .map(t => ({ titulo: t.titulo, parcela: t.parcela, vencimento: t.vencimento, valor: t.valor })) };
+  }
+  if (s.startsWith('DELETE FROM PEDIDOS_PENDENTES_PAGAMENTO')) {
+    pedidosPendentesPagamento = [];
+    return { rows: [] };
+  }
+  if (s.startsWith('INSERT INTO PEDIDOS_PENDENTES_PAGAMENTO')) {
+    const [nrs, clis, nomes, valores, datas] = params;
+    nrs.forEach((nr, i) => pedidosPendentesPagamento.push({
+      nr_pedido: nr, cliente_codigo_oficial: clis[i], cliente_nome: nomes[i], valor: valores[i], data_implantacao: datas[i],
+    }));
+    return { rows: [] };
+  }
+  if (s.includes('FROM PEDIDOS_PENDENTES_PAGAMENTO PPP')) {
+    const cod = params[0];
+    return { rows: pedidosPendentesPagamento
+      .filter(p => p.cliente_codigo_oficial === cod
+        || pedidosOficiaisItens.some(it => it.nr_pedido === p.nr_pedido && it.cliente_codigo_oficial === cod))
+      .map(p => ({ nr_pedido: p.nr_pedido, valor: p.valor, data_implantacao: p.data_implantacao })) };
+  }
+  // Pedidos oficiais de um cliente (GET /api/pedidos-oficiais/:clienteId).
+  if (s.includes('COALESCE(PR.NOME, POI.DESCRICAO) AS PRODUTO, POI.QUANTIDADE')) {
+    return { rows: pedidosOficiaisItens
+      .filter(it => it.cliente_codigo_oficial === params[0])
+      .map(it => {
+        const prod = produtos.find(p => p.codigo_sku === it.codigo_sku);
+        return { ...it, produto: prod ? prod.nome : (it.descricao || null) };
+      }) };
+  }
+
 
   // Sugestões de recompra (routes/relatorios.js) - última compra por SKU no
   // faturado oficial e nos pedidos do app.
@@ -84,7 +618,7 @@ async function query(sql, params = []) {
     for (const ped of pedidos.filter(p => String(p.cliente_id) === String(params[0]) && p.origem !== 'faturamento')) {
       for (const it of pedidoItens.filter(i => i.pedido_id === ped.id)) {
         const prod = produtos.find(p => p.id === it.produto_id);
-        if (prod) rows.push({ codigo_sku: prod.codigo_sku, data: new Date(ped.data_pedido).toISOString().slice(0, 10), pedido: 'app' + ped.id });
+        if (prod) rows.push({ codigo_sku: prod.codigo_sku, data: diaDoPedidoBr(ped.data_pedido), pedido: 'app' + ped.id });
       }
     }
     return { rows };
@@ -102,7 +636,7 @@ async function query(sql, params = []) {
     for (const ped of pedidos.filter(p => String(p.cliente_id) === String(params[0]) && p.origem !== 'faturamento')) {
       for (const it of pedidoItens.filter(i => i.pedido_id === ped.id)) {
         const prod = produtos.find(p => p.id === it.produto_id);
-        if (prod) rows.push({ codigo_sku: prod.codigo_sku, data: new Date(ped.data_pedido).toISOString().slice(0, 10), quantidade: it.quantidade, pedido: 'app' + ped.id });
+        if (prod) rows.push({ codigo_sku: prod.codigo_sku, data: diaDoPedidoBr(ped.data_pedido), quantidade: it.quantidade, pedido: 'app' + ped.id });
       }
     }
     return { rows };
@@ -126,7 +660,7 @@ async function query(sql, params = []) {
     const rows = [];
     for (const l of levantamentos.filter(l => String(l.cliente_id) === String(params[0]))) {
       for (const li of levantamentoItens.filter(i => i.levantamento_id === l.id && String(i.produto_id) === String(params[1]))) {
-        rows.push({ data_visita: l.data_visita, quantidade_contada: li.quantidade_contada });
+        rows.push({ data_visita: l.data_visita, quantidade_contada: li.quantidade_contada, dia_visita: DIA_BR.format(new Date(l.data_visita)) });
       }
     }
     return { rows: rows.sort((a, b) => new Date(a.data_visita) - new Date(b.data_visita)) };
@@ -138,19 +672,325 @@ async function query(sql, params = []) {
     return { rows: produtos.filter(p => String(p.id) === String(params[0])).map(p => ({ codigo_sku: p.codigo_sku })) };
   }
 
-  if (s.includes('/* COMPRADOS-RECENTES:OFICIAL */')) {
-    const limite = Date.now() - Number(params[1]) * 86400000;
+  // Inadimplência - routes/inadimplencia.js
+  if (s.includes('/* INADIMPLENCIA:META */')) {
+    const c = configuracoes[params[0]];
+    return { rows: c ? [{ valor: c.valor }] : [] };
+  }
+  if (s.includes('/* INADIMPLENCIA:GRAVAR-META */')) {
+    configuracoes[params[0]] = { valor: JSON.parse(params[1]), atualizado_em: new Date().toISOString() };
+    return { rows: [] };
+  }
+  // Fotos dos produtos - routes/produtoFotos.js
+  if (s.includes('/* FOTOS:LISTA */')) {
+    return { rows: Object.entries(produtoFotos).map(([codigo_sku, f]) => ({ codigo_sku, versao: String(f.versao) })) };
+  }
+  if (s.includes('/* FOTOS:VARIACOES */')) {
+    return { rows: produtos.map(p => ({ codigo_sku: p.codigo_sku, nome: p.nome, tem_foto: !!produtoFotos[p.codigo_sku] })) };
+  }
+  if (s.includes('/* FOTOS:IMAGEM */')) {
+    const f = produtoFotos[params[0]];
+    return { rows: f ? [{ imagem: f.imagem }] : [] };
+  }
+  if (s.includes('/* FOTOS:PRODUTOS */')) {
+    return { rows: produtos.filter(p => params[0].includes(p.codigo_sku)).map(p => ({ codigo_sku: p.codigo_sku, nome: p.nome })) };
+  }
+  if (s.includes('/* FOTOS:GRAVAR */')) {
+    const [sku, imagem, tamanho] = params;
+    produtoFotosRelogio += 1000;
+    produtoFotos[sku] = { imagem, tamanho, versao: produtoFotosRelogio };
+    return { rows: [{ versao: String(produtoFotosRelogio) }] };
+  }
+  if (s.includes('/* FOTOS:VARIACOES_GRAVAR */')) {
+    const [skus, imagem, tamanho] = params;
+    const novas = skus.filter(c => !produtoFotos[c]);
+    novas.forEach(c => { produtoFotos[c] = { imagem, tamanho, versao: produtoFotosRelogio }; });
+    return { rows: novas.map(codigo_sku => ({ codigo_sku })) };
+  }
+  if (s.includes('/* FOTOS:MINIATURAS */')) {
+    return { rows: params[0].filter(c => produtoFotos[c]).map(c => ({ codigo_sku: c, versao: String(produtoFotos[c].versao), miniatura: produtoFotos[c].miniatura || null })) };
+  }
+  if (s.includes('/* FOTOS:IMAGEM_PRA_MINI */')) {
+    const f = produtoFotos[params[0]];
+    return { rows: f && String(f.versao) === String(params[1]) ? [{ imagem: f.imagem }] : [] };
+  }
+  if (s.includes('/* FOTOS:MINIATURA_GRAVAR */')) {
+    const f = produtoFotos[params[0]];
+    if (f && String(f.versao) === String(params[2])) f.miniatura = params[1];
+    return { rows: [] };
+  }
+  if (s.includes('/* FOTOS:APAGAR */')) { delete produtoFotos[params[0]]; return { rows: [] }; }
+  if (s.includes('/* INADIMPLENCIA:TRAVA */')) return { rows: [] };
+  if (s.includes('/* INADIMPLENCIA:CLIENTES */')) {
+    return { rows: clientes.filter(c => c.codigo_oficial && params[0].includes(String(c.codigo_oficial))).map(c => ({ id: c.id, codigo_oficial: c.codigo_oficial })) };
+  }
+  if (s.includes('/* INADIMPLENCIA:LIMPAR */')) { titulosInadimplentes = []; return { rows: [] }; }
+  if (s.includes('/* INADIMPLENCIA:GRAVAR */')) {
+    const [data, tit, parc, cod, ids, nome, cidade, uf, emissao, venc, saldo, liq, terc] = params;
+    tit.forEach((t, i) => titulosInadimplentes.push({
+      titulo: t, parcela: parc[i], codigo_oficial: cod[i], cliente_id: ids[i], cliente_nome: nome[i], cidade: cidade[i], uf: uf[i],
+      emissao: emissao[i], vencimento: venc[i], saldo: saldo[i], valor_liquido: liq[i], cobranca_terceirizada: terc[i], data_relatorio: data,
+    }));
+    return { rows: [] };
+  }
+  if (s.includes('/* INADIMPLENCIA:TITULOS */')) {
+    return { rows: titulosInadimplentes.map(t => {
+      const c = clientes.find(x => x.id === t.cliente_id) || clientes.find(x => String(x.codigo_oficial) === String(t.codigo_oficial));
+      return { ...t, cliente_id: c ? c.id : null, nome: c ? c.nome : t.cliente_nome };
+    }).sort((a, b) => a.vencimento.localeCompare(b.vencimento) || a.titulo.localeCompare(b.titulo) || a.parcela.localeCompare(b.parcela)) };
+  }
+
+  // Registro de visita - routes/visitas.js
+  if (s.includes('/* VISITAS:CLIENTES */')) {
+    return { rows: clientes.map(c => ({ id: c.id, nome: c.nome, codigo_oficial: c.codigo_oficial || null, municipio: (clienteCnpjFicha[c.id] || {}).municipio || null })) };
+  }
+  if (s.includes('/* VISITAS:ULTIMAS */')) {
+    const por = new Map();
+    for (const l of levantamentos.filter(l => l.cliente_id != null && String(l.usuario_id) === String(params[0]))) {
+      const dia = new Date(l.data_visita).toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+      const v = por.get(l.cliente_id) || { cliente_id: l.cliente_id, dias: new Set() };
+      v.dias.add(dia);
+      por.set(l.cliente_id, v);
+    }
+    return { rows: [...por.values()].map(v => ({ cliente_id: v.cliente_id, ultima: [...v.dias].sort().pop(), total: v.dias.size })) };
+  }
+  if (s.includes('/* VISITAS:ULTIMA-OFICIAL */')) {
+    const ultima = new Map();
+    for (const it of pedidosOficiaisItens.filter(i => String(i.nr_pedido).length <= 6)) {
+      const d = String(it.data_implantacao || it.data_faturamento || '').slice(0, 10);
+      if (d && (!ultima.has(it.cliente_codigo_oficial) || d > ultima.get(it.cliente_codigo_oficial))) ultima.set(it.cliente_codigo_oficial, d);
+    }
+    return { rows: [...ultima].map(([codigo, u]) => ({ codigo, ultima: u })) };
+  }
+  if (s.includes('/* VISITAS:ULTIMA-APP */')) {
+    const ultima = new Map();
+    for (const ped of pedidos.filter(p => p.cliente_id != null && p.origem !== 'faturamento')) {
+      const d = diaDoPedidoBr(ped.data_pedido);
+      if (!ultima.has(ped.cliente_id) || d > ultima.get(ped.cliente_id)) ultima.set(ped.cliente_id, d);
+    }
+    return { rows: [...ultima].map(([cliente_id, u]) => ({ cliente_id, ultima: u })) };
+  }
+  if (s.includes('/* VISITAS:FAT-12M */')) {
+    const desde = diasAntes(new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' }), 365);
+    const total = new Map();
+    for (const it of pedidosOficiaisItens.filter(i => faturadoDeFato(i) && i.data_faturamento && String(i.data_faturamento).slice(0, 10) > desde)) {
+      total.set(it.cliente_codigo_oficial, (total.get(it.cliente_codigo_oficial) || 0) + Number(it.valor || 0));
+    }
+    return { rows: [...total].map(([codigo, t]) => ({ codigo, total: t })) };
+  }
+
+  // Relatório "Todas Contas" do Salesforce - routes/contasSalesforce.js
+  if (s.includes('/* CONTAS-SF:OUTROS */')) {
+    const rep = (c) => /^representante/i.test(String(c.classificatorio || '').trim());
+    return { rows: contasSalesforce.filter(c => (c.de_outro_vendedor || rep(c)) && c.cliente_id != null)
+      .map(c => ({ cliente_id: c.cliente_id, base: rep(c) ? 'Representação' : (c.base || c.proprietario) })) };
+  }
+  if (s.includes('/* CONTAS-SF:INATIVOS */')) {
+    return { rows: contasSalesforce.filter(c => c.cliente_id != null && c.situacao === 'Inativo').map(c => ({ cliente_id: c.cliente_id })) };
+  }
+  if (s.includes('/* CONTAS-SF:GESTORES */')) {
+    return { rows: [...new Set(Object.values(classificatorioErp).map(e => e.gestor).filter(Boolean))].map(gestor => ({ gestor })) };
+  }
+  if (s.includes('/* CONTAS-SF:TRAVA */')) return { rows: [] };
+  if (s.includes('/* CONTAS-SF:CLIENTES */')) {
+    return { rows: clientes.map(c => ({ id: c.id, nome: c.nome, codigo_oficial: c.codigo_oficial || null, documento: c.documento || null, doc: String(c.documento || '').replace(/\D/g, '') })) };
+  }
+  if (s.includes('/* CONTAS-SF:CODIGO */')) {
+    const c = clientes.find(x => String(x.id) === String(params[1]) && !x.codigo_oficial);
+    if (c) c.codigo_oficial = params[0];
+    return { rows: [], rowCount: c ? 1 : 0 };
+  }
+  if (s.includes('/* CONTAS-SF:DOCUMENTO */')) {
+    const c = clientes.find(x => String(x.id) === String(params[1]) && !x.documento);
+    if (c) c.documento = params[0];
+    return { rows: [], rowCount: c ? 1 : 0 };
+  }
+  if (s.includes('/* CONTAS-SF:CRIAR */')) {
+    const [nomes, docs, codigos, tipos, descontos, dia] = params;
+    const rows = [];
+    nomes.forEach((nome, i) => {
+      const doc = String(docs[i] || '').replace(/\D/g, '');
+      if (clientes.some(c => c.codigo_oficial === codigos[i] || (doc && String(c.documento || '').replace(/\D/g, '') === doc))) return;
+      const id = nextId.clientes++;
+      clientes.push({ id, nome, documento: docs[i], codigo_oficial: codigos[i], classificatorio_tipo: tipos[i], classificatorio_desconto: descontos[i], classificatorio_atualizado_em: tipos[i] ? dia : null });
+      rows.push({ id, codigo_oficial: codigos[i] });
+    });
+    return { rows };
+  }
+  if (s.includes('/* CONTAS-SF:LIMPAR */')) { contasSalesforce = []; return { rows: [] }; }
+  if (s.includes('/* CONTAS-SF:GRAVAR */')) {
+    const [data, codigos, ids, nomes, docs, donos, situacoes, deOutro, ultimas, cidades, ufs, telefones, emails, classis, transps, regioes, bases] = params;
+    codigos.forEach((codigo, i) => contasSalesforce.push({
+      codigo_oficial: codigo, cliente_id: ids[i], data_relatorio: data, nome: nomes[i], documento: docs[i], proprietario: donos[i],
+      situacao: situacoes[i], de_outro_vendedor: deOutro[i], ultima_compra: ultimas[i], cidade: cidades[i], uf: ufs[i],
+      telefone: telefones[i], email: emails[i], classificatorio: classis[i], transportadora: transps[i], regiao: regioes[i], base: bases[i],
+    }));
+    return { rows: [] };
+  }
+  if (s.includes('/* CONTAS-SF:ALVOS */')) {
+    const [desde, ids, donos, ultimas] = params;
+    ids.forEach((id, i) => {
+      if (!reativacaoAlvos.some(a => a.cliente_id === id)) reativacaoAlvos.push({ cliente_id: id, desde, proprietario: donos[i], ultima_compra_antes: ultimas[i] });
+    });
+    return { rows: [] };
+  }
+  if (s.includes('/* CONTAS-SF:GRAVAR-META */')) {
+    configuracoes[params[0]] = { valor: JSON.parse(params[1]), atualizado_em: new Date().toISOString() };
+    return { rows: [] };
+  }
+  if (s.includes('/* REATIVACAO:SALESFORCE */')) {
+    return { rows: contasSalesforce.filter(c => c.cliente_id != null).map(c => ({ ...c })) };
+  }
+  if (s.includes('/* REATIVACAO:RECUPERADOS */')) {
+    return { rows: reativacaoAlvos.map(a => {
+      const c = clientes.find(x => x.id === a.cliente_id);
+      if (!c) return null;
+      const oficiais = pedidosOficiaisItens.filter(p => c.codigo_oficial && p.cliente_codigo_oficial === c.codigo_oficial && String(p.nr_pedido).length <= 6
+        && String(p.data_implantacao || p.data_faturamento || '').slice(0, 10) >= a.desde);
+      const datas = oficiais.map(p => String(p.data_implantacao || p.data_faturamento).slice(0, 10)).sort();
+      const app = pedidos.filter(p => p.cliente_id === a.cliente_id && p.origem !== 'faturamento').map(p => diaDoPedidoBr(p.data_pedido)).filter(d => d >= a.desde).sort();
+      return { cliente_id: a.cliente_id, nome: c.nome, desde: a.desde, proprietario: a.proprietario,
+        primeira_oficial: datas[0] || null, valor: oficiais.length ? oficiais.reduce((t, p) => t + Number(p.valor || 0), 0) : null, primeira_app: app[0] || null };
+    }).filter(Boolean) };
+  }
+
+  // Para reativar - routes/reativacao.js
+  if (s.includes('/* REATIVACAO:META */')) {
+    const c = configuracoes[params[0]];
+    return { rows: c ? [{ valor: c.valor }] : [] };
+  }
+  if (s.includes('/* REATIVACAO:GRAVAR-META */')) {
+    configuracoes[params[0]] = { valor: JSON.parse(params[1]), atualizado_em: new Date().toISOString() };
+    return { rows: [] };
+  }
+  if (s.includes('/* REATIVACAO:CLIENTES-IMPORT */')) {
+    return { rows: clientes.map(c => ({ id: c.id, codigo_oficial: c.codigo_oficial || null, doc: String(c.documento || '').replace(/\D/g, '') })) };
+  }
+  if (s.includes('/* REATIVACAO:CODIGO-PELO-CNPJ */')) {
+    const c = clientes.find(x => String(x.id) === String(params[1]) && !x.codigo_oficial);
+    if (c) c.codigo_oficial = params[0];
+    return { rows: [], rowCount: c ? 1 : 0 };
+  }
+  if (s.includes('/* REATIVACAO:TRAVA */')) return { rows: [] };
+  if (s.includes('/* REATIVACAO:LIMPAR */')) { clientesSemCompra = []; return { rows: [] }; }
+  if (s.includes('/* REATIVACAO:GRAVAR */')) {
+    const [data, codigos, ids, meses, mes, fat, grupo, matriz, telefone, cidade, uf, gestor] = params;
+    codigos.forEach((codigo, i) => clientesSemCompra.push({
+      codigo_oficial: codigo, cliente_id: ids[i], data_relatorio: data, meses_sem_compra: meses[i], mes_ultima_compra: mes[i],
+      fat_12m: fat[i], grupo: grupo[i], matriz: matriz[i], telefone: telefone[i], cidade: cidade[i], uf: uf[i], gestor: gestor[i],
+    }));
+    return { rows: [] };
+  }
+  if (s.includes('/* REATIVACAO:CLIENTES */')) {
+    return { rows: clientes.map(c => {
+      const f = clienteCnpjFicha[c.id] || {};
+      return { id: c.id, nome: c.nome, documento: c.documento, codigo_oficial: c.codigo_oficial || null, classificatorio_tipo: c.classificatorio_tipo || null, municipio: f.municipio || null, uf: f.uf || null };
+    }) };
+  }
+  if (s.includes('/* REATIVACAO:FOTO */')) {
+    return { rows: clientesSemCompra.filter(l => l.cliente_id != null).map(l => ({ ...l, mes: String(l.mes_ultima_compra).slice(0, 7) })) };
+  }
+  if (s.includes('/* REATIVACAO:ULTIMA-OFICIAL */')) {
+    const ultima = new Map();
+    for (const it of pedidosOficiaisItens.filter(i => String(i.nr_pedido).length <= 6)) {
+      const d = String(it.data_implantacao || it.data_faturamento || '').slice(0, 10);
+      if (d && (!ultima.has(it.cliente_codigo_oficial) || d > ultima.get(it.cliente_codigo_oficial))) ultima.set(it.cliente_codigo_oficial, d);
+    }
+    return { rows: [...ultima].map(([codigo, u]) => ({ codigo, ultima: u })) };
+  }
+  if (s.includes('/* REATIVACAO:ULTIMA-APP */')) {
+    const ultima = new Map();
+    for (const ped of pedidos.filter(p => p.cliente_id != null && p.origem !== 'faturamento')) {
+      const d = diaDoPedidoBr(ped.data_pedido);
+      if (!ultima.has(ped.cliente_id) || d > ultima.get(ped.cliente_id)) ultima.set(ped.cliente_id, d);
+    }
+    return { rows: [...ultima].map(([cliente_id, u]) => ({ cliente_id, ultima: u })) };
+  }
+  if (s.includes('/* REATIVACAO:FAT-ULTIMO-ANO */')) {
+    const fat = pedidosOficiaisItens.filter(it => faturadoDeFato(it) && it.data_faturamento);
+    const ultima = new Map();
+    for (const it of fat) { const d = String(it.data_faturamento).slice(0, 10); if (!ultima.has(it.cliente_codigo_oficial) || d > ultima.get(it.cliente_codigo_oficial)) ultima.set(it.cliente_codigo_oficial, d); }
+    const total = new Map();
+    for (const it of fat) {
+      if (String(it.data_faturamento).slice(0, 10) > diasAntes(ultima.get(it.cliente_codigo_oficial), 365)) {
+        total.set(it.cliente_codigo_oficial, (total.get(it.cliente_codigo_oficial) || 0) + Number(it.valor || 0));
+      }
+    }
+    return { rows: [...total].map(([codigo, t]) => ({ codigo, total: t })) };
+  }
+  if (s.includes('/* REATIVACAO:ADIAMENTOS */')) {
+    return { rows: reativacaoAdiamentos.map(a => ({ ...a })) };
+  }
+  if (s.includes('/* REATIVACAO:CLIENTE-EXISTE */')) {
+    return { rows: clientes.filter(c => String(c.id) === String(params[0])).map(c => ({ id: c.id })) };
+  }
+  if (s.includes('/* REATIVACAO:ADIAR */')) {
+    const [clienteId, tipo, desde, ate, usuarioId] = params;
+    const atual = reativacaoAdiamentos.find(a => String(a.cliente_id) === String(clienteId));
+    if (!atual) {
+      reativacaoAdiamentos.push({ cliente_id: Number(clienteId), tipo, desde, ate, usuario_id: usuarioId });
+      return { rows: [{ tipo, ate }] };
+    }
+    if (atual.tipo === 'nao_reativar' && tipo === 'ja_falei' && desde <= atual.desde) { /* mantém */ }
+    else if (tipo === 'nao_reativar') Object.assign(atual, { tipo, desde, ate: null });
+    else Object.assign(atual, { tipo, desde, ate: atual.ate && atual.ate > ate ? atual.ate : ate });
+    atual.usuario_id = usuarioId;
+    return { rows: [{ tipo: atual.tipo, ate: atual.ate }] };
+  }
+
+  // Recompra da semana - routes/recompra.js
+  if (s.includes('/* RECOMPRA:CLIENTES */')) {
+    return { rows: clientes.map(c => ({ id: c.id, nome: c.nome, documento: c.documento, codigo_oficial: c.codigo_oficial || null, classificatorio_tipo: c.classificatorio_tipo || null })) };
+  }
+  if (s.includes('/* RECOMPRA:OFICIAL */')) {
+    const inicio = new Date(`${params[0]}T00:00:00Z`).getTime() - Number(params[1]) * 86400000;
     return { rows: pedidosOficiaisItens
-      .filter(it => it.status === 'faturado' && it.cliente_codigo_oficial === params[0] && it.data_faturamento && new Date(it.data_faturamento).getTime() > limite)
+      .map(it => ({ it, data: it.data_implantacao || it.data_faturamento }))
+      .filter(({ it, data }) => data && new Date(`${String(data).slice(0, 10)}T00:00:00Z`).getTime() > inicio && String(it.nr_pedido).length <= 6)
+      .map(({ it, data }) => ({ cliente_codigo_oficial: it.cliente_codigo_oficial, codigo_sku: it.codigo_sku, quantidade: it.quantidade, data, data_faturamento: it.data_faturamento || null })) };
+  }
+  if (s.includes('/* RECOMPRA:APP */')) {
+    const inicio = diasAntes(params[0], Number(params[1]));
+    const rows = [];
+    for (const ped of pedidos.filter(p => p.cliente_id != null && diaDoPedidoBr(p.data_pedido) > inicio && p.origem !== 'faturamento')) {
+      for (const it of pedidoItens.filter(i => i.pedido_id === ped.id)) {
+        const prod = produtos.find(p => p.id === it.produto_id);
+        if (prod) rows.push({ cliente_id: ped.cliente_id, codigo_sku: prod.codigo_sku, quantidade: it.quantidade, data: diaDoPedidoBr(ped.data_pedido) });
+      }
+    }
+    return { rows };
+  }
+  if (s.includes('/* RECOMPRA:ADIAMENTOS */')) {
+    return { rows: recompraAdiamentos.filter(a => a.ate >= params[0]).map(a => ({ cliente_id: a.cliente_id, ate: a.ate })) };
+  }
+  if (s.includes('/* RECOMPRA:DADOS-ATE */')) {
+    const datas = pedidosOficiaisItens.map(it => it.data_implantacao).filter(Boolean).map(d => String(d).slice(0, 10)).sort();
+    return { rows: [{ ate: datas.length ? datas[datas.length - 1] : null }] };
+  }
+  if (s.includes('/* RECOMPRA:ADIAR */')) {
+    const [clienteId, ate, usuarioId] = params;
+    const atual = recompraAdiamentos.find(a => String(a.cliente_id) === String(clienteId));
+    if (atual) { atual.ate = atual.ate > ate ? atual.ate : ate; atual.usuario_id = usuarioId; return { rows: [{ ate: atual.ate }] }; }
+    recompraAdiamentos.push({ cliente_id: Number(clienteId), ate, usuario_id: usuarioId });
+    return { rows: [{ ate }] };
+  }
+  if (s.startsWith('SELECT ID FROM CLIENTES WHERE ID = $1')) {
+    return { rows: clientes.filter(c => String(c.id) === String(params[0])).map(c => ({ id: c.id })) };
+  }
+
+  if (s.includes('/* COMPRADOS-RECENTES:OFICIAL */')) {
+    const limite = diasAntes(hojeBr(), Number(params[1]));
+    return { rows: pedidosOficiaisItens
+      .filter(it => it.status === 'faturado' && it.cliente_codigo_oficial === params[0] && it.data_faturamento && String(it.data_faturamento).slice(0, 10) > limite)
       .map(it => ({ codigo_sku: it.codigo_sku, data: it.data_faturamento, quantidade: it.quantidade, pedido: it.nr_pedido })) };
   }
   if (s.includes('/* COMPRADOS-RECENTES:APP */')) {
-    const limite = Date.now() - Number(params[1]) * 86400000;
+    const limite = diasAntes(hojeBr(), Number(params[1]));
     const rows = [];
-    for (const ped of pedidos.filter(p => String(p.cliente_id) === String(params[0]) && new Date(p.data_pedido).getTime() > limite && p.origem !== 'faturamento')) {
+    for (const ped of pedidos.filter(p => String(p.cliente_id) === String(params[0]) && diaDoPedidoBr(p.data_pedido) > limite && p.origem !== 'faturamento')) {
       for (const it of pedidoItens.filter(i => i.pedido_id === ped.id)) {
         const prod = produtos.find(p => p.id === it.produto_id);
-        if (prod) rows.push({ codigo_sku: prod.codigo_sku, data: new Date(ped.data_pedido), quantidade: it.quantidade, pedido: 'app' + ped.id });
+        if (prod) rows.push({ codigo_sku: prod.codigo_sku, data: diaDoPedidoBr(ped.data_pedido), quantidade: it.quantidade, pedido: 'app' + ped.id });
       }
     }
     return { rows };
@@ -177,7 +1017,7 @@ async function query(sql, params = []) {
       const ped = pedidos.find(p => p.id === it.pedido_id && p.origem !== 'faturamento');
       const c = ped && clientes.find(cl => String(cl.id) === String(ped.cliente_id));
       if (prod && c && params[0].includes(prod.codigo_sku)) {
-        rows.push({ id: c.id, nome: c.nome, documento: c.documento, quantidade: it.quantidade, data: new Date(ped.data_pedido).toISOString().slice(0, 10) });
+        rows.push({ id: c.id, nome: c.nome, documento: c.documento, quantidade: it.quantidade, data: diaDoPedidoBr(ped.data_pedido) });
       }
     }
     return { rows };
@@ -254,6 +1094,14 @@ async function query(sql, params = []) {
     clientes.push(c);
     return { rows: [s.includes('RETURNING *') ? c : { id: c.id }] };
   }
+  // GET /api/clientes?busca= (routes/clientes.js): carteira inteira com nome
+  // fantasia/cidade da ficha; a ordem pela busca é feita em memória na rota.
+  if (s.includes('/* CLIENTES:BUSCA */')) {
+    return { rows: clientes.map(c => {
+      const f = clienteCnpjFicha[c.id] || {};
+      return { classificatorio_tipo: null, classificatorio_desconto: null, ...c, nome_fantasia: f.nome_fantasia || null, municipio: f.municipio || null, uf: f.uf || null };
+    }) };
+  }
   if (s.includes('SELECT ID, NOME, DOCUMENTO, CONTATO, CLASSIFICATORIO_TIPO, CLASSIFICATORIO_DESCONTO')) {
     const busca = params[0] ? params[0].replace(/%/g, '').toUpperCase() : null;
     const found = busca
@@ -268,14 +1116,79 @@ async function query(sql, params = []) {
     const c = clientes.find(x => x.id == params[0]);
     return { rows: c ? [{ matriz_grupo: c.matriz_grupo || null }] : [] };
   }
+  // correção do documento pelo admin (routes/clientes.js PATCH /:id/documento)
+  if (s.startsWith('UPDATE CLIENTES SET DOCUMENTO = $1 WHERE ID = $2')) {
+    const [documento, id] = params;
+    if (clientes.some(c => c.documento === documento && Number(c.id) !== Number(id))) {
+      const err = new Error('duplicate key value violates unique constraint'); err.code = '23505'; throw err;
+    }
+    const c = clientes.find(x => Number(x.id) === Number(id));
+    if (!c) return { rows: [] };
+    c.documento = documento;
+    return { rows: [{ nome: c.nome }] };
+  }
   if (s.startsWith('UPDATE CLIENTES SET MATRIZ_GRUPO')) {
     const [matrizGrupo, id] = params;
     const c = clientes.find(x => Number(x.id) === Number(id));
     if (c) c.matriz_grupo = matrizGrupo;
     return { rows: c ? [{ nome: c.nome }] : [] };
   }
-  if (s.includes('SELECT ID, NOME, DOCUMENTO, CODIGO_OFICIAL FROM CLIENTES')) {
-    return { rows: clientes.map(c => ({ id: c.id, nome: c.nome, documento: c.documento, codigo_oficial: c.codigo_oficial || null })) };
+  if (s.includes('AS CANCELAMENTOS FROM CLIENTES C')) {
+    const regime = (brutos) => {
+      if (!brutos) return null;
+      if (brutos.mei && brutos.mei.optante === true) return 'mei';
+      if (brutos.simples && brutos.simples.optante === true) return 'simples';
+      if (brutos.simples && brutos.simples.optante === false) return 'normal';
+      return null;
+    };
+    return { rows: clientes.map(c => ({
+      id: c.id, nome: c.nome, documento: c.documento, codigo_oficial: c.codigo_oficial || null,
+      nome_arquivo: c.nome_arquivo || null, nome_arquivo_em: c.nome_arquivo_em || null,
+      classificatorio_tipo: c.classificatorio_tipo || null,
+      classificatorio_desconto: c.classificatorio_desconto == null ? null : String(c.classificatorio_desconto),
+      whatsapp_comprador: c.whatsapp_comprador || null, whatsapp_comprador_nome: c.whatsapp_comprador_nome || null,
+      whatsapp_comprador_em: c.whatsapp_comprador_em || null,
+      telefone_ficha: (clienteCnpjFicha[c.id] && clienteCnpjFicha[c.id].telefone) || null,
+      devedor_contumaz: (() => {
+        const d = clienteCnpjFicha[c.id] && clienteCnpjFicha[c.id].dados_brutos && clienteCnpjFicha[c.id].dados_brutos.devedorContumaz;
+        return d && String(d.consta) === 'true' ? (d.conferidoEm || 'sim') : null;
+      })(),
+      telefone_comercial: c.telefone_comercial || null, email_comercial: c.email_comercial || null,
+      email_nfe: c.email_nfe || null, contatos_em: c.contatos_em || null,
+      email_ficha: (clienteCnpjFicha[c.id] && clienteCnpjFicha[c.id].email) || null,
+      nome_fantasia: (clienteCnpjFicha[c.id] && clienteCnpjFicha[c.id].nome_fantasia) || null,
+      regime_tributario: regime(clienteCnpjFicha[c.id] && clienteCnpjFicha[c.id].dados_brutos),
+      latitude: c.latitude == null ? null : String(c.latitude),
+      longitude: c.longitude == null ? null : String(c.longitude),
+      endereco: (() => {
+        const f = clienteCnpjFicha[c.id];
+        if (!f) return null;
+        const bruto = (f.dados_brutos && f.dados_brutos.endereco) || {};
+        return {
+          tipo: bruto.tipoLogradouro || null, logradouro: f.logradouro || null, numero: f.numero || null,
+          municipio: f.municipio || null, uf: f.uf || null,
+        };
+      })(),
+      // posição pelo endereço só vale com o mesmo endereço da ficha (chave de
+      // sqlChaveEndereco, routes/lib/geocodificacao.js)
+      ...(() => {
+        const g = clienteGeocodificacao[c.id], f = clienteCnpjFicha[c.id];
+        const vale = g && f && g.latitude != null && g.endereco === chaveEnderecoFicha(f);
+        return {
+          latitude_aprox: vale ? String(g.latitude) : null, longitude_aprox: vale ? String(g.longitude) : null,
+          localizacao_nivel: vale ? g.nivel : null,
+        };
+      })(),
+      bloqueados: (() => {
+        const l = bloqueiosAtivos().filter(b => c.codigo_oficial && b.cliente_codigo_oficial === c.codigo_oficial)
+          .map(b => ({ nr_pedido: b.nr_pedido, motivo: b.motivo, recebido_em: b.recebido_em }));
+        return l.length ? l : null;
+      })(),
+      cancelamentos: (() => {
+        const l = avisosCancelamentoAtivos().filter(a => c.codigo_oficial && a.cliente_codigo_oficial === c.codigo_oficial).map(camposAviso);
+        return l.length ? l : null;
+      })(),
+    })) };
   }
   if (s.includes('FROM CLIENTES WHERE ID = ANY')) {
     const ids = params[0].map(Number);
@@ -297,10 +1210,11 @@ async function query(sql, params = []) {
     return { rows: [] };
   }
   if (s.startsWith('UPDATE CLIENTES SET') && s.includes('DOCUMENTO = $2')) {
-    const [manterId, documento, contato, codigoOficial, classifTipo, classifDesconto, classifAtualizado] = params;
+    const [manterId, documento, contato, codigoOficial, matrizGrupo, pic, vlAcordo, classifTipo, classifDesconto, classifAtualizado] = params;
     const c = clientes.find(x => Number(x.id) === Number(manterId));
     if (c) {
       c.documento = documento; c.contato = contato; c.codigo_oficial = codigoOficial;
+      c.matriz_grupo = matrizGrupo; c.classificatorio_pic = pic; c.classificatorio_vl_acordo = vlAcordo;
       c.classificatorio_tipo = classifTipo; c.classificatorio_desconto = classifDesconto; c.classificatorio_atualizado_em = classifAtualizado;
     }
     return { rows: [] };
@@ -316,35 +1230,107 @@ async function query(sql, params = []) {
     return { rows: found.map(c => ({ id: c.id, codigo_oficial: c.codigo_oficial })) };
   }
   if (s.startsWith('UPDATE CLIENTES SET') && s.includes('CODIGO_OFICIAL = COALESCE')) {
-    const [codigoOficial, matrizGrupo, pic, vlAcordo, classifTipo, classifDesconto, id] = params;
-    const c = clientes.find(x => Number(x.id) === Number(id));
-    if (c) {
-      if (!c.codigo_oficial) c.codigo_oficial = codigoOficial;
-      c.matriz_grupo = matrizGrupo;
-      c.classificatorio_pic = pic;
-      c.classificatorio_vl_acordo = vlAcordo;
-      if (!c.classificatorio_tipo) c.classificatorio_tipo = classifTipo;
-      if (!c.classificatorio_desconto) c.classificatorio_desconto = classifDesconto;
-    }
+    aplicarLinhaClassificatorio(...params);
     return { rows: [] };
+  }
+  // importação da planilha Classificatório em lote (routes/clientesClassificatorio.js)
+  if (s.includes('/* CLASSIFICATORIO:CLIENTES */')) {
+    const [codigos, docs] = params;
+    return { rows: clientes.filter(c => (c.codigo_oficial && codigos.includes(c.codigo_oficial)) || (c.documento && docs.includes(String(c.documento).replace(/\D/g, ''))))
+      .sort((a, b) => a.id - b.id).map(c => ({ id: c.id, codigo_oficial: c.codigo_oficial || null, doc: c.documento == null ? null : String(c.documento).replace(/\D/g, '') })) };
+  }
+  if (s.includes('/* CLASSIFICATORIO:ATUALIZAR */')) {
+    const [dataRelatorio, ids, codigos, matrizes, pics, vls, tipos, descontos] = params;
+    ids.forEach((id, i) => aplicarLinhaClassificatorio(codigos[i], matrizes[i], pics[i], vls[i], tipos[i], descontos[i], id, dataRelatorio));
+    return { rows: [], rowCount: ids.length };
+  }
+  if (s.includes('/* CLASSIFICATORIO:FOTO */')) {
+    const [dataRelatorio, apuradoAte, ids, ...cols] = params;
+    ids.forEach((id, i) => fotoClassificatorio([id, dataRelatorio, apuradoAte, ...cols.map(col => col[i])]));
+    return { rows: [] };
+  }
+  if (s.startsWith('INSERT INTO CLIENTE_CLASSIFICATORIO_ERP')) {
+    fotoClassificatorio(params);
+    return { rows: [] };
+  }
+  // Conciliação ERP × app do status individual (vendas depois da apuração /
+  // que o ERP ainda conta e o app já tirou da janela de 12 meses)
+  if (s.includes('AS DEPOIS_12M')) {
+    const [id, apuradoAte] = params;
+    const cliente = clientes.find(c => Number(c.id) === Number(id));
+    const ehRede = s.includes("JOIN CLIENTES C2 ON C2.ID = C.ID JOIN");
+    const grupo = !cliente ? [] : (!ehRede && cliente.matriz_grupo ? clientes.filter(c => c.matriz_grupo === cliente.matriz_grupo) : [cliente]);
+    const codigos = grupo.map(c => c.codigo_oficial).filter(Boolean);
+    const itens = pedidosOficiaisItens.filter(it => codigos.includes(it.cliente_codigo_oficial) && faturadoDeFato(it) && it.data_faturamento);
+    const iso = d => d.toISOString().slice(0, 10);
+    const ap = new Date(apuradoAte + 'T00:00:00Z');
+    const inicioErp = iso(new Date(Date.UTC(ap.getUTCFullYear() - 1, ap.getUTCMonth(), ap.getUTCDate() + 1)));
+    const janela = inicioJanela12m();
+    const hoje = iso(new Date());
+    const inicioAno = `${hoje.slice(0, 4)}-01-01`;
+    const soma = f => itens.filter(f).reduce((acc, it) => acc + (Number(it.valor) || 0), 0);
+    const dJanela = new Date(janela + 'T00:00:00Z'); dJanela.setUTCDate(dJanela.getUTCDate() + 1);
+    return { rows: [{
+      depois_12m: String(soma(it => it.data_faturamento > apuradoAte && it.data_faturamento > janela)),
+      fora_janela_app: String(soma(it => it.data_faturamento >= inicioErp && it.data_faturamento <= janela)),
+      depois_ano: String(soma(it => it.data_faturamento > apuradoAte && it.data_faturamento >= inicioAno)),
+      inicio_erp: inicioErp, inicio_app: iso(dJanela), fim_fora_janela_app: janela, hoje,
+      mesmo_ano: apuradoAte.slice(0, 4) === hoje.slice(0, 4),
+    }] };
+  }
+  // Alertas em lote: foto do ERP + parte da matriz que vem de empresas fora do app
+  if (s.includes('AS FAT_12M_OUTRAS_EMPRESAS')) {
+    const rows = clientes.filter(c => c.classificatorio_tipo && classificatorioErp[c.id]).map(c => {
+      const e = classificatorioErp[c.id];
+      const soma = clientes
+        .filter(c2 => Number(c2.id) === Number(c.id) || (c.matriz_grupo && c2.matriz_grupo === c.matriz_grupo))
+        .map(c2 => classificatorioErp[c2.id])
+        .filter(e2 => e2 && e2.data_relatorio === e.data_relatorio)
+        .reduce((acc, e2) => acc + (Number(e2.fat_12m_cliente) || 0), 0);
+      return { cliente_id: c.id, fat_12m_matriz: String(e.fat_12m_matriz), diferenca: e.diferenca == null ? null : String(e.diferenca),
+        fat_12m_outras_empresas: String((Number(e.fat_12m_matriz) || 0) - soma) };
+    });
+    return { rows };
+  }
+  if (s.includes('SUM(E.FAT_12M_CLIENTE)')) {
+    const [id, dataRelatorio, matrizGrupo] = params;
+    const soma = clientes
+      .filter(c => Number(c.id) === Number(id) || (matrizGrupo && c.matriz_grupo === matrizGrupo))
+      .map(c => classificatorioErp[c.id])
+      .filter(e => e && e.data_relatorio === dataRelatorio)
+      .reduce((acc, e) => acc + (Number(e.fat_12m_cliente) || 0), 0);
+    return { rows: [{ soma: String(soma) }] };
+  }
+  if (s.includes('FROM CLIENTE_CLASSIFICATORIO_ERP WHERE CLIENTE_ID = $1')) {
+    const linha = classificatorioErp[Number(params[0])];
+    // NUMERIC chega do pg como texto
+    const txt = v => (v == null ? null : String(v));
+    return { rows: linha ? [{
+      ...linha,
+      fat_ano_anterior: txt(linha.fat_ano_anterior), fat_acumulado: txt(linha.fat_acumulado),
+      fat_12m_cliente: txt(linha.fat_12m_cliente), fat_12m_matriz: txt(linha.fat_12m_matriz), diferenca: txt(linha.diferenca),
+    }] : [] };
   }
   if (s.includes('SELECT C.ID AS CLIENTE_ID') && s.includes('WHERE C.ID = $1')) {
     const clienteDoStatus = clientes.find(c => Number(c.id) === Number(params[0]));
-    const agruparPorMatrizGrupo = !clienteDoStatus || clienteDoStatus.classificatorio_tipo !== 'Rede';
-    const { faturamento_12m, faturamento_ano_corrente, faturamento_mesmo_periodo_ano_anterior, ultima_compra } = calcularFaturamentoAnoFechadoParaCliente(params[0], agruparPorMatrizGrupo);
+    const agruparPorMatrizGrupo = (!clienteDoStatus || clienteDoStatus.classificatorio_tipo !== 'Rede')
+      && s.includes('C2.MATRIZ_GRUPO = C.MATRIZ_GRUPO'); // variante individual não soma o grupo
+    const { faturamento_12m, faturamento_ano_corrente, faturamento_mesmo_periodo_ano_anterior, ultima_compra, ultimo_pedido } = calcularFaturamentoAnoFechadoParaCliente(params[0], agruparPorMatrizGrupo);
     // A rota real envolve essa subconsulta num SELECT externo que também pede
     // EXTRACT(YEAR FROM ...) AS ano_fechado/ano_atual/trimestre_atual_idx -
     // inclui aqui pra bater com isso.
     return { rows: [{
-      cliente_id: Number(params[0]), faturamento_12m, faturamento_ano_corrente, faturamento_mesmo_periodo_ano_anterior, ultima_compra,
+      cliente_id: Number(params[0]), faturamento_12m, faturamento_ano_corrente, faturamento_mesmo_periodo_ano_anterior,
+      ultima_compra: comoDateDoPg(ultima_compra), ultimo_pedido: comoDateDoPg(ultimo_pedido),
       ano_fechado: anoClassificatorioFechado(), ano_atual: anoAtual(), trimestre_atual_idx: trimestreAtualIdxAgora(),
+      dia_do_ano: diaDoAnoAgora(),
     }] };
   }
   // Ano/trimestre atual "de verdade" (não o ano fechado da faixa) - usado
   // pela rota de alertas em lote pra alimentar calcularRitmoTrimestral de
   // cada cliente com a mesma referência que a rota individual usa.
-  if (s === 'SELECT EXTRACT(YEAR FROM CURRENT_DATE)::INT AS ANO_ATUAL, EXTRACT(QUARTER FROM CURRENT_DATE)::INT - 1 AS TRIMESTRE_ATUAL_IDX') {
-    return { rows: [{ ano_atual: anoAtual(), trimestre_atual_idx: trimestreAtualIdxAgora() }] };
+  if (s.startsWith('SELECT EXTRACT(YEAR FROM (NOW() AT TIME ZONE ') && s.endsWith('AS DIA_DO_ANO')) {
+    return { rows: [{ ano_atual: anoAtual(), trimestre_atual_idx: trimestreAtualIdxAgora(), dia_do_ano: diaDoAnoAgora() }] };
   }
   // Trimestres recentes de TODOS os clientes classificados de uma vez
   // (janela móvel de 4 trimestres, mesma lógica da rota individual) -
@@ -371,8 +1357,35 @@ async function query(sql, params = []) {
   }
   if (s.includes('SELECT C.ID AS CLIENTE_ID') && s.includes("CLASSIFICATORIO_TIPO IS NOT NULL")) {
     const classificados = clientes.filter(c => c.classificatorio_tipo);
-    const rows = classificados.map(c => ({ cliente_id: c.id, ...calcularFaturamentoAnoFechadoParaCliente(c.id) }));
+    const rows = classificados.map(c => {
+      const f = calcularFaturamentoAnoFechadoParaCliente(c.id);
+      return { cliente_id: c.id, ...f, ultima_compra: comoDateDoPg(f.ultima_compra), ultimo_pedido: comoDateDoPg(f.ultimo_pedido) };
+    });
     return { rows };
+  }
+  // PUT /api/clientes/:id/whatsapp
+  if (s.startsWith('UPDATE CLIENTES SET WHATSAPP_COMPRADOR = $1')) {
+    const c = clientes.find(x => String(x.id) === String(params[2]));
+    if (!c) return { rows: [] };
+    c.whatsapp_comprador = params[0];
+    c.whatsapp_comprador_nome = params[1];
+    c.whatsapp_comprador_em = new Date().toISOString();
+    return { rows: [{ id: c.id, nome: c.nome, whatsapp_comprador: c.whatsapp_comprador, whatsapp_comprador_nome: c.whatsapp_comprador_nome, whatsapp_comprador_em: c.whatsapp_comprador_em }] };
+  }
+  // PUT /api/clientes/:id/contatos
+  if (s.includes('/* CLIENTES:CONTATOS */')) {
+    const c = clientes.find(x => String(x.id) === String(params[3]));
+    if (!c) return { rows: [] };
+    Object.assign(c, { telefone_comercial: params[0], email_comercial: params[1], email_nfe: params[2], contatos_em: new Date().toISOString() });
+    return { rows: [{ id: c.id, nome: c.nome, telefone_comercial: c.telefone_comercial, email_comercial: c.email_comercial, email_nfe: c.email_nfe, contatos_em: c.contatos_em }] };
+  }
+  // PUT /api/clientes/:id/nome-arquivo
+  if (s.startsWith('UPDATE CLIENTES SET NOME_ARQUIVO = $1, NOME_ARQUIVO_EM = NOW() WHERE ID = $2')) {
+    const c = clientes.find(x => String(x.id) === String(params[1]));
+    if (!c) return { rows: [] };
+    c.nome_arquivo = params[0];
+    c.nome_arquivo_em = new Date().toISOString();
+    return { rows: [{ id: c.id, nome: c.nome, nome_arquivo: c.nome_arquivo, nome_arquivo_em: c.nome_arquivo_em }] };
   }
   if (s.includes('WHERE C.MATRIZ_GRUPO = $1')) {
     // Faturamento de CADA empresa individualmente (só o próprio
@@ -384,7 +1397,7 @@ async function query(sql, params = []) {
     const fimStr = `${ano + 1}-01-01`;
     const inicio12m = inicioJanela12m();
     const rows = grupo.map(c => {
-      const itensDoCliente = pedidosOficiaisItens.filter(it => it.cliente_codigo_oficial === c.codigo_oficial && it.status === 'faturado');
+      const itensDoCliente = pedidosOficiaisItens.filter(it => it.cliente_codigo_oficial === c.codigo_oficial && faturadoDeFato(it));
       const faturamento_12m = itensDoCliente.filter(it => it.data_faturamento && it.data_faturamento > inicio12m)
         .reduce((s, it) => s + (Number(it.valor) || 0), 0);
       const faturamento_ano_corrente = itensDoCliente.filter(it => it.data_faturamento && it.data_faturamento >= fimStr)
@@ -430,7 +1443,8 @@ async function query(sql, params = []) {
       id: c.id,
       nome: c.nome,
       classificatorio_tipo: c.classificatorio_tipo || null,
-      ultima_compra: calcularFaturamentoAnoFechadoParaCliente(c.id).ultima_compra,
+      ultima_compra: comoDateDoPg(calcularFaturamentoAnoFechadoParaCliente(c.id).ultima_compra),
+      ultimo_pedido: comoDateDoPg(calcularFaturamentoAnoFechadoParaCliente(c.id).ultimo_pedido),
     }));
     return { rows };
   }
@@ -446,7 +1460,7 @@ async function query(sql, params = []) {
     let inicio = null, fim = null;
     if (s.includes('DATA_FATURAMENTO >=')) inicio = params[idx++];
     if (s.includes('DATA_FATURAMENTO <=')) fim = params[idx++];
-    let itens = pedidosOficiaisItens.filter(it => it.status === 'faturado');
+    let itens = pedidosOficiaisItens.filter(it => faturadoDeFato(it));
     if (porCliente) itens = itens.filter(it => it.cliente_codigo_oficial === clienteCodigo);
     if (inicio) itens = itens.filter(it => it.data_faturamento && it.data_faturamento >= inicio);
     if (fim) itens = itens.filter(it => it.data_faturamento && it.data_faturamento <= fim);
@@ -475,10 +1489,25 @@ async function query(sql, params = []) {
   // Fixup de num_pedidos pra grupos reconciliados por código base (evita
   // contar duas vezes um nr_pedido que tem código base + variante P na
   // mesma linha de pedido) - routes/relatorios.js, reconciliarProdutosPorCodigoBase.
+  // Curva ABC: pedidos distintos por grupo de códigos mesclados, em lote (routes/relatorios.js)
+  if (s.includes('/* CURVA-ABC:PEDIDOS-POR-GRUPO */')) {
+    const [gruposIdx, codigos] = params;
+    let idx = 2;
+    let itens = pedidosOficiaisItens.filter(it => faturadoDeFato(it));
+    if (s.includes('CLIENTE_CODIGO_OFICIAL = $')) { const cc = params[idx++]; itens = itens.filter(it => it.cliente_codigo_oficial === cc); }
+    if (s.includes('DATA_FATURAMENTO >=')) { const ini = params[idx++]; itens = itens.filter(it => it.data_faturamento && it.data_faturamento >= ini); }
+    if (s.includes('DATA_FATURAMENTO <=')) { const fim = params[idx++]; itens = itens.filter(it => it.data_faturamento && it.data_faturamento <= fim); }
+    const porGrupo = new Map();
+    codigos.forEach((cod, i) => itens.filter(it => it.codigo_sku === cod).forEach(it => {
+      if (!porGrupo.has(gruposIdx[i])) porGrupo.set(gruposIdx[i], new Set());
+      porGrupo.get(gruposIdx[i]).add(it.nr_pedido);
+    }));
+    return { rows: [...porGrupo].map(([grupo, nrs]) => ({ grupo, total: String(nrs.size) })) };
+  }
   if (s.startsWith('SELECT COUNT(DISTINCT NR_PEDIDO) AS TOTAL FROM PEDIDOS_OFICIAIS_ITENS') && s.includes('CODIGO_SKU = ANY(')) {
     const codigos = params[0];
     let idx = 1;
-    let itens = pedidosOficiaisItens.filter(it => it.status === 'faturado' && codigos.includes(it.codigo_sku));
+    let itens = pedidosOficiaisItens.filter(it => faturadoDeFato(it) && codigos.includes(it.codigo_sku));
     if (s.includes('CLIENTE_CODIGO_OFICIAL = $')) { const cc = params[idx++]; itens = itens.filter(it => it.cliente_codigo_oficial === cc); }
     if (s.includes('DATA_FATURAMENTO >=')) { const ini = params[idx++]; itens = itens.filter(it => it.data_faturamento && it.data_faturamento >= ini); }
     if (s.includes('DATA_FATURAMENTO <=')) { const fim = params[idx++]; itens = itens.filter(it => it.data_faturamento && it.data_faturamento <= fim); }
@@ -521,9 +1550,29 @@ async function query(sql, params = []) {
       if (it.cliente_codigo_oficial) atual.clientesSet.add(it.cliente_codigo_oficial);
       grupos.set(key, atual);
     }
-    const rows = [...grupos.values()].sort((a, b) => a.periodo.localeCompare(b.periodo))
-      .map(g => ({ periodo: g.periodo, valor: g.valor, pedidos: g.pedidosSet.size, clientes: g.clientesSet.size }));
+    // Os 12 meses sempre, terminando no atual; mês sem pedido vem zerado
+    // (generate_series + LEFT JOIN no SQL real).
+    const rows = [];
+    for (let i = 11; i >= 0; i--) {
+      const periodo = new Date(Date.UTC(hoje.getUTCFullYear(), hoje.getUTCMonth() - i, 1)).toISOString().slice(0, 10);
+      const g = grupos.get(periodo);
+      rows.push({ periodo, valor: g ? g.valor : 0, pedidos: g ? g.pedidosSet.size : 0, clientes: g ? g.clientesSet.size : 0 });
+    }
     return { rows };
+  }
+
+  // Entrada do mês anterior até o mesmo dia de hoje
+  // (SQL_ENTRADA_MES_ANTERIOR_ATE_HOJE em routes/relatorios.js).
+  if (s.includes('AS ATE, COALESCE(SUM(POI.VALOR), 0) AS VALOR')) {
+    const hoje = new Date();
+    const inicio = new Date(Date.UTC(hoje.getUTCFullYear(), hoje.getUTCMonth() - 1, 1));
+    const ultimoDia = new Date(Date.UTC(hoje.getUTCFullYear(), hoje.getUTCMonth(), 0)).getUTCDate();
+    const ate = new Date(Date.UTC(hoje.getUTCFullYear(), hoje.getUTCMonth() - 1, Math.min(hoje.getUTCDate(), ultimoDia))).toISOString().slice(0, 10);
+    const inicioStr = inicio.toISOString().slice(0, 10);
+    const valor = pedidosOficiaisItens
+      .filter(it => it.data_implantacao && it.data_implantacao >= inicioStr && it.data_implantacao <= ate && String(it.nr_pedido).length <= 6)
+      .reduce((soma, it) => soma + (Number(it.valor) || 0), 0);
+    return { rows: [{ ate, valor }] };
   }
 
   // Pedidos do mês atual por trás do cartão "Valor Entrada de Pedidos Mês"
@@ -555,7 +1604,7 @@ async function query(sql, params = []) {
     const diasCorte = { month: 365, week: 70, quarter: 730 }[tipo];
     const corte = new Date(); corte.setDate(corte.getDate() - diasCorte);
     const corteStr = corte.toISOString().slice(0, 10);
-    const itens = pedidosOficiaisItens.filter(it => it.status === 'faturado' && it.data_faturamento && it.data_faturamento >= corteStr);
+    const itens = pedidosOficiaisItens.filter(it => faturadoDeFato(it) && it.data_faturamento && it.data_faturamento >= corteStr);
     const grupos = new Map();
     for (const it of itens) {
       const d = new Date(it.data_faturamento);
@@ -593,6 +1642,19 @@ async function query(sql, params = []) {
     return { rows: clientes.filter(c => c.classificatorio_tipo) };
   }
 
+  // fichas_tecnicas
+  if (s.includes('SELECT CODIGO_SKU, NOME, DESCRICAO, FOTO, SPECS FROM FICHAS_TECNICAS')) {
+    return { rows: Object.entries(fichasTecnicas).map(([codigo_sku, v]) => ({ codigo_sku, ...v })) };
+  }
+  if (s.includes('INTO FICHAS_TECNICAS')) {
+    const [skus, nomes, descs, fotos, specs] = params;
+    skus.forEach((c, i) => { fichasTecnicas[c] = { nome: nomes[i], descricao: descs[i], foto: fotos[i], specs: JSON.parse(specs[i]) }; });
+    return { rows: [] };
+  }
+  if (s.includes('SELECT COUNT(*) FROM FICHAS_TECNICAS')) {
+    return { rows: [{ count: String(Object.keys(fichasTecnicas).length) }] };
+  }
+
   // codigos_produto (EAN-13 / DUN-14)
   if (s.includes('SELECT CODIGO_SKU, EAN13, DUN14 FROM CODIGOS_PRODUTO')) {
     return { rows: Object.entries(codigosProduto).map(([codigo_sku, v]) => ({ codigo_sku, ean13: v.ean13, dun14: v.dun14 })) };
@@ -627,16 +1689,29 @@ async function query(sql, params = []) {
       desistidos: '0',
     }] };
   }
+  // UF do cliente pro saldo mínimo em carteira (GET /api/pedidos-oficiais/:clienteId)
+  if (s.includes('SELECT UF FROM CLIENTE_CNPJ_FICHA WHERE CLIENTE_ID')) {
+    const row = clienteCnpjFicha[params[0]];
+    return { rows: row ? [{ uf: row.uf ?? null }] : [] };
+  }
   if (s.includes('SELECT * FROM CLIENTE_CNPJ_FICHA WHERE CLIENTE_ID')) {
     const row = clienteCnpjFicha[params[0]];
     return { rows: row ? [row] : [] };
+  }
+  if (s.includes('UPDATE CLIENTE_CNPJ_FICHA SET SOCIOS = $2, TELEFONE = $3, MASCARADO_COMPLETADO_EM')) {
+    const row = clienteCnpjFicha[params[0]];
+    if (!row) return { rows: [] };
+    row.socios = typeof params[1] === 'string' ? JSON.parse(params[1]) : params[1];
+    row.telefone = params[2];
+    row.mascarado_completado_em = new Date().toISOString();
+    return { rows: [row] };
   }
   if (s.includes('INSERT INTO CLIENTE_CNPJ_FICHA')) {
     const [
       cliente_id, razao_social, nome_fantasia, situacao_cadastral, data_situacao_cadastral,
       motivo_situacao, cnae_principal_codigo, cnae_principal_descricao, natureza_juridica, porte,
       data_abertura, capital_social, logradouro, numero, complemento, bairro, municipio, uf, cep,
-      telefone, email, matriz_filial, cnae_secundario, socios, dados_brutos,
+      telefone, email, matriz_filial, cnae_secundario, socios, dados_brutos, sociosConferidos,
     ] = params;
     const row = {
       cliente_id, razao_social, nome_fantasia, situacao_cadastral, data_situacao_cadastral,
@@ -646,6 +1721,7 @@ async function query(sql, params = []) {
       socios: typeof socios === 'string' ? JSON.parse(socios) : socios,
       dados_brutos: typeof dados_brutos === 'string' ? JSON.parse(dados_brutos) : dados_brutos,
       atualizado_em: new Date().toISOString(),
+      mascarado_completado_em: sociosConferidos ? new Date().toISOString() : null,
     };
     clienteCnpjFicha[cliente_id] = row;
     return { rows: [row] };
@@ -678,11 +1754,12 @@ async function query(sql, params = []) {
     }
     return { rows: [{ criados: String(criados), atualizados: String(atualizados) }] };
   }
-  if (s.includes('INSERT INTO PRODUTOS') && s.includes('ON CONFLICT')) {
-    const existing = produtos.find(p => p.codigo_sku === params[0]);
-    if (existing) { existing.nome = params[1]; existing.categoria = params[2]; return { rows: [{ inserted: false }] }; }
-    produtos.push({ id: nextId.produtos++, codigo_sku: params[0], nome: params[1], categoria: params[2] });
-    return { rows: [{ inserted: true }] };
+  // PDF com produto que não está nem no catálogo (routes/lib/produtoPorSku.js): ON CONFLICT DO NOTHING RETURNING id
+  if (s.includes('INSERT INTO PRODUTOS (CODIGO_SKU, NOME) VALUES ($1, $2) ON CONFLICT (CODIGO_SKU) DO NOTHING RETURNING ID')) {
+    if (produtos.some(p => p.codigo_sku === params[0])) return { rows: [] };
+    const novo = { id: nextId.produtos++, codigo_sku: params[0], nome: params[1], categoria: null };
+    produtos.push(novo);
+    return { rows: [{ id: novo.id }] };
   }
   if (s.includes('SELECT ID, CODIGO_SKU, NOME, CATEGORIA FROM PRODUTOS')) {
     return { rows: produtos };
@@ -698,6 +1775,12 @@ async function query(sql, params = []) {
 
   // catalogo_precos (routes/catalogoPrecos.js) - usado pela geração em
   // lote de produtos promocionais (routes/produtosPromocionais.js).
+  if (s === 'SELECT CODIGO_SKU, NOME, EMB, NCM, IPI, FAMILIA, PRECO_FIXO, CANAIS_FX, PRECOS, PRECOS_SEM_IMPOSTO FROM CATALOGO_PRECOS ORDER BY CODIGO_SKU') {
+    return { rows: [...catalogoPrecos].sort((a, b) => String(a.codigo_sku).localeCompare(String(b.codigo_sku))) };
+  }
+  if (s === 'SELECT CODIGO_SKU, NOME FROM CATALOGO_PRECOS') {
+    return { rows: catalogoPrecos.map(p => ({ codigo_sku: p.codigo_sku, nome: p.nome })) };
+  }
   if (s === 'SELECT CODIGO_SKU FROM CATALOGO_PRECOS') {
     return { rows: catalogoPrecos.map(p => ({ codigo_sku: p.codigo_sku })) };
   }
@@ -709,26 +1792,84 @@ async function query(sql, params = []) {
   // POST /api/pedidos-oficiais/importar (UNNEST em lote + ON CONFLICT) - vem
   // antes do INSERT INTO PEDIDOS abaixo, que também casaria com este SQL.
   if (s.includes('INSERT INTO PEDIDOS_OFICIAIS_ITENS') && s.includes('UNNEST')) {
-    const [nrs, skus, clis, qtds, valores, impls, fats, nfs, classis, transps, sits, status, descs] = params;
+    const [nrs, skus, clis, qtds, valores, impls, fats, nfs, classis, transps, sits, status, descs, chaves] = params;
+    // chave da linha: nr_pedido + codigo_sku + nota_chave (nota fiscal na
+    // linha faturada, '' no saldo em carteira) - ver schema.sql
+    const chaveDe = (it) => it.nota_chave ?? (it.status === 'faturado' && it.nota_fiscal != null ? String(it.nota_fiscal) : '');
     nrs.forEach((nr, i) => {
       const novo = {
         nr_pedido: nr, codigo_sku: skus[i], cliente_codigo_oficial: clis[i], quantidade: qtds[i], valor: valores[i],
         data_implantacao: impls[i], data_faturamento: fats[i], nota_fiscal: nfs[i], classificatorio: classis[i],
         transportadora: transps[i], situacao_pedido: sits[i], status: status[i], descricao: descs ? descs[i] : null,
+        nota_chave: chaves ? chaves[i] : '',
       };
-      const atual = pedidosOficiaisItens.find(it => it.nr_pedido === nr && it.codigo_sku === skus[i]);
+      const atual = pedidosOficiaisItens.find(it => it.nr_pedido === nr && it.codigo_sku === skus[i] && chaveDe(it) === novo.nota_chave);
       if (!atual) { pedidosOficiaisItens.push(novo); return; }
       const novoFaturado = novo.status === 'faturado';
       if (novoFaturado || atual.status !== 'faturado') { atual.quantidade = novo.quantidade; atual.valor = novo.valor; }
       atual.data_implantacao = novo.data_implantacao ?? atual.data_implantacao;
       atual.descricao = novo.descricao ?? atual.descricao;
-      if (novoFaturado) Object.assign(atual, { data_faturamento: novo.data_faturamento, nota_fiscal: novo.nota_fiscal, status: 'faturado' });
+      if (novoFaturado) Object.assign(atual, { data_faturamento: novo.data_faturamento, nota_fiscal: novo.nota_fiscal, situacao_pedido: novo.situacao_pedido, status: 'faturado' });
     });
     return { rows: [] };
   }
+  // importação: saldo em carteira que deixou de existir (planejarCarteira) -
+  // pedido "Atendido Total" no relatório e produto que saiu da Carteira
+  if (s.startsWith("DELETE FROM PEDIDOS_OFICIAIS_ITENS WHERE STATUS = 'CARTEIRA' AND NR_PEDIDO = ANY($1::TEXT[])")) {
+    const antes = pedidosOficiaisItens.length;
+    pedidosOficiaisItens = pedidosOficiaisItens.filter(it => !(it.status === 'carteira' && params[0].includes(it.nr_pedido)));
+    return { rowCount: antes - pedidosOficiaisItens.length, rows: [] };
+  }
+  if (s.startsWith('DELETE FROM PEDIDOS_OFICIAIS_ITENS POI USING UNNEST')) {
+    const pares = new Set(params[0].map((nr, i) => `${nr}::${params[1][i]}`));
+    const antes = pedidosOficiaisItens.length;
+    pedidosOficiaisItens = pedidosOficiaisItens.filter(it => !(it.status === 'carteira' && pares.has(`${it.nr_pedido}::${it.codigo_sku}`)));
+    return { rowCount: antes - pedidosOficiaisItens.length, rows: [] };
+  }
+  // GET /api/pedidos/exportar (routes/relatorios.js): período pelo dia do pedido em Brasília
+  if (s.includes('/* PEDIDOS:EXPORTAR */')) {
+    const rows = [];
+    for (const ped of pedidos) {
+      const dia = diaDoPedidoBr(ped.data_pedido);
+      if (dia < params[0] || dia > params[1]) continue;
+      const c = clientes.find(cl => String(cl.id) === String(ped.cliente_id));
+      const v = vendedores.find(vd => vd.id === ped.vendedor_id);
+      for (const it of pedidoItens.filter(i => i.pedido_id === ped.id)) {
+        const prod = produtos.find(p => p.id === it.produto_id);
+        if (c && prod) rows.push({ data_pedido: ped.data_pedido, dia, cliente_nome: c.nome, cliente_documento: c.documento || null,
+          vendedor_nome: v ? v.nome : null, codigo_sku: prod.codigo_sku, produto_nome: prod.nome, quantidade: it.quantidade,
+          preco_unitario: it.preco_unitario, origem: ped.origem, numero_cotacao: ped.numero_cotacao || null });
+      }
+    }
+    rows.sort((a, b) => (a.dia === b.dia ? new Date(b.data_pedido) - new Date(a.data_pedido) : (a.dia < b.dia ? 1 : -1)));
+    return { rows };
+  }
+  // GET /api/pedidos/duplicados: mesmo cliente, mesmo dia (Brasília), algum produto em comum
+  if (s.includes('/* PEDIDOS:DUPLICADOS */')) {
+    const prodsDe = (ped) => new Set(pedidoItens.filter(i => i.pedido_id === ped.id).map(i => i.produto_id));
+    const dup = pedidos.filter(p2 => pedidos.some(p3 => p3.id !== p2.id && String(p3.cliente_id) === String(p2.cliente_id)
+      && diaDoPedidoBr(p3.data_pedido) === diaDoPedidoBr(p2.data_pedido) && [...prodsDe(p3)].some(id => prodsDe(p2).has(id))));
+    const rows = dup.map(ped => {
+      const c = clientes.find(cl => String(cl.id) === String(ped.cliente_id));
+      return { pedido_id: ped.id, cliente_id: ped.cliente_id, cliente_nome: c ? c.nome : null, data_pedido: ped.data_pedido,
+        dia: diaDoPedidoBr(ped.data_pedido), origem: ped.origem, numero_cotacao: ped.numero_cotacao || null,
+        itens: pedidoItens.filter(i => i.pedido_id === ped.id).map(i => {
+          const prod = produtos.find(p => p.id === i.produto_id);
+          return { codigo_sku: prod?.codigo_sku, produto: prod?.nome, quantidade: i.quantidade };
+        }) };
+    });
+    rows.sort((a, b) => (Number(a.cliente_id) - Number(b.cliente_id)) || (a.dia < b.dia ? 1 : a.dia > b.dia ? -1 : 0));
+    return { rows };
+  }
   if (s.includes('INSERT INTO PEDIDOS')) {
-    // params: cliente_id, vendedor_id, observacao, numero_cotacao, origem, data_pedido, pdf_modificado_em, usuario_id
+    // params: cliente_id, vendedor_id, observacao, numero_cotacao, origem, data_pedido, pdf_modificado_em, usuario_id, contexto, id_envio
     const numeroCotacao = params[3] ?? null;
+    if (params[9] && pedidos.some(p => p.id_envio === params[9])) {
+      // índice único parcial idx_pedidos_id_envio
+      const err = new Error('duplicate key value violates unique constraint "idx_pedidos_id_envio"');
+      err.code = '23505'; err.constraint = 'idx_pedidos_id_envio';
+      throw err;
+    }
     if (numeroCotacao && pedidos.some(p => p.numero_cotacao === numeroCotacao)) {
       // mesmo comportamento do índice único parcial idx_pedidos_numero_cotacao
       const err = new Error('duplicate key value violates unique constraint "idx_pedidos_numero_cotacao"');
@@ -738,10 +1879,18 @@ async function query(sql, params = []) {
     const p = {
       id: nextId.pedidos++, cliente_id: params[0], vendedor_id: params[1], observacao: params[2],
       numero_cotacao: numeroCotacao, pdf_modificado_em: params[6] ?? null, usuario_id: params[7] ?? null,
-      data_pedido: new Date().toISOString(),
+      origem: params[4] || 'app', contexto: params[8] ?? null, id_envio: params[9] ?? null, versao_app: params[10] ?? null,
+      data_pedido: params[5] ? new Date(params[5]).toISOString() : new Date().toISOString(),
     };
     pedidos.push(p);
     return { rows: [{ id: p.id, data_pedido: p.data_pedido }] };
+  }
+  // trava por id_envio (pg_advisory_xact_lock): no mock as consultas não se intercalam
+  if (s.includes('PG_ADVISORY_XACT_LOCK')) return { rows: [{}] };
+  // POST /api/pedidos com id_envio: o reenvio do mesmo pedido devolve o gravado
+  if (s.includes('FROM PEDIDOS WHERE ID_ENVIO = $1')) {
+    return { rows: pedidos.filter(p => p.id_envio && p.id_envio === params[0])
+      .map(p => ({ id: p.id, cliente_id: p.cliente_id, data_pedido: p.data_pedido, usuario_id: p.usuario_id, versao_app: p.versao_app || null, contexto: p.contexto ? JSON.parse(p.contexto) : null })) };
   }
   // POST /api/pedidos com numero_cotacao: busca (com lock) da cotação já gravada
   if (s.includes('FROM PEDIDOS WHERE NUMERO_COTACAO = $1')) {
@@ -766,10 +1915,19 @@ async function query(sql, params = []) {
   }
 
   // levantamentos
+  if (s.includes('/* LEVANTAMENTO:MESMO-ENVIO */')) {
+    return { rows: levantamentos.filter(l => l.id_envio && l.id_envio === params[0]).map(l => ({ id: l.id, cliente_id: l.cliente_id, data_visita: l.data_visita })) };
+  }
   if (s.includes('INSERT INTO LEVANTAMENTOS')) {
+    if (params[6] && levantamentos.some(l => l.id_envio === params[6])) {
+      // índice único parcial idx_levantamentos_id_envio
+      const err = new Error('duplicate key value violates unique constraint "idx_levantamentos_id_envio"');
+      err.code = '23505'; err.constraint = 'idx_levantamentos_id_envio';
+      throw err;
+    }
     const l = {
       id: nextId.levantamentos++, cliente_id: params[0], vendedor_id: params[1], nome: params[2], data_visita: new Date().toISOString(),
-      latitude: params[3] ?? null, longitude: params[4] ?? null, localizacao_precisao_m: params[5] ?? null,
+      latitude: params[3] ?? null, longitude: params[4] ?? null, localizacao_precisao_m: params[5] ?? null, id_envio: params[6] ?? null, usuario_id: params[7] ?? null,
     };
     levantamentos.push(l);
     return { rows: [{ id: l.id, data_visita: l.data_visita }] };
@@ -788,7 +1946,7 @@ async function query(sql, params = []) {
     return { rowCount: 0, rows: [] };
   }
   if (s.includes('INSERT INTO LEVANTAMENTO_ITENS')) {
-    levantamentoItens.push({ id: nextId.levantamento_itens++, levantamento_id: params[0], produto_id: params[1], quantidade_contada: params[2] });
+    levantamentoItens.push({ id: nextId.levantamento_itens++, levantamento_id: params[0], produto_id: params[1], quantidade_contada: params[2], quantidade_pedido: params[3] || 0 });
     return { rows: [] };
   }
 
@@ -798,6 +1956,23 @@ async function query(sql, params = []) {
   }
   if (s.includes('MEDIA_DIAS_ENTRE_PEDIDOS')) {
     return computeRotatividade(params[0]);
+  }
+  if (s.includes('LEVANTAMENTOS:RECENTES')) {
+    // equipe inteira, últimos N dias (params[0]), mais novo primeiro
+    const desde = Date.now() - params[0] * 86400000;
+    const diaBr = (d) => new Date(new Date(d).getTime() - 3 * 3600000).toISOString().slice(0, 10);
+    const vistos = new Set(); // DISTINCT ON (cliente, vendedor, dia de Brasília): só o mais novo
+    const rows = levantamentos.filter(l => new Date(l.data_visita).getTime() >= desde)
+      .sort((a, b) => new Date(b.data_visita) - new Date(a.data_visita) || b.id - a.id)
+      .filter(l => { const k = `${l.cliente_id}|${l.vendedor_id}|${diaBr(l.data_visita)}`; if (vistos.has(k)) return false; vistos.add(k); return true; })
+      .map(l => {
+        const itens = levantamentoItens.filter(li => li.levantamento_id === l.id);
+        const c = clientes.find(c => c.id == l.cliente_id);
+        const v = vendedores.find(v => v.id == l.vendedor_id);
+        return { id: l.id, id_envio: l.id_envio || null, cliente_id: l.cliente_id, cliente_nome: c ? c.nome : null, data_visita: l.data_visita, vendedor: v ? v.nome : null,
+          num_produtos: itens.length, total_unidades: String(itens.reduce((a, li) => a + Number(li.quantidade_contada), 0)) };
+      });
+    return { rows };
   }
   if (s.includes('FROM LEVANTAMENTOS L') && s.includes('LEFT JOIN VENDEDORES')) {
     return computeLevantamentosDoCliente(params[0]);
@@ -810,7 +1985,7 @@ async function query(sql, params = []) {
     // doOpenSavedSurvey em index.html, que precisa de Number(...) nisso).
     return { rows: itens.map(li => {
       const prod = produtos.find(p => p.id === li.produto_id);
-      return { codigo_sku: prod ? prod.codigo_sku : null, quantidade_contada: String(li.quantidade_contada) };
+      return { codigo_sku: prod ? prod.codigo_sku : null, quantidade_contada: String(li.quantidade_contada), quantidade_pedido: String(li.quantidade_pedido || 0) };
     }) };
   }
 
@@ -840,6 +2015,7 @@ async function query(sql, params = []) {
       email,
       google_sub: ehVarianteGoogle ? params[2] : null,
       is_admin: isAdmin,
+      ativo: true,
     };
     usuarios.push(u);
     return { rows: [{ id: u.id, nome: u.nome, email: u.email, is_admin: u.is_admin }] };
@@ -857,11 +2033,67 @@ async function query(sql, params = []) {
     const sessao = sessoes.find(se => se.token === params[0] && new Date(se.expira_em) > new Date());
     if (!sessao) return { rows: [] };
     const u = usuarios.find(us => us.id === sessao.usuario_id);
+    // "AND u.ativo": usuário desativado pelo admin não passa (middleware/auth.js, /auth/me)
+    if (u && s.includes('AND U.ATIVO') && u.ativo === false) return { rows: [] };
     return { rows: u ? [{ id: u.id, nome: u.nome, email: u.email, is_admin: u.is_admin }] : [] };
+  }
+  if (s.includes('DELETE FROM SESSOES WHERE USUARIO_ID')) {
+    const antes = sessoes.length;
+    sessoes = sessoes.filter(se => se.usuario_id != params[0]);
+    return { rows: [], rowCount: antes - sessoes.length };
   }
   if (s.includes('DELETE FROM SESSOES')) {
     sessoes = sessoes.filter(se => se.token !== params[0]);
     return { rows: [] };
+  }
+  if (s.includes('DELETE FROM PUSH_INSCRICOES WHERE USUARIO_ID')) {
+    const antes = pushInscricoes.length;
+    pushInscricoes = pushInscricoes.filter(i => i.usuario_id != params[0]);
+    return { rows: [], rowCount: antes - pushInscricoes.length };
+  }
+  // usuários - routes/auth.js (login Google, lista, desativar/excluir)
+  if (s.startsWith('LOCK TABLE USUARIOS')) return { rows: [] };
+  if (s.includes('FROM USUARIOS WHERE GOOGLE_SUB = $1')) {
+    return { rows: usuarios.filter(u => u.google_sub === params[0]).map(u => ({ ...u })) };
+  }
+  if (s.includes('FROM USUARIOS WHERE EMAIL = $1 AND GOOGLE_SUB IS NULL')) {
+    return { rows: usuarios.filter(u => u.email === params[0] && !u.google_sub).map(u => ({ ...u })) };
+  }
+  if (s.startsWith('UPDATE USUARIOS SET GOOGLE_SUB')) {
+    const u = usuarios.find(x => x.id == params[1]);
+    if (u) u.google_sub = params[0];
+    return { rows: [] };
+  }
+  if (s.includes('FROM USUARIOS WHERE IS_ADMIN = TRUE')) {
+    const soAtivos = s.includes('AND ATIVO = TRUE');
+    return { rows: usuarios.filter(u => u.is_admin && (!soAtivos || u.ativo !== false)).map(u => ({ id: u.id })) };
+  }
+  if (s.startsWith('SELECT') && s.includes('FROM USUARIOS WHERE ID = $1')) {
+    return { rows: usuarios.filter(u => u.id == params[0]).map(u => ({ ...u })) };
+  }
+  if (s.includes('/* USUARIOS:NOME */')) {
+    const u = usuarios.find(x => x.id == params[0]);
+    if (!u) return { rows: [] };
+    u.nome = params[1];
+    return { rows: [{ id: u.id, nome: u.nome, email: u.email, is_admin: u.is_admin, ativo: u.ativo !== false }] };
+  }
+  if (s.startsWith('UPDATE USUARIOS SET ATIVO')) {
+    const u = usuarios.find(x => x.id == params[0]);
+    if (!u) return { rows: [] };
+    u.ativo = params[1];
+    return { rows: [{ id: u.id, nome: u.nome, email: u.email, is_admin: u.is_admin, ativo: u.ativo }] };
+  }
+  if (s.startsWith('SELECT ID, NOME, EMAIL, IS_ADMIN, ATIVO, CRIADO_EM FROM USUARIOS')) {
+    return { rows: usuarios.slice().sort((a, b) => (b.ativo !== false) - (a.ativo !== false) || String(a.nome).localeCompare(b.nome))
+      .map(u => ({ id: u.id, nome: u.nome, email: u.email, is_admin: u.is_admin, ativo: u.ativo !== false })) };
+  }
+  if (s.startsWith('DELETE FROM USUARIOS WHERE ID')) {
+    // chave estrangeira sem ON DELETE: pedidos.usuario_id e import_log.usuario_id
+    if (pedidos.some(p => p.usuario_id == params[0])) { const err = new Error('violates foreign key constraint'); err.code = '23503'; throw err; }
+    const u = usuarios.find(x => x.id == params[0]);
+    usuarios = usuarios.filter(x => x.id != params[0]);
+    sessoes = sessoes.filter(se => se.usuario_id != params[0]);
+    return { rows: u ? [{ nome: u.nome, email: u.email }] : [] };
   }
 
   // rascunho de levantamento
@@ -884,6 +2116,16 @@ async function query(sql, params = []) {
   // POST /classificatorio/objetivos-trimestrais/importar). Checado ANTES do
   // catch-all de "FROM PEDIDOS_OFICIAIS_ITENS POI" da curva ABC logo abaixo,
   // que bateria com esse texto também (mesma tabela na consulta).
+  if (s.includes('/* OBJETIVOS:MATRIZES */')) {
+    const porMatriz = new Map();
+    for (const c of clientes) {
+      const m = c.matriz_grupo || c.nome;
+      if (!params[0].includes(m)) continue;
+      if (!porMatriz.has(m)) porMatriz.set(m, new Set());
+      porMatriz.get(m).add(c.classificatorio_tipo ?? null);
+    }
+    return { rows: [...porMatriz].map(([matriz, tipos]) => ({ matriz, tipos: [...tipos] })) };
+  }
   if (s === 'SELECT DISTINCT CLASSIFICATORIO_TIPO FROM CLIENTES WHERE COALESCE(MATRIZ_GRUPO, NOME) = $1') {
     const chave = params[0];
     const tipos = [...new Set(clientes.filter(c => (c.matriz_grupo || c.nome) === chave).map(c => c.classificatorio_tipo))];
@@ -928,7 +2170,7 @@ async function query(sql, params = []) {
     const inicio = s.includes('DATA_FATURAMENTO >=') ? params[idx++] : null;
     const fim = s.includes('DATA_FATURAMENTO <=') ? params[idx++] : null;
     const itens = pedidosOficiaisItens.filter(it =>
-      it.status === 'faturado' &&
+      faturadoDeFato(it) &&
       (!porCliente || it.cliente_codigo_oficial === codigoOficial) &&
       (!inicio || it.data_faturamento >= inicio) &&
       (!fim || it.data_faturamento <= fim)
@@ -1016,9 +2258,34 @@ async function query(sql, params = []) {
   // Configurações genéricas chave/valor (routes/configuracoes.js) - usado
   // hoje por produtos_promocionais/promocoes e pela meta mensal/produtos
   // foco do Dashboard.
+  // status da posição das lojas (statusGeocodificacao, routes/lib/geocodificacao.js)
+  if (s.includes('AS COM_GPS') && s.includes('CLIENTE_GEOCODIFICACAO')) {
+    const max = params[0];
+    let comGps = 0, peloEndereco = 0, peloNumero = 0, comEndereco = 0, naoEncontrados = 0;
+    for (const c of clientes) {
+      if (c.latitude != null) { comGps++; continue; }
+      const f = clienteCnpjFicha[c.id], g = clienteGeocodificacao[c.id];
+      if (f && String(f.logradouro || '').trim() && String(f.municipio || '').trim()) comEndereco++;
+      const mesmo = g && f && g.endereco === chaveEnderecoFicha(f);
+      if (mesmo && g.latitude != null) peloEndereco++;
+      if (mesmo && g.latitude != null && ['numero', 'interpolado', 'estimado'].includes(g.nivel)) peloNumero++;
+      if (mesmo && g.latitude == null && g.tentativas >= max) naoEncontrados++;
+    }
+    return { rows: [{ com_gps: String(comGps), pelo_endereco: String(peloEndereco), pelo_numero: String(peloNumero), com_endereco_sem_gps: String(comEndereco), nao_encontrados: String(naoEncontrados) }] };
+  }
   if (s.includes('FROM CONFIGURACOES WHERE CHAVE')) {
     const registro = configuracoes[params[0]];
     return { rows: registro ? [{ valor: registro.valor, atualizado_em: registro.atualizado_em }] : [] };
+  }
+  // produtos promocionais (routes/produtosPromocionais.js): garante a linha com
+  // '[]' fixo no SQL (só a chave como parâmetro) antes do SELECT ... FOR UPDATE
+  if (s.startsWith('INSERT INTO CONFIGURACOES') && s.includes('DO NOTHING') && params.length === 1) {
+    if (!configuracoes[params[0]]) configuracoes[params[0]] = { valor: [], atualizado_em: new Date().toISOString() };
+    return { rows: [] };
+  }
+  if (s.startsWith('UPDATE CONFIGURACOES SET VALOR = $2')) {
+    configuracoes[params[0]] = { valor: JSON.parse(params[1]), atualizado_em: new Date().toISOString() };
+    return { rows: [], rowCount: 1 };
   }
   if (s.startsWith('INSERT INTO CONFIGURACOES')) {
     const [chave, valorJson] = params;
@@ -1029,10 +2296,50 @@ async function query(sql, params = []) {
   // Rastro de quem fez cada importação em massa (registrarImportacao, db.js) -
   // o teste não confere o conteúdo, só que a chamada não derruba a rota.
   if (s.startsWith('INSERT INTO IMPORT_LOG')) {
+    importLog.push({ rota: params[1], criado_em: new Date().toISOString() });
     return { rows: [] };
   }
 
   throw new Error('Mock não sabe responder a esta query: ' + sql.slice(0, 80));
+}
+
+function aplicarLinhaClassificatorio(codigoOficial, matrizGrupo, pic, vlAcordo, classifTipo, classifDesconto, id, dataRelatorio) {
+  const c = clientes.find(x => Number(x.id) === Number(id));
+  if (c) {
+    if (!c.codigo_oficial) c.codigo_oficial = codigoOficial;
+    // matriz/PIC/acordo: só planilha tão ou mais nova que a última foto do cliente
+    const foto = classificatorioErp[c.id];
+    const planilhaMaisNova = !dataRelatorio || !foto || foto.data_relatorio <= dataRelatorio;
+    if (planilhaMaisNova) {
+      if (matrizGrupo) c.matriz_grupo = matrizGrupo;
+      c.classificatorio_pic = pic;
+      if (vlAcordo != null) c.classificatorio_vl_acordo = vlAcordo;
+    }
+    // Relatório datado tão ou mais novo que o classificatório atual troca a
+    // faixa; sem data, só preenche quem não tem (comportamento antigo).
+    const trocar = classifTipo && dataRelatorio
+      && (!c.classificatorio_atualizado_em || String(c.classificatorio_atualizado_em) <= dataRelatorio);
+    if (trocar) {
+      c.classificatorio_tipo = classifTipo;
+      c.classificatorio_desconto = classifDesconto;
+      c.classificatorio_atualizado_em = dataRelatorio;
+    } else {
+      if (!c.classificatorio_tipo) c.classificatorio_tipo = classifTipo;
+      if (!c.classificatorio_desconto) c.classificatorio_desconto = classifDesconto;
+    }
+  }
+}
+function fotoClassificatorio(params) {
+  const [clienteId, dataRelatorio, apuradoAte, fatAnoAnterior, fatAcumulado, fat12mCliente, fat12mMatriz,
+    diferenca, gestor, situacao, cidade, uf, clienteDesde, ultimaCompra] = params;
+  const atual = classificatorioErp[clienteId];
+  if (!atual || atual.data_relatorio <= dataRelatorio) {
+    classificatorioErp[clienteId] = {
+      data_relatorio: dataRelatorio, apurado_ate: apuradoAte, fat_ano_anterior: fatAnoAnterior, fat_acumulado: fatAcumulado,
+      fat_12m_cliente: fat12mCliente, fat_12m_matriz: fat12mMatriz, diferenca, gestor, situacao, cidade, uf,
+      cliente_desde: clienteDesde, ultima_compra: ultimaCompra,
+    };
+  }
 }
 
 // Ano civil fechado usado pela revisão do classificatório (ver
@@ -1049,6 +2356,7 @@ function inicioJanela12m() {
   const d = new Date();
   return new Date(Date.UTC(d.getUTCFullYear() - 1, d.getUTCMonth(), d.getUTCDate())).toISOString().slice(0, 10);
 }
+function diaDoAnoAgora() { const d = new Date(); return Math.floor((Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - Date.UTC(d.getUTCFullYear(), 0, 1)) / 86400000) + 1; }
 function trimestreAtualIdxAgora() { return Math.floor(new Date().getUTCMonth() / 3); } // 0-3
 // Início (YYYY-MM-DD) do trimestre civil de 3 trimestres atrás, contando do
 // trimestre em andamento agora - mesma janela de `date_trunc('quarter',
@@ -1066,12 +2374,18 @@ function inicioJanelaTrimestralMovel() {
 // próprio cliente quando `agruparPorMatrizGrupo` é false (usado pra Rede,
 // onde matriz_grupo guarda o nome da rede/cooperativa, não empresas
 // irmãs - somar tudo misturaria lojas sem relação societária entre si).
+// O pg entrega coluna DATE como Date à meia-noite local - não como texto.
+function comoDateDoPg(iso) {
+  if (!iso) return null;
+  const [a, m, d] = String(iso).slice(0, 10).split('-').map(Number);
+  return new Date(a, m - 1, d);
+}
 function calcularFaturamentoAnoFechadoParaCliente(clienteId, agruparPorMatrizGrupo = true) {
   const cliente = clientes.find(c => Number(c.id) === Number(clienteId));
   if (!cliente) return { faturamento_12m: 0, faturamento_ano_corrente: 0, faturamento_mesmo_periodo_ano_anterior: 0, ultima_compra: null };
   const grupo = agruparPorMatrizGrupo && cliente.matriz_grupo ? clientes.filter(c => c.matriz_grupo === cliente.matriz_grupo) : [cliente];
   const codigos = grupo.map(c => c.codigo_oficial).filter(Boolean);
-  const itensFaturados = pedidosOficiaisItens.filter(it => codigos.includes(it.cliente_codigo_oficial) && it.status === 'faturado');
+  const itensFaturados = pedidosOficiaisItens.filter(it => codigos.includes(it.cliente_codigo_oficial) && faturadoDeFato(it));
   const ano = anoClassificatorioFechado();
   const inicioStr = `${ano}-01-01`;
   const fimStr = `${ano + 1}-01-01`;
@@ -1095,7 +2409,14 @@ function calcularFaturamentoAnoFechadoParaCliente(clienteId, agruparPorMatrizGru
   const faturamento_mesmo_periodo_ano_anterior = itensMesmoPeriodo.reduce((s, it) => s + (Number(it.valor) || 0), 0);
   const datas = itensFaturados.map(it => it.data_faturamento).filter(Boolean).sort();
   const ultima_compra = datas.length ? datas[datas.length - 1] : null;
-  return { faturamento_12m, faturamento_ano_corrente, faturamento_mesmo_periodo_ano_anterior, ultima_compra };
+  // ultimo_pedido: nota faturada, implantação (sem série de 7 dígitos) ou pedido do app
+  const idsGrupo = grupo.map(c => Number(c.id));
+  const candidatos = [ultima_compra,
+    ...pedidosOficiaisItens.filter(it => codigos.includes(it.cliente_codigo_oficial) && it.data_implantacao && String(it.nr_pedido).length <= 6).map(it => String(it.data_implantacao).slice(0, 10)),
+    ...pedidos.filter(p => idsGrupo.includes(Number(p.cliente_id)) && p.origem !== 'faturamento' && p.data_pedido).map(p => diaDoPedidoBr(p.data_pedido)),
+  ].filter(Boolean).map(d => String(d).slice(0, 10)).sort();
+  const ultimo_pedido = candidatos.length ? candidatos[candidatos.length - 1] : null;
+  return { faturamento_12m, faturamento_ano_corrente, faturamento_mesmo_periodo_ano_anterior, ultima_compra, ultimo_pedido };
 }
 
 function computeHistorico(clienteId) {
@@ -1142,9 +2463,31 @@ module.exports = {
   __reset: reset,
   __seed: seed,
   __getClientes: () => clientes,
+  __getContasSalesforce: () => contasSalesforce,
+  __getReativacaoAlvos: () => reativacaoAlvos,
   __getLevantamentos: () => levantamentos,
   __getPedidoItens: () => pedidoItens,
+  __getPedidos: () => pedidos,
   __getPedidosOficiaisItens: () => pedidosOficiaisItens,
+  __getRecompraAdiamentos: () => recompraAdiamentos,
+  __getOcorrencias: () => ocorrencias,
+  __getNovidades: () => novidades,
+  __getProdutoFotos: () => produtoFotos,
+  __getImportacoesEmail: () => importacoesEmail,
+  __getPedidosBloqueados: () => pedidosBloqueados,
+  __getAvisosCancelamento: () => avisosCancelamento,
+  __getPrevisaoEstoque: () => previsaoEstoque,
+  __getCatalogoPrecos: () => catalogoPrecos,
+  __fixarVersaoTabelas: (v) => { versaoTabelas = v; },
+  __getProdutos: () => produtos,
+  __getConfiguracao: (chave) => (configuracoes[chave] ? configuracoes[chave].valor : undefined),
+  __setConfiguracao: (chave, valor) => { configuracoes[chave] = { valor, atualizado_em: new Date().toISOString() }; },
+  __getLevantamentoItens: () => levantamentoItens,
+  __getPushInscricoes: () => pushInscricoes,
+  __getUsuarios: () => usuarios,
+  __getSessoes: () => sessoes,
+  __getPedidosPendentesPagamento: () => pedidosPendentesPagamento,
+  __getTitulosAvistaPendentes: () => titulosAvistaPendentes,
   __anoClassificatorioFechado: anoClassificatorioFechado,
   __inicioJanela12m: inicioJanela12m,
 };

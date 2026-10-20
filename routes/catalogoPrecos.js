@@ -1,7 +1,10 @@
 const express = require('express');
+const { esquecerCatalogo } = require('./lib/descontinuado');
+const { lerComCache, esquecerTabela } = require('./lib/cacheTabela');
 const router = express.Router();
 const XLSX = require('@e965/xlsx');
 const { pool, registrarImportacao } = require('../db');
+const { avisarImportacao, quantos } = require('./lib/novidades');
 
 // ---------------------------------------------------------------------
 // Conversor da planilha "LISTA PADRÃO" (6 canais x 3 regiões, com
@@ -181,31 +184,59 @@ router.post('/importar', async (req, res) => {
   if (arquivoBase64.length > TAMANHO_MAX_PLANILHA_BYTES * 4 / 3) {
     return res.status(413).json({ erro: 'Arquivo muito grande. O limite é 10MB.' });
   }
+  const r = await importarCatalogoPrecos(Buffer.from(arquivoBase64, 'base64'), req.usuario);
+  res.status(r.status).json(r.json);
+});
 
+// Também chamada pela importação automática por e-mail (routes/importacaoEmail.js)
+// - devolve { status, json } em vez de responder direto.
+// opcoes.maxFracaoRemovida (só o caminho do e-mail, decisão do usuário): recusa
+// (422) a planilha que tiraria do catálogo mais que essa fração dos códigos que
+// ele tem hoje - uma lista cortada/errada publicada sem ninguém olhar esvaziava
+// o catálogo de todos os aparelhos. A importação manual pelo Painel não tem trava.
+async function importarCatalogoPrecos(buffer, usuario, opcoes = {}) {
+  if (buffer.length > TAMANHO_MAX_PLANILHA_BYTES) return { status: 413, json: { erro: 'Arquivo muito grande. O limite é 10MB.' } };
   let produtos;
   try {
-    const buffer = Buffer.from(arquivoBase64, 'base64');
     produtos = converterPlanilha(buffer);
   } catch (e) {
     console.error('Erro ao converter planilha:', e);
-    return res.status(400).json({ erro: 'Erro ao ler a planilha: ' + e.message });
+    return { status: 400, json: { erro: 'Erro ao ler a planilha: ' + e.message } };
   }
 
   if (produtos.length === 0) {
-    return res.status(400).json({ erro: 'Nenhum produto encontrado na planilha - confira se é o arquivo certo.' });
+    return { status: 400, json: { erro: 'Nenhum produto encontrado na planilha - confira se é o arquivo certo.' } };
   }
 
   const codigosInvalidos = produtos.filter(p => !CODIGO_SKU_REGEX.test(p.codigo_sku)).map(p => p.codigo_sku);
   if (codigosInvalidos.length > 0) {
-    return res.status(400).json({
+    return { status: 400, json: {
       erro: 'Códigos de produto em formato inválido na planilha: ' + codigosInvalidos.slice(0, 10).join(', '),
-    });
+    } };
   }
 
   let client;
   try {
     client = await pool.connect();
     await client.query('BEGIN');
+    if (opcoes.maxFracaoRemovida != null) {
+      // dentro da transação, antes de gravar: conta contra o catálogo de agora
+      const conf = await client.query(
+        `/* catalogo-precos:conferir-remocao */
+         SELECT count(*)::int AS total, count(*) FILTER (WHERE codigo_sku <> ALL($1::text[]))::int AS sairiam FROM catalogo_precos`,
+        [produtos.map(p => p.codigo_sku)]
+      );
+      const { total, sairiam } = conf.rows[0];
+      if (total > 0 && sairiam / total > opcoes.maxFracaoRemovida) {
+        await client.query('ROLLBACK');
+        const pct = (n) => (n * 100).toLocaleString('pt-BR', { maximumFractionDigits: 1 });
+        return { status: 422, json: {
+          erro: `A planilha tiraria ${sairiam} de ${total} produtos do catálogo (${pct(sairiam / total)}%, o limite da importação automática é ${pct(opcoes.maxFracaoRemovida)}%). `
+            + 'Não foi importada - confira o arquivo e, se estiver certo, importe pelo Painel.',
+          produtosQueSairiam: sairiam, produtosNoCatalogo: total,
+        } };
+      }
+    }
     await client.query(
       `INSERT INTO catalogo_precos (codigo_sku, nome, emb, ncm, ipi, familia, preco_fixo, canais_fx, precos, precos_sem_imposto, atualizado_em)
        SELECT * FROM UNNEST(
@@ -232,6 +263,18 @@ router.post('/importar', async (req, res) => {
         produtos.map(() => new Date()),
       ]
     );
+    // Produto novo da lista entra também no cadastro de produtos (o que pedido e
+    // levantamento referenciam) - antes só o /api/produtos/sync (admin abrindo o
+    // Painel) fazia isso, e o pedido com o produto novo era recusado. Só os que
+    // ainda não existem: nome/categoria dos que já estão lá ficam como o sync pôs.
+    const produtosCriados = await client.query(
+      `/* catalogo-precos:produtos-novos */
+       INSERT INTO produtos (codigo_sku, nome, categoria)
+       SELECT codigo_sku, COALESCE(NULLIF(trim(nome), ''), codigo_sku), familia
+       FROM UNNEST($1::text[], $2::text[], $3::text[]) AS t(codigo_sku, nome, familia)
+       ON CONFLICT (codigo_sku) DO NOTHING`,
+      [produtos.map(p => p.codigo_sku), produtos.map(p => (p.nome == null ? null : String(p.nome))), produtos.map(p => p.familia)]
+    );
     // A planilha é a fonte completa do catálogo (não um lote parcial) - um
     // produto que saiu dela deve sair do catálogo também, senão fica com
     // preço desatualizado pra sempre (o comentário da rota já dizia
@@ -244,30 +287,37 @@ router.post('/importar', async (req, res) => {
     if (removidos.rowCount > 0) {
       console.log(`Catálogo de preços: ${removidos.rowCount} produto(s) removido(s) por não estarem mais na planilha.`);
     }
-    await registrarImportacao(req.usuario?.id, 'catalogo-precos/importar', produtos.length);
-    res.json({ ok: true, produtosImportados: produtos.length, produtosRemovidos: removidos.rowCount });
+    esquecerTabela('catalogo_precos');
+    esquecerTabela('produtos'); // a importação também cria produto novo no cadastro
+    esquecerCatalogo(); // "Descontinuado" passa a valer pelo catálogo novo na próxima consulta
+    await registrarImportacao(usuario?.id, 'catalogo-precos/importar', produtos.length);
+    await avisarImportacao('catalogo-precos', quantos(produtos.length, 'produto', 'produtos'));
+    return { status: 200, json: { ok: true, produtosImportados: produtos.length, produtosRemovidos: removidos.rowCount, produtosNovos: produtosCriados.rowCount || 0 } };
   } catch (e) {
     if (client) {
       try { await client.query('ROLLBACK'); } catch (rollbackErr) { console.error('Erro no rollback:', rollbackErr); }
     }
     console.error(e);
-    res.status(500).json({ erro: 'Erro ao salvar catálogo no banco.' });
+    return { status: 500, json: { erro: 'Erro ao salvar catálogo no banco.' } };
   } finally {
     if (client) client.release();
   }
-});
+}
 
 // Devolve o catálogo completo, no formato que o app usa como "fonte
 // automática" (substitui o precos.json estático do GitHub Pages - agora
 // todo aparelho busca direto do servidor).
 router.get('/', async (req, res) => {
   try {
-    const r = await pool.query('SELECT codigo_sku, nome, emb, ncm, ipi, familia, preco_fixo, canais_fx, precos, precos_sem_imposto FROM catalogo_precos ORDER BY codigo_sku');
+    // do cache enquanto a tabela não mudar (routes/lib/cacheTabela.js: ~1,25 MB
+    // por leitura era o maior gasto de egress do Supabase)
+    const rows = await lerComCache('catalogo_precos', 'catalogo_precos',
+      'SELECT codigo_sku, nome, emb, ncm, ipi, familia, preco_fixo, canais_fx, precos, precos_sem_imposto FROM catalogo_precos ORDER BY codigo_sku');
     res.json({
       version: 'Catálogo do servidor',
       generatedAt: new Date().toISOString(),
       canais: CANAIS,
-      produtos: r.rows,
+      produtos: rows,
     });
   } catch (e) {
     console.error(e);
@@ -276,4 +326,5 @@ router.get('/', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.importarCatalogoPrecos = importarCatalogoPrecos;
 module.exports.converterPlanilha = converterPlanilha; // exposto só pra teste da conversão sem precisar subir o servidor inteiro

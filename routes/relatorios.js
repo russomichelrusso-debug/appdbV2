@@ -1,11 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
-const { SQL_FATURAMENTO_CLASSIFICATORIO_POR_CLIENTE } = require('./clientesClassificatorio');
+const { SQL_FATURAMENTO_CLASSIFICATORIO_POR_CLIENTE, diaDoBanco } = require('./clientesClassificatorio');
 const { mesclarPorCodigoBase, codigoBase } = require('./lib/skuNormalizacao');
+const { nomesDosProdutos } = require('./lib/cacheTabela');
 const { grupoDoProduto } = require('./lib/agrupamentoProduto');
-const { SQL_PEDIDO_APP_VALIDO, indexarDatasOficiais, pedidoAppJaFaturado } = require('./lib/comprasApp');
+const { SQL_PEDIDO_APP_VALIDO, sqlDiaDoPedido, SQL_HOJE_BR, FUSO, indexarDatasOficiais, pedidoAppJaFaturado } = require('./lib/comprasApp');
 const { validarIdInteiro } = require('../middleware/validarId');
+const { sqlFaturadoDeFato } = require('./lib/faturadoDeFato');
+const { clientesDeOutroVendedor } = require('./lib/contasSalesforce');
+const { marcarDescontinuados, estaDescontinuado, grupoDescontinuado, catalogoOuNada } = require('./lib/descontinuado');
 
 router.param('id', validarIdInteiro);
 router.param('produtoId', validarIdInteiro);
@@ -15,26 +19,32 @@ router.param('produtoId', validarIdInteiro);
 // literal, e corrige num_pedidos pros grupos que mescharam 2+ códigos
 // (soma ingênua de COUNT DISTINCT pode contar duas vezes um nr_pedido
 // que por acaso tem o código base E a variante na mesma linha de
-// pedido - raro, mas a query extra é barata já que só acontece pra
-// grupos que de fato mescIaram).
+// pedido - raro; uma consulta só pra todos os grupos que de fato mesclaram).
 async function reconciliarProdutosPorCodigoBase(linhas, { inicio, fim, clienteCodigo } = {}) {
   const produtosResult = await pool.query('SELECT codigo_sku, nome, categoria FROM produtos');
   const produtosPorCodigo = {};
   for (const p of produtosResult.rows) produtosPorCodigo[p.codigo_sku] = p;
   const mescladas = mesclarPorCodigoBase(linhas, produtosPorCodigo);
-  for (const grupo of mescladas) {
-    if (grupo._codigosOriginais.length < 2) continue;
-    const fixupParams = [grupo._codigosOriginais];
-    let fixupFiltro = '';
-    if (clienteCodigo) { fixupParams.push(clienteCodigo); fixupFiltro += ` AND cliente_codigo_oficial = $${fixupParams.length}`; }
-    if (inicio) { fixupParams.push(inicio); fixupFiltro += ` AND data_faturamento >= $${fixupParams.length}::date`; }
-    if (fim) { fixupParams.push(fim); fixupFiltro += ` AND data_faturamento <= $${fixupParams.length}::date`; }
-    const fixup = await pool.query(
-      `SELECT COUNT(DISTINCT nr_pedido) AS total FROM pedidos_oficiais_itens
-       WHERE status = 'faturado' AND codigo_sku = ANY($1::text[])${fixupFiltro}`,
-      fixupParams
+  // pedidos distintos de todos os grupos mesclados numa consulta só (antes uma
+  // por grupo)
+  const grupos = mescladas.filter(g => g._codigosOriginais.length >= 2);
+  if (grupos.length > 0) {
+    const params = [grupos.flatMap((g, i) => g._codigosOriginais.map(() => i)), grupos.flatMap(g => g._codigosOriginais)];
+    let filtro = '';
+    if (clienteCodigo) { params.push(clienteCodigo); filtro += ` AND poi.cliente_codigo_oficial = $${params.length}`; }
+    if (inicio) { params.push(inicio); filtro += ` AND poi.data_faturamento >= $${params.length}::date`; }
+    if (fim) { params.push(fim); filtro += ` AND poi.data_faturamento <= $${params.length}::date`; }
+    const r = await pool.query(
+      `/* curva-abc:pedidos-por-grupo */
+       SELECT g.grupo, COUNT(DISTINCT poi.nr_pedido) AS total
+       FROM UNNEST($1::int[], $2::text[]) AS g(grupo, codigo_sku)
+       JOIN pedidos_oficiais_itens poi ON poi.codigo_sku = g.codigo_sku
+       WHERE ${sqlFaturadoDeFato('poi')}${filtro}
+       GROUP BY g.grupo`,
+      params
     );
-    grupo.num_pedidos = Number(fixup.rows[0].total);
+    const totalDoGrupo = new Map(r.rows.map(x => [Number(x.grupo), Number(x.total)]));
+    grupos.forEach((g, i) => { g.num_pedidos = totalDoGrupo.get(i) || 0; });
   }
   for (const grupo of mescladas) delete grupo._codigosOriginais;
   return mescladas;
@@ -63,6 +73,25 @@ function canalDoCliente(classificatorioTipo) {
 const FAIXA_3_A_5_MESES = [90, 179];
 const FAIXA_6_A_8_MESES = [180, 269];
 
+// Produto entregue em mais de uma nota fiscal do mesmo pedido (faturado em
+// parte, o saldo saiu depois) vira uma linha por nota em
+// pedidos_oficiais_itens. Pra "o que o cliente comprou" continua sendo uma
+// compra só: soma as notas do mesmo pedido + código, na data da primeira -
+// senão a entrega dividida parecia recompra e encurtava a Rotatividade.
+function juntarNotasDoPedido(rows) {
+  const dia = (d) => (d instanceof Date ? d.toISOString() : String(d)).slice(0, 10);
+  const porChave = new Map();
+  for (const l of rows) {
+    const chave = `${l.pedido}::${l.codigo_sku}`;
+    const atual = porChave.get(chave);
+    if (!atual) { porChave.set(chave, { ...l, quantidade: Number(l.quantidade) || 0 }); continue; }
+    atual.quantidade += Number(l.quantidade) || 0;
+    if (l.data && (!atual.data || dia(l.data) < dia(atual.data))) atual.data = l.data;
+    if (!atual.descricao && l.descricao) atual.descricao = l.descricao;
+  }
+  return [...porChave.values()];
+}
+
 // Tudo que o cliente comprou, por SKU e por dia: faturado oficial (relatório
 // do ERP) + pedidos feitos pelo app. Antes Histórico/Rotatividade/Recuperar só
 // olhavam o app (desde 05/2026, uma fração das compras) - quem comprava pelo
@@ -89,18 +118,19 @@ async function comprasDoCliente(clienteId) {
       : Promise.resolve({ rows: [] }),
     pool.query(
       `/* compras-cliente:app */
-       SELECT p.codigo_sku, ped.data_pedido::date AS data, pi.quantidade, 'app' || ped.id AS pedido
+       SELECT p.codigo_sku, ${sqlDiaDoPedido()} AS data, pi.quantidade, 'app' || ped.id AS pedido
        FROM pedidos ped
        JOIN pedido_itens pi ON pi.pedido_id = ped.id
        JOIN produtos p ON p.id = pi.produto_id
        WHERE ped.cliente_id = $1 AND ${SQL_PEDIDO_APP_VALIDO}`,
       [clienteId]),
-    pool.query('SELECT codigo_sku, nome FROM produtos'),
+    nomesDosProdutos(),
   ]);
   const nomePorCodigo = new Map(produtos.rows.map(p => [String(p.codigo_sku), p.nome]));
   const codigosConhecidos = new Set(nomePorCodigo.keys());
   const dia = (d) => (d instanceof Date ? d.toISOString() : String(d)).slice(0, 10);
   const skuDe = (l) => codigoBase(String(l.codigo_sku), codigosConhecidos);
+  oficial.rows = juntarNotasDoPedido(oficial.rows);
   // produto que saiu da tabela de preços (fora de `produtos`): nome pela
   // "Descrição" do relatório oficial, em vez de mostrar só o código
   const descricaoPorSku = new Map();
@@ -162,7 +192,7 @@ router.get('/clientes/:id/historico', async (req, res) => {
     if (!compras) return res.status(404).json({ erro: 'Cliente não encontrado.' });
     const lista = [...compras.values()].map(resumoCompras)
       .sort((a, b) => b.ultima_compra.localeCompare(a.ultima_compra));
-    res.json(lista);
+    res.json(await marcarDescontinuados(pool, lista, 'produto'));
   } catch (e) {
     console.error(e);
     res.status(500).json({ erro: 'Erro ao gerar histórico.' });
@@ -178,7 +208,7 @@ router.get('/clientes/:id/rotatividade', async (req, res) => {
     const lista = [...compras.values()].map(resumoCompras)
       .sort((a, b) => (a.media_dias_entre_pedidos ?? Infinity) - (b.media_dias_entre_pedidos ?? Infinity)
         || b.ultima_compra.localeCompare(a.ultima_compra));
-    res.json(lista);
+    res.json(await marcarDescontinuados(pool, lista, 'produto'));
   } catch (e) {
     console.error(e);
     res.status(500).json({ erro: 'Erro ao calcular rotatividade.' });
@@ -216,7 +246,7 @@ router.get('/clientes/:id/consumo-estimado/:produtoId', async (req, res) => {
   const { id, produtoId } = req.params;
   try {
     const leiturasResult = await pool.query(
-      `SELECT l.data_visita, li.quantidade_contada
+      `SELECT l.data_visita, li.quantidade_contada, (l.data_visita AT TIME ZONE '${FUSO}')::date::text AS dia_visita
        FROM levantamento_itens li
        JOIN levantamentos l ON li.levantamento_id = l.id
        WHERE l.cliente_id = $1 AND li.produto_id = $2
@@ -232,7 +262,10 @@ router.get('/clientes/:id/consumo-estimado/:produtoId', async (req, res) => {
       pool.query('SELECT codigo_sku FROM produtos WHERE id = $1', [produtoId]),
     ]);
     const doProduto = compras && produto.rows[0] ? compras.get(String(produto.rows[0].codigo_sku)) : null;
-    const diaDe = (d) => (d instanceof Date ? d.toISOString() : String(d)).slice(0, 10);
+    // dia da visita no fuso de Brasília (data_visita é TIMESTAMPTZ): pelo dia
+    // UTC, a visita feita depois das 21h caía no dia seguinte e a compra desse
+    // dia saía do período
+    const diaDe = (l) => l.dia_visita || (l.data_visita instanceof Date ? l.data_visita.toISOString() : String(l.data_visita)).slice(0, 10);
     const consumos = [];
     for (let i = 1; i < leituras.length; i++) {
       const inicio = leituras[i-1].data_visita;
@@ -240,7 +273,7 @@ router.get('/clientes/:id/consumo-estimado/:produtoId', async (req, res) => {
       let pedidoNoPeriodo = 0;
       if (doProduto) {
         for (const [d, q] of doProduto.dias) {
-          if (d > diaDe(inicio) && d <= diaDe(fim)) pedidoNoPeriodo += q.quantidade;
+          if (d > diaDe(leituras[i-1]) && d <= diaDe(leituras[i])) pedidoNoPeriodo += q.quantidade;
         }
       }
       const dias = (new Date(fim) - new Date(inicio)) / 86400000;
@@ -287,7 +320,7 @@ router.get('/produtos/:codigo/clientes', async (req, res) => {
         [variantes]),
       pool.query(
         `/* produto-compradores:app */
-         SELECT c.id, c.nome, c.documento, pi.quantidade, ped.data_pedido::date AS data
+         SELECT c.id, c.nome, c.documento, pi.quantidade, ${sqlDiaDoPedido()} AS data
          FROM pedido_itens pi
          JOIN produtos p ON p.id = pi.produto_id
          JOIN pedidos ped ON ped.id = pi.pedido_id
@@ -356,8 +389,9 @@ router.get('/pedidos/exportar', async (req, res) => {
   if (!inicio || !fim) return res.status(400).json({ erro: 'Informe as datas de início e fim (?inicio=AAAA-MM-DD&fim=AAAA-MM-DD).' });
   try {
     const result = await pool.query(
-      `SELECT
-         ped.data_pedido, c.nome AS cliente_nome, c.documento AS cliente_documento,
+      `/* pedidos:exportar */
+       SELECT
+         ped.data_pedido, ${sqlDiaDoPedido()}::text AS dia, c.nome AS cliente_nome, c.documento AS cliente_documento,
          v.nome AS vendedor_nome, p.codigo_sku, p.nome AS produto_nome,
          pi.quantidade, pi.preco_unitario, ped.origem, ped.numero_cotacao
        FROM pedidos ped
@@ -365,8 +399,8 @@ router.get('/pedidos/exportar', async (req, res) => {
        JOIN clientes c ON c.id = ped.cliente_id
        JOIN produtos p ON p.id = pi.produto_id
        LEFT JOIN vendedores v ON v.id = ped.vendedor_id
-       WHERE ped.data_pedido >= $1 AND ped.data_pedido < ($2::date + interval '1 day')
-       ORDER BY ped.data_pedido DESC`,
+       WHERE ${sqlDiaDoPedido()} BETWEEN $1::date AND $2::date
+       ORDER BY ${sqlDiaDoPedido()} DESC, ped.data_pedido DESC`,
       [inicio, fim]
     );
     console.log(`Exportação de pedidos (${inicio} a ${fim}): ${result.rows.length} linha(s), por ${req.usuario?.email}.`);
@@ -407,13 +441,13 @@ router.get('/clientes/:id/sugestoes-recompra', async (req, res) => {
         : Promise.resolve({ rows: [] }),
       pool.query(
         `/* sugestoes-recompra:app */
-         SELECT DISTINCT p.codigo_sku, ped.data_pedido::date AS data, 'app' || ped.id AS pedido
+         SELECT DISTINCT p.codigo_sku, ${sqlDiaDoPedido()} AS data, 'app' || ped.id AS pedido
          FROM pedidos ped
          JOIN pedido_itens pi ON pi.pedido_id = ped.id
          JOIN produtos p ON p.id = pi.produto_id
          WHERE ped.cliente_id = $1 AND ${SQL_PEDIDO_APP_VALIDO}`,
         [req.params.id]),
-      pool.query('SELECT codigo_sku, nome FROM produtos'),
+      nomesDosProdutos(),
     ]);
 
     const nomePorCodigo = new Map(produtos.rows.map(p => [String(p.codigo_sku), p.nome]));
@@ -438,7 +472,7 @@ router.get('/clientes/:id/sugestoes-recompra', async (req, res) => {
       const nome = nomePorCodigo.get(sku);
       if (!nome || !linha.ultima_compra) continue; // produto fora do catálogo: sem nome pra agrupar
       const { chave, rotulo } = grupoDoProduto(nome);
-      const g = grupos.get(chave) || { grupo: rotulo, ultima_compra: null, num_pedidos: 0, variacoes: new Set() };
+      const g = grupos.get(chave) || { chave, grupo: rotulo, ultima_compra: null, num_pedidos: 0, variacoes: new Set() };
       // prefere o rótulo com acento quando o catálogo grafa o mesmo nome dos dois jeitos
       if (rotulo !== g.grupo && /[^\x00-\x7F]/.test(rotulo) && !/[^\x00-\x7F]/.test(g.grupo)) g.grupo = rotulo;
       const data = new Date(linha.ultima_compra);
@@ -448,8 +482,12 @@ router.get('/clientes/:id/sugestoes-recompra', async (req, res) => {
       grupos.set(chave, g);
     }
 
+    const cat = await catalogoOuNada(pool);
     const limite = Date.now() - SUGESTOES_DIAS_SEM_COMPRAR * 86400000;
     const sugestoes = [...grupos.values()]
+      // grupo sem nenhum produto na Lista de Preços saiu de linha: não tem o que
+      // oferecer. Código trocado por um novo continua no mesmo grupo (fica).
+      .filter(g => !(cat && grupoDescontinuado(g.chave, cat)))
       .filter(g => g.ultima_compra.getTime() < limite)
       .sort((a, b) => b.num_pedidos - a.num_pedidos || b.ultima_compra - a.ultima_compra)
       .slice(0, SUGESTOES_LIMITE)
@@ -489,18 +527,18 @@ router.get('/clientes/:id/comprados-recentes', async (req, res) => {
            SELECT codigo_sku, data_faturamento AS data, quantidade, nr_pedido AS pedido
            FROM pedidos_oficiais_itens
            WHERE status = 'faturado' AND cliente_codigo_oficial = $1
-             AND data_faturamento > CURRENT_DATE - $2::int`,
+             AND data_faturamento > ${SQL_HOJE_BR} - $2::int`,
           [codigoOficial, COMPRADOS_RECENTES_DIAS])
         : Promise.resolve({ rows: [] }),
       pool.query(
         `/* comprados-recentes:app */
-         SELECT p.codigo_sku, ped.data_pedido::date AS data, pi.quantidade, 'app' || ped.id AS pedido
+         SELECT p.codigo_sku, ${sqlDiaDoPedido()} AS data, pi.quantidade, 'app' || ped.id AS pedido
          FROM pedidos ped
          JOIN pedido_itens pi ON pi.pedido_id = ped.id
          JOIN produtos p ON p.id = pi.produto_id
-         WHERE ped.cliente_id = $1 AND ped.data_pedido::date > CURRENT_DATE - $2::int AND ${SQL_PEDIDO_APP_VALIDO}`,
+         WHERE ped.cliente_id = $1 AND ${sqlDiaDoPedido()} > ${SQL_HOJE_BR} - $2::int AND ${SQL_PEDIDO_APP_VALIDO}`,
         [req.params.id, COMPRADOS_RECENTES_DIAS]),
-      pool.query('SELECT codigo_sku, nome FROM produtos'),
+      nomesDosProdutos(),
     ]);
 
     const nomePorCodigo = new Map(produtos.rows.map(p => [String(p.codigo_sku), p.nome]));
@@ -511,15 +549,18 @@ router.get('/clientes/:id/comprados-recentes', async (req, res) => {
     // (routes/lib/comprasApp.js); se ainda sobrar app e faturado do mesmo SKU
     // no mesmo dia, vale só a quantidade do faturado.
     const skuDe = (l) => codigoBase(String(l.codigo_sku), codigosConhecidos);
+    oficial.rows = juntarNotasDoPedido(oficial.rows);
     const datasOficiais = indexarDatasOficiais(oficial.rows, skuDe);
     const linhas = [
       ...oficial.rows.map(l => ({ ...l, origem: 'oficial' })),
       ...app.rows.filter(l => !pedidoAppJaFaturado(skuDe(l), l.data, datasOficiais)).map(l => ({ ...l, origem: 'app' })),
     ];
+    const cat = await catalogoOuNada(pool);
     for (const linha of linhas) {
       if (!linha.data) continue;
       const sku = codigoBase(String(linha.codigo_sku), codigosConhecidos);
       if (!nomePorCodigo.has(sku)) continue; // fora do catálogo: o app não tem como incluir
+      if (cat && estaDescontinuado(sku, cat.codigos)) continue; // saiu da Lista de Preços: não ocupa vaga
       const d = dia(linha.data);
       const g = porSku.get(sku) || { codigo_sku: sku, nome: nomePorCodigo.get(sku), ultima_compra: d, qtd: { oficial: 0, app: 0 }, pedidos: new Set() };
       if (d > g.ultima_compra) { g.ultima_compra = d; g.qtd = { oficial: 0, app: 0 }; }
@@ -565,9 +606,13 @@ router.get('/clientes/:id/recuperar', async (req, res) => {
     const temLevantamento = await pool.query('SELECT 1 FROM levantamentos WHERE cliente_id = $1 LIMIT 1', [req.params.id]);
     if (temLevantamento.rows.length === 0) return res.json([]);
     const ultimaLeitura = new Map(leituras.rows.map(r => [String(r.codigo_sku), r]));
+    const cat = await catalogoOuNada(pool);
     const lista = [];
     for (const c of compras.values()) {
       if (!c.noCatalogo) continue; // fora do catálogo: não tem como ir pro orçamento
+      // saiu da Lista de Preços: não tem o que oferecer, e era o que ocupava as 30 vagas
+      // (é o de compra mais antiga)
+      if (cat && estaDescontinuado(c.codigo_sku, cat.codigos)) continue;
       const leitura = ultimaLeitura.get(c.codigo_sku);
       if (leitura && Number(leitura.quantidade_contada) > 0) continue;
       const r = resumoCompras(c);
@@ -609,14 +654,14 @@ router.get('/produtos-abc-geral', async (req, res) => {
               SUM(poi.valor) AS faturamento_total
        FROM pedidos_oficiais_itens poi
        LEFT JOIN produtos p ON p.codigo_sku = poi.codigo_sku
-       WHERE poi.status = 'faturado'${filtroData}
+       WHERE ${sqlFaturadoDeFato('poi')}${filtroData}
        GROUP BY poi.codigo_sku, p.nome, p.categoria
        ORDER BY faturamento_total DESC NULLS LAST`,
       params
     );
     const reconciliado = await reconciliarProdutosPorCodigoBase(result.rows, { inicio, fim });
     reconciliado.sort((a, b) => b.faturamento_total - a.faturamento_total);
-    res.json(reconciliado);
+    res.json(await marcarDescontinuados(pool, reconciliado, 'produto'));
   } catch (e) {
     console.error(e);
     res.status(500).json({ erro: 'Erro ao calcular curva ABC geral.' });
@@ -654,14 +699,14 @@ router.get('/clientes/:id/produtos-abc', async (req, res) => {
               SUM(poi.valor) AS faturamento_total
        FROM pedidos_oficiais_itens poi
        LEFT JOIN produtos p ON p.codigo_sku = poi.codigo_sku
-       WHERE poi.status = 'faturado' AND poi.cliente_codigo_oficial = $1${filtroData}
+       WHERE ${sqlFaturadoDeFato('poi')} AND poi.cliente_codigo_oficial = $1${filtroData}
        GROUP BY poi.codigo_sku, p.nome, p.categoria
        ORDER BY faturamento_total DESC NULLS LAST`,
       params
     );
     const reconciliado = await reconciliarProdutosPorCodigoBase(result.rows, { inicio, fim, clienteCodigo: codigoOficial });
     reconciliado.sort((a, b) => b.faturamento_total - a.faturamento_total);
-    res.json(reconciliado);
+    res.json(await marcarDescontinuados(pool, reconciliado, 'produto'));
   } catch (e) {
     console.error(e);
     res.status(500).json({ erro: 'Erro ao calcular curva ABC do cliente.' });
@@ -677,13 +722,45 @@ router.get('/clientes/:id/produtos-abc', async (req, res) => {
 //  - só a série principal de pedidos (6 dígitos, hoje na casa dos 676000). A
 //    série de 7 dígitos (10xxxxx-13xxxxx: itens avulsos de valor baixo, fora
 //    do catálogo) não entra no painel oficial.
+//
+// Sempre devolve os 12 meses, terminando no mês atual - mês sem pedido vem
+// com zero. Antes só vinham os meses com pedido, e a tela tomava a última
+// linha como "o mês": no dia 1º, sem pedido importado ainda, os cartões do
+// Dashboard continuavam mostrando o mês anterior inteiro (out/2026 abria com
+// os R$ 480 mil / 98 pedidos de setembro).
+//
+// "Hoje" pelo relógio de Brasília: o banco roda em UTC, e CURRENT_DATE já
+// virava o mês às 21h do último dia (e ainda estava no mês anterior até as
+// 3h do dia 1º). Vale também pro faturamento semanal/trimestral e o top
+// clientes do Dashboard (janelas de 10 semanas, 24 e 12 meses).
+const SQL_HOJE_BRASIL = `(now() AT TIME ZONE 'America/Sao_Paulo')::date`;
 const SQL_ENTRADA_PEDIDOS_MENSAL = `
-  SELECT date_trunc('month', data_implantacao) AS periodo, SUM(valor) AS valor,
-         COUNT(DISTINCT nr_pedido) AS pedidos, COUNT(DISTINCT cliente_codigo_oficial) AS clientes
-  FROM pedidos_oficiais_itens
-  WHERE data_implantacao >= date_trunc('month', CURRENT_DATE) - INTERVAL '11 months'
-    AND length(nr_pedido) <= 6
-  GROUP BY 1 ORDER BY 1`;
+  SELECT m.periodo, COALESCE(e.valor, 0) AS valor, COALESCE(e.pedidos, 0) AS pedidos, COALESCE(e.clientes, 0) AS clientes
+  FROM generate_series(date_trunc('month', ${SQL_HOJE_BRASIL}) - INTERVAL '11 months',
+                       date_trunc('month', ${SQL_HOJE_BRASIL}), INTERVAL '1 month') AS m(periodo)
+  LEFT JOIN (
+    SELECT date_trunc('month', data_implantacao) AS periodo, SUM(valor) AS valor,
+           COUNT(DISTINCT nr_pedido) AS pedidos, COUNT(DISTINCT cliente_codigo_oficial) AS clientes
+    FROM pedidos_oficiais_itens
+    WHERE data_implantacao >= date_trunc('month', ${SQL_HOJE_BRASIL}) - INTERVAL '11 months'
+      AND length(nr_pedido) <= 6
+    GROUP BY 1
+  ) e ON e.periodo = m.periodo
+  ORDER BY m.periodo`;
+
+// Entrada do mês anterior só até o mesmo dia de hoje (1º a DD do mês passado),
+// pra comparar o mês em andamento com um período do mesmo tamanho - comparar
+// com o mês anterior inteiro dava "↓ 100%" todo começo de mês. Mês anterior
+// mais curto (hoje 31/03) para no último dia dele (28/02): o "- 1 month" do
+// Postgres já faz isso.
+const SQL_ENTRADA_MES_ANTERIOR_ATE_HOJE = `
+  SELECT (h - INTERVAL '1 month')::date AS ate, COALESCE(SUM(poi.valor), 0) AS valor
+  FROM (SELECT ${SQL_HOJE_BRASIL} AS h) hoje
+  LEFT JOIN pedidos_oficiais_itens poi
+    ON poi.data_implantacao >= date_trunc('month', h) - INTERVAL '1 month'
+   AND poi.data_implantacao <= (h - INTERVAL '1 month')::date
+   AND length(poi.nr_pedido) <= 6
+  GROUP BY h`;
 
 // Os pedidos por trás do cartão "Valor Entrada de Pedidos Mês" (mesma regra
 // acima, só o mês atual): um por linha, com o nome do cliente, pra lista que
@@ -694,7 +771,7 @@ const SQL_ENTRADA_PEDIDOS_DO_MES = `
          MIN(poi.data_implantacao) AS data_implantacao, SUM(poi.valor) AS valor
   FROM pedidos_oficiais_itens poi
   LEFT JOIN clientes c ON c.codigo_oficial = poi.cliente_codigo_oficial
-  WHERE poi.data_implantacao >= date_trunc('month', CURRENT_DATE)
+  WHERE poi.data_implantacao >= date_trunc('month', ${SQL_HOJE_BRASIL})
     AND length(poi.nr_pedido) <= 6
   GROUP BY poi.nr_pedido, poi.cliente_codigo_oficial
   ORDER BY data_implantacao DESC, valor DESC NULLS LAST`;
@@ -710,23 +787,25 @@ const SQL_ENTRADA_PEDIDOS_DO_MES = `
 // padrão de acesso de /produtos-abc-geral e dos alertas de classificatório.
 router.get('/dashboard/resumo', async (req, res) => {
   try {
-    const [mensal, pedidosDoMes, semanal, trimestral, topClientes, porCliente] = await Promise.all([
+    const outrosVendedores = await clientesDeOutroVendedor();
+    const [mensal, pedidosDoMes, mesAnteriorAteHoje, semanal, trimestral, topClientes, porCliente] = await Promise.all([
       pool.query(SQL_ENTRADA_PEDIDOS_MENSAL),
       pool.query(SQL_ENTRADA_PEDIDOS_DO_MES),
+      pool.query(SQL_ENTRADA_MES_ANTERIOR_ATE_HOJE),
       pool.query(
         `SELECT date_trunc('week', data_faturamento) AS periodo, SUM(valor) AS faturamento
-         FROM pedidos_oficiais_itens WHERE status = 'faturado' AND data_faturamento >= CURRENT_DATE - INTERVAL '10 weeks'
+         FROM pedidos_oficiais_itens WHERE ${sqlFaturadoDeFato()} AND data_faturamento >= ${SQL_HOJE_BRASIL} - INTERVAL '10 weeks'
          GROUP BY 1 ORDER BY 1`
       ),
       pool.query(
         `SELECT date_trunc('quarter', data_faturamento) AS periodo, SUM(valor) AS faturamento
-         FROM pedidos_oficiais_itens WHERE status = 'faturado' AND data_faturamento >= CURRENT_DATE - INTERVAL '24 months'
+         FROM pedidos_oficiais_itens WHERE ${sqlFaturadoDeFato()} AND data_faturamento >= ${SQL_HOJE_BRASIL} - INTERVAL '24 months'
          GROUP BY 1 ORDER BY 1`
       ),
       pool.query(
         `SELECT c.id, c.nome, SUM(poi.valor) AS faturamento
          FROM pedidos_oficiais_itens poi JOIN clientes c ON c.codigo_oficial = poi.cliente_codigo_oficial
-         WHERE poi.status = 'faturado' AND poi.data_faturamento >= CURRENT_DATE - INTERVAL '12 months'
+         WHERE ${sqlFaturadoDeFato('poi')} AND poi.data_faturamento >= ${SQL_HOJE_BRASIL} - INTERVAL '12 months'
          GROUP BY c.id, c.nome ORDER BY faturamento DESC LIMIT 5`
       ),
       // Canal + inatividade (cartões "Clientes Ativos por Canal" e "Contas
@@ -736,7 +815,7 @@ router.get('/dashboard/resumo', async (req, res) => {
       // (que filtra por classificatorio_tipo IS NOT NULL) e usa a mesma
       // subconsulta de faturamento 12m sem filtro nenhum de cliente.
       pool.query(
-        `SELECT c.id, c.nome, c.classificatorio_tipo, base.ultima_compra
+        `SELECT c.id, c.nome, c.classificatorio_tipo, base.ultima_compra, base.ultimo_pedido
          FROM clientes c
          JOIN (${SQL_FATURAMENTO_CLASSIFICATORIO_POR_CLIENTE} GROUP BY c.id) base ON base.cliente_id = c.id`
       ),
@@ -747,9 +826,14 @@ router.get('/dashboard/resumo', async (req, res) => {
     const clientesDe3a5Meses = [];
     const clientesDe6a8Meses = [];
     for (const row of porCliente.rows) {
+      // ativo com outro vendedor (Salesforce): nem "ativo" da carteira nem "conta sem comprar"
+      if (outrosVendedores.has(String(row.id))) continue;
       const canal = canalDoCliente(row.classificatorio_tipo);
-      if (!row.ultima_compra) continue;
-      const diasSemComprar = Math.floor((hoje - new Date(row.ultima_compra)) / (1000 * 60 * 60 * 24));
+      // último pedido (carteira e app inclusive), não só a última nota: quem
+      // já pediu de novo não é "conta sem comprar"
+      const ultimoPedido = diaDoBanco(row.ultimo_pedido) || diaDoBanco(row.ultima_compra);
+      if (!ultimoPedido) continue;
+      const diasSemComprar = Math.floor((hoje - new Date(`${ultimoPedido}T00:00:00Z`)) / (1000 * 60 * 60 * 24));
       if (diasSemComprar <= 365) ativosPorCanal[canal] = (ativosPorCanal[canal] || 0) + 1;
       if (diasSemComprar >= FAIXA_3_A_5_MESES[0] && diasSemComprar <= FAIXA_3_A_5_MESES[1]) {
         clientesDe3a5Meses.push({ id: row.id, nome: row.nome, diasSemComprar });
@@ -765,6 +849,7 @@ router.get('/dashboard/resumo', async (req, res) => {
     res.json({
       mensal: mensal.rows,
       entradaPedidosMes: pedidosDoMes.rows,
+      entradaMesAnteriorAteHoje: mesAnteriorAteHoje.rows[0] || null,
       semanal: semanal.rows,
       trimestral: trimestral.rows,
       topClientes: topClientes.rows,
