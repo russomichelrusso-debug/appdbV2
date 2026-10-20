@@ -40,7 +40,7 @@
 // valer: rodar a função "conferirAutenticacao" (ver docs/IMPORTACAO-EMAIL.md).
 
 const CONFIG = {
-  urlServidor: 'https://appdb-z6uh.onrender.com',
+  urlServidor: 'https://api-da-v2-nao-configurada.invalid', // v2: trocar pelo endereço do serviço da v2 no Render - NUNCA o da produção (appdb-z6uh)
   minutos: 15,
   diasParaTras: 7,
   marcadorImportado: 'Cortag/Importado',

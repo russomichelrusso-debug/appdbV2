@@ -12,7 +12,8 @@ Regras (detalhes na seção 3 do plano):
 - **Nunca** usar o `DATABASE_URL` da produção — o `db.js` roda o `schema.sql` a cada subida do
   servidor. A v2 tem banco (projeto Supabase) e serviço no Render próprios.
 - O frontend aponta para a API da v2 (`API_BASE_URL_DEFAULT` em `index.html`, `curva-abc.html`,
-  `ficha-cnpj.html` — hoje com um endereço `.invalid` até o serviço da v2 existir) e é publicado
+  `ficha-cnpj.html`, `tela-cliente.html`, e `urlServidor` em `scripts/gmail-importacao/Codigo.gs` — hoje com um
+  endereço `.invalid` até o serviço da v2 existir; página nova que chame a API entra nessa lista) e é publicado
   **fora** do GitHub Pages desta conta (mesma origem = mesmo `localStorage` da produção).
 - O `keep-alive.yml` está sem agendamento (o endereço nele ainda é o da produção).
 - Correções de produção entram pelo `appdb` e chegam aqui por merge
